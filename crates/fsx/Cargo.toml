@@ -1,0 +1,17 @@
+[package]
+name = "swagcod-fsx"
+description = "Файловые операции, watch, поиск, diff. Этап 2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+walkdir = "2"
+notify = "6"
+similar = "2"
+ignore = "0.4"

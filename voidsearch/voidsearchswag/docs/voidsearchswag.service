@@ -1,0 +1,85 @@
+[Unit]
+Description=VoidSearchSwag - self-hosted MCP search engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Не от root: бинарь ходит в сеть и запускает tor-демон и chromium, у него
+# нет причин владеть машиной. Юзера заведи один раз:
+#   useradd --system --home-dir /var/lib/voidsearchswag --shell /usr/sbin/nologin voidsearchswag
+User=voidsearchswag
+Group=voidsearchswag
+
+# StateDirectory заводит /var/lib/voidsearchswag с правами 0750 и
+# владельцем voidsearchswag - руками mkdir/chown не нужен.
+StateDirectory=voidsearchswag
+
+# HOME нужен rod: chromium для stealth-режима докачивается в
+# $HOME/.cache/rod/browser. ProtectHome=true прячет /home и /root, поэтому
+# HOME указывает внутрь каталога данных - там он и записываем, и не теряется
+# при рестарте. Без HOME rod кладёт бинарь в /tmp и перекачивает ~150 МБ
+# после каждого рестарта.
+Environment=HOME=/var/lib/voidsearchswag
+Environment=VOIDSEARCH_DATA_DIR=/var/lib/voidsearchswag
+
+# Всё окружение - одним файлом, который не читается чужими юзерами:
+#   install -d -m 0750 -o root -g voidsearchswag /etc/voidsearchswag
+#   cat >/etc/voidsearchswag/env <<'EOF'
+#   VOIDSEARCH_HUNT_BG=true
+#   VOIDSEARCH_DISCOVER_BG=true
+#   # VOIDSEARCH_SEARXNG_URL=http://127.0.0.1:8080
+#   # Лимит запросов в минуту с одного IP (дефолт 120); за реверс-прокси
+#   # с собственным троттлингом можно ослабить или обнулить.
+#   # VOIDSEARCH_RATE_LIMIT=120
+#   EOF
+EnvironmentFile=/etc/voidsearchswag/env
+
+# Токен живёт в файле, а не в аргументах: ps показывает командную строку всем
+# локальным юзерам, и секрет в argv светился бы вместе с ней. Файл создай так:
+#   umask 027
+#   head -c 32 /dev/urandom | base64 >/etc/voidsearchswag/http-token
+#   chown voidsearchswag:voidsearchswag /etc/voidsearchswag/http-token
+#   chmod 640 /etc/voidsearchswag/http-token
+ExecStart=/opt/voidsearchswag/voidsearchswag run --http 127.0.0.1:8800 --token-file /etc/voidsearchswag/http-token
+
+# Фоновые циклы: охота каждые 10 минут, разведка раз в сутки (в env-файле).
+Restart=on-failure
+RestartSec=10
+UMask=0077
+LimitNOFILE=8192
+# Потолок памяти: ядро, tor и chromium вместе. chromium при крэше ест много -
+# потолок прибивает утечку, а не всю машину.
+MemoryMax=2G
+
+# Песочница: бинарю хватает чтения системы, записи в каталог данных и сети.
+# Каждый пункт снят отдельной строкой ради читаемости при разборе инцидента.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Только каталог данных записываем: база, tor-data, state пула, rod-кэш.
+ReadWritePaths=/var/lib/voidsearchswag
+# MemoryDenyWriteExecute НЕ включён: V8 у chromium требует W+X страниц для
+# JIT, с этой директивой stealth-режим умирает на старте.
+
+# Tor-демон - дочерний процесс бинаря (--__OwningControllerProcess):
+# падает вместе с сервисом, отдельного юнита не нужно.
+# Chromium докачивается сам при setup / первом поиске (в HOME выше).
+
+[Install]
+WantedBy=multi-user.target

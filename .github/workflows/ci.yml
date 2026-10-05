@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Бюджет из DECISIONS.md §2: приватные байты нашего процесса, не RSS (D-013).
+  BUDGET_OUR_PRIVATE_MB: 40
+  BUDGET_FAMILY_PRIVATE_MB: 200
+  BUDGET_STARTUP_MS: 400
+
+jobs:
+  rust:
+    name: Rust · test + clippy + fmt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        # -D warnings: предупреждения не должны накапливаться молча.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (headless, без Tauri-окна)
+        run: cargo test --workspace
+
+      - name: test release profile
+        # Бенчи и проверки производительности имеют смысл только в release.
+        run: cargo test --workspace --release
+
+  frontend:
+    name: Frontend · test + check + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: unit tests
+        run: pnpm --filter swagcod-desktop test
+
+      - name: type check
+        run: pnpm --filter swagcod-desktop check
+
+      - name: build
+        run: pnpm --filter swagcod-desktop build
+
+      # Бюджет бандла: холодный старт зависит от размера JS, поэтому порог
+      # зафиксирован в CI, а не «на глаз при ревью».
+      - name: bundle size budget
+        shell: bash
+        run: |
+          set -e
+          LIMIT=150000
+          TOTAL=0
+          for f in apps/desktop/dist/assets/*.js; do
+            SIZE=$(stat -c%s "$f")
+            TOTAL=$((TOTAL + SIZE))
+          done
+          echo "JS bundle total: $TOTAL bytes (limit $LIMIT)"
+          if [ "$TOTAL" -gt "$LIMIT" ]; then
+            echo "::error::Бандл JS вырос сверх бюджета ($TOTAL > $LIMIT байт)"
+            exit 1
+          fi
+
+  # Замеры старта и памяти требуют GUI и WebView2, поэтому гоняются локально:
+  #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/bench-startup.ps1 -OutFile bench-out/startup.json
+  # Результаты коммитятся в bench-out/ как точка сравнения между этапами.
+  # В CI их нет: headless-раннер не поднимет WebView2, а число получилось бы
+  # нерепрезентативным и создавало ложное ощущение контроля над бюджетом.

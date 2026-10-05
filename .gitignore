@@ -1,0 +1,35 @@
+# Секреты (D-009): ключ живёт только здесь, в репозиторий не попадает.
+.env
+.env.local
+!.env.example
+
+# Собранный exe и отладочные символы: воспроизводятся сборкой, не хранятся.
+SwagCod.exe
+*.pdb
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node / фронтенд
+node_modules/
+apps/desktop/dist/
+apps/desktop/.svelte-kit/
+apps/desktop/build/
+
+# Tauri
+crates/app/gen/schemas/
+
+# Замеры и артефакты: двоичный шум, воспроизводится скриптами и пробами.
+bench-out/
+*.tmp
+.tmp-*
+flamegraph.svg
+perf.data
+
+# ОС / редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

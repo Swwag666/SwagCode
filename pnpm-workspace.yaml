@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+
+# pnpm 10+ не запускает build-скрипты зависимостей без явного разрешения.
+# esbuild нужен vite: его postinstall ставит нативный бинарник esbuild.exe.
+# В pnpm 11 ключ — allowBuilds (onlyBuiltDependencies больше не читается).
+allowBuilds:
+  esbuild: true

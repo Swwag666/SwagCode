@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    name: fmt, vet, test, race, cross
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "не отформатировано:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test with coverage
+        run: go test ./... -count=1 -coverprofile=coverage.out
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      # Детектор гонок обязателен и идёт отдельным шагом: проект собирается
+      # с CGO_ENABLED=0, а -race требует cgo. modernc.org/sqlite - чистый Go,
+      # поэтому включение cgo здесь не добавляет Си-зависимостей и не меняет
+      # боевой бинарь. Отдельный шаг нужен, чтобы падение гонок не выглядело
+      # как падение обычных тестов.
+      - name: race detector
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+      - name: cross-compile (production is CGO-free)
+        run: |
+          set -e
+          # Релизная мета заливается линкером: версия без тегов - короткий
+          # хеш пуша, + dirty, если рабочее дерево не чисто (в CI чисто
+          # всегда, но правило одно для всех сборок).
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(git log -1 --format=%cI)"
+          LDFLAGS="-X main.version=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildDate=${DATE}"
+          echo "заливаю: ${LDFLAGS}"
+          mkdir -p dist
+          for target in windows/amd64 linux/amd64 linux/arm64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            echo "сборка $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "$LDFLAGS" \
+              -o "dist/voidsearchswag-$os-$arch" ./cmd/voidsearchswag
+          done
+          sha256sum dist/voidsearchswag-* > dist/sums.txt
+
+      - name: verify version stamp on release binary
+        run: |
+          # Контрольный бинарь с той же заливкой: штамп версии обязан
+          # читаться в выводе команды version.
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath \
+            -ldflags "-X main.version=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildDate=1970-01-01T00:00:00Z" \
+            -o /tmp/vss-stamp-check ./cmd/voidsearchswag
+          out="$(/tmp/vss-stamp-check version)"
+          echo "$out"
+          case "$out" in
+            *"(${COMMIT},"*) echo "штамп версии на месте" ;;
+            *) echo "бинарь не несёт коммит: $out"; exit 1 ;;
+          esac
+
+      - name: verify production binary has no cgo dependency
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o /tmp/vss-check ./cmd/voidsearchswag
+          if ldd /tmp/vss-check >/dev/null 2>&1; then
+            echo "бинарь оказался динамически слинкованным"
+            ldd /tmp/vss-check
+            exit 1
+          fi
+          echo "статический бинарь, зависимостей от libc нет"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+      # Релизные бинари со штампом (коммит, дата, версия) и суммы: то, что
+      # кладут на сервер, а не пересобирают на месте.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/

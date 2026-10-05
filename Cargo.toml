@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/provider",
+    "crates/pty",
+    "crates/fsx",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+repository = "https://github.com/swagcod/swagcod"
+
+# D-011: core не должен зависеть от tauri. tauri живёт только в crates/app.
+[workspace.dependencies]
+swagcod-core = { path = "crates/core" }
+swagcod-provider = { path = "crates/provider" }
+swagcod-pty = { path = "crates/pty" }
+swagcod-fsx = { path = "crates/fsx" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+opt-level = 3
+panic = "abort"

@@ -1,0 +1,205 @@
+/*
+ * Тема SwagCod — D-014.
+ *
+ * Формула: агрессия в рамке (шапка, состояния, splash), спокойствие в контенте
+ * (чат, diff, терминал). Красный — акцент состояний, не фон текста.
+ *
+ * Палитра:
+ *   фон почти чёрный с холодным подтоном, панели чуть светлее, текст тёплый
+ *   светло-серый для читаемости на часы. Два красных: яркий акцент и
+ *   приглушённый вторичный.
+ */
+:root {
+  /* фон и поверхности */
+  --bg: #0a0a0d;
+  --bg-panel: #141419;
+  --bg-elevated: #1c1c24;
+  --bg-hover: #23232d;
+  --border: #2a2a35;
+  --border-strong: #3a3a48;
+
+  /* текст */
+  --text: #d8d8e0;
+  --text-dim: #8a8a99;
+  --text-faint: #55555f;
+
+  /* красный — три тона: база, hover, приглушённый */
+  --accent: #ff2d44;
+  --accent-hover: #ff5f70;
+  --accent-dim: #7a1622;
+  --accent-glow: rgba(255, 45, 68, 0.25);
+  /* RGB-тройка акцента: из неё собираются и заливки hover-фонов, и свечения
+     (rgba(var(--accent-rgb), α)), поэтому тема перекрашивается целиком,
+     а не по кусочкам. */
+  --accent-rgb: 255, 45, 68;
+
+  /* состояния */
+  --ok: #7ee787;
+  --err: #ff2d44;
+  --err-rgb: 255, 45, 68;
+  --warn: #e0af68;
+
+  /* поверхности chrome: сайдбар, шапка, зона ввода. Раньше были захардкожены
+     тёмными значениями в компонентах — из-за этого светлая тема не работала. */
+  --surface-sidebar: rgba(18, 18, 22, 0.98);
+  --surface-chrome: rgba(20, 20, 25, 0.95);
+  --surface-inset: rgba(255, 255, 255, 0.02);
+  --surface-overlay: rgba(0, 0, 0, 0.6);
+  --shadow-strong: 0 24px 64px rgba(0, 0, 0, 0.5);
+
+  /* шрифты */
+  --mono: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  --sans: system-ui, 'Segoe UI', sans-serif;
+
+  /* высота строки списка: нужна для расчёта виртуализации до измерения. */
+  --row-estimate: 72px;
+
+  /* управляется из Settings → General; меняется на лету */
+  --content-font-size: 13px;
+  --ui-zoom: 1;
+}
+
+/*
+ * Светлая тема. Переопределяет только переменные — компоненты их уже
+ * используют, поэтому тема переключается мгновенно и целиком.
+ */
+:root[data-appearance='light'] {
+  --bg: #f2f2f6;
+  --bg-panel: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-hover: #e8e8f0;
+  --border: #d6d6e0;
+  --border-strong: #b4b4c4;
+
+  --text: #17171e;
+  --text-dim: #55555f;
+  --text-faint: #8b8b9a;
+
+  /* Светлая тема — не «тёмная с белым фоном», а самостоятельная сине-зелёная
+     палитра: акцент, ховеры, границы-тинты и свечение одного семейства. */
+  --accent: #0e9384;
+  --accent-hover: #14b8a6;
+  --accent-dim: #9ad4cc;
+  --accent-glow: rgba(14, 147, 132, 0.25);
+  --accent-rgb: 14, 147, 132;
+
+  --ok: #1a7f37;
+  --err: #c62828;
+  --err-rgb: 198, 40, 40;
+  --warn: #8a6100;
+
+  --surface-sidebar: rgba(248, 248, 252, 0.98);
+  --surface-chrome: rgba(255, 255, 255, 0.94);
+  --surface-inset: rgba(20, 20, 40, 0.04);
+  --surface-overlay: rgba(30, 30, 45, 0.35);
+  --shadow-strong: 0 24px 64px rgba(20, 20, 40, 0.18);
+}
+
+/* Контрастная тема: тот же тёмный базис, но плотнее и без полупрозрачности. */
+:root[data-appearance='contrast'] {
+  --bg: #000000;
+  --bg-panel: #0b0b0f;
+  --bg-elevated: #131319;
+  --bg-hover: #1e1e28;
+  --border: #4a4a5c;
+  --border-strong: #6a6a80;
+
+  --text: #ffffff;
+  --text-dim: #c2c2d0;
+  --text-faint: #8e8ea0;
+
+  --accent: #9b1830;
+  --accent-hover: #c22743;
+  --accent-dim: #55101f;
+  /* Бордо «кровь из вены»: плотный тёмный красный вместо неона. */
+  --accent-glow: rgba(155, 24, 48, 0.45);
+  --accent-rgb: 155, 24, 48;
+  /* Ошибки в контрастной теме остаются звонкими: бордо — это акцент,
+     а авария должна читаться мгновенно. */
+  --err: #ff5563;
+  --err-rgb: 255, 85, 99;
+
+  --surface-sidebar: #07070a;
+  --surface-chrome: #0a0a0e;
+  --surface-inset: rgba(255, 255, 255, 0.06);
+  --surface-overlay: rgba(0, 0, 0, 0.8);
+}
+
+/* Глобальный масштаб интерфейса — то, чем раньше нельзя было управлять. */
+#app {
+  zoom: var(--ui-zoom, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  /* Субпиксельный рендер текста: на WebView2 даёт заметно более чёткий вывод. */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+button:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+}
+
+/* Скроллбар: тонкий, красный на hover — агрессия в рамке. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-dim);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Выделение текста — красное, как на референсах. */
+::selection {
+  background: var(--accent-dim);
+  color: var(--text);
+}

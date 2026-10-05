@@ -1,0 +1,23 @@
+[package]
+name = "swagcod-provider"
+description = "OpenAI-совместимый провайдер: SSE-стрим с reasoning_content и инкрементальными tool_calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+# HTTP-транспорт под флагом: парсер остаётся чистым и тестируемым headless.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+default = ["http"]
+http = ["dep:reqwest", "dep:futures-util"]

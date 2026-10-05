@@ -1,0 +1,19 @@
+[package]
+name = "swagcod-pty"
+description = "PTY, ANSI-парсер, кольцевой буфер, flow control. Этап 2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# ConPTY. Подключим на этапе 2, сейчас заготовка.
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Security", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["termios", "process"] }

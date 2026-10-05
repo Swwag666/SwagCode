@@ -1,0 +1,17 @@
+[package]
+name = "swagcod-core"
+description = "Домен-ядро: шина событий, сессии, ход агента. Без зависимости от tauri (D-011)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+swagcod-provider.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
