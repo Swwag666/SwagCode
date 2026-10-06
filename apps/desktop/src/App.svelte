@@ -2874,6 +2874,7 @@
   .media-on .sidebar,
   .media-on .content,
   .media-on .content-header,
+  .media-on .input-area,
   .media-on .input-box {
     background: color-mix(in srgb, var(--bg) var(--panel-glass), transparent);
     backdrop-filter: blur(14px) saturate(1.1);
