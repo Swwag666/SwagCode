@@ -11,11 +11,13 @@
   import BackgroundFX from './components/BackgroundFX.svelte'
   import Splash from './components/Splash.svelte'
   import SessionList from './components/SessionList.svelte'
+  import ApprovalDialog from './components/ApprovalDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
   import logoGif from './assets/logo.gif'
   import { Transcript as TranscriptModel, type TranscriptItem } from './lib/transcript'
+  import { translate, type StrKey } from './lib/strings'
 
   interface BuildInfo {
     version: string
@@ -74,165 +76,9 @@
   let showPermPicker = $state(false)
   let modelQuery = $state('')
 
-  const STR = {
-    ru: {
-      newSession: 'Новая сессия',
-      workspaces: 'Рабочие области',
-      settings: 'Настройки',
-      chat: 'Чат',
-      trajectory: 'Траектория',
-      placeholder: 'сообщение модели…',
-      thinking: 'думает',
-      standard: 'Обычный режим',
-      turns: 'ходов',
-      connected: 'подключено',
-      connecting: 'подключение',
-      browser: 'браузер',
-      modelTitle: 'Модель',
-      permTitle: 'Права',
-      permAlways: 'Спрашивать всегда',
-      permAlwaysDesc: 'Подтверждение на каждый вызов инструмента',
-      permDangerous: 'Только опасные',
-      permDangerousDesc: 'bash, pwsh, write, edit, delete — с подтверждением',
-      permNever: 'Никогда не спрашивать',
-      permNeverDesc: 'Опасно: модель действует без подтверждений',
-      permApplied: 'права применены',
-      permFailed: 'не удалось применить права',
-      approvalTitle: 'Подтверждение действия',
-      approvalHint: 'Агент просит выполнить опасный инструмент. Команда и аргументы показаны полностью.',
-      approve: 'Подтвердить',
-      deny: 'Отклонить',
-      appearance: 'Тема',
-      dark: 'Тёмная',
-      light: 'Светлая',
-      contrast: 'Контрастная',
-      system: 'Системная',
-      fontSize: 'Размер шрифта',
-      fontSizeDesc: 'Текст сообщений в транскрипции',
-      zoom: 'Масштаб интерфейса',
-      zoomDesc: 'Растягивает всё окно: панели, шрифт, отступы',
-      sidebarWidth: 'Ширина панели',
-      language: 'Язык',
-      maximize: 'Развернуть на весь экран',
-      restore: 'Вернуть панель',
-      reset: 'Сброс',
-      ctx: 'контекст',
-      speedFast: 'быстрая',
-      speedBalanced: 'средняя',
-      speedHeavy: 'тяжёлая',
-      capTools: 'инструменты',
-      capReasoning: 'рассуждения',
-      capVision: 'зрение',
-      noModels: 'Список моделей не получен — проверь .env и провайдера',
-      openModelSettings: 'Настройки моделей',
-      tempAuto: 'temperature',
-      tempAutoDesc: 'Не переопределяем: провайдер применяет своё значение по умолчанию',
-      auto: 'авто',
-      studioAccent: 'Свой акцент',
-      studioAccentDesc: 'Круглая палитра: перекрашивает кнопки, свечения и декор',
-      studioTint: 'Тонировка',
-      studioTintDesc: 'Мягкий цветовой слой поверх всего интерфейса',
-      studioMedia: 'Медиафон',
-      studioMediaDesc: 'gif, mp4, webm или картинка на задний план',
-      studioMediaPick: 'выбрать файл',
-      studioMediaClear: 'убрать',
-      studioMediaBusy: 'сохраняю файл…',
-      wsTitle: 'Пути рабочих областей',
-      wsEmpty: 'Нет открытых областей',
-      wsOpen: 'открыть в проводнике',
-      wsCopy: 'копировать путь',
-      stopTitle: 'остановить нейронку',
-      send: 'отправить',
-      queueTitle: 'в очереди',
-      searchModels: 'фильтр моделей…',
-      currentModel: 'текущая',
-      trajectoryTitle: 'Ходы и инструменты',
-      noTurns: 'Нет ходов — отправьте сообщение модели',
-      turn: 'Ход',
-      events: 'событий',
-    },
-    en: {
-      newSession: 'New Session',
-      workspaces: 'Workspaces',
-      settings: 'Settings',
-      chat: 'Chat',
-      trajectory: 'Trajectory',
-      placeholder: 'message the model…',
-      thinking: 'thinking',
-      standard: 'Standard mode',
-      turns: 'turns',
-      connected: 'connected',
-      connecting: 'connecting',
-      browser: 'browser',
-      modelTitle: 'Model',
-      permTitle: 'Permissions',
-      permAlways: 'Ask every time',
-      permAlwaysDesc: 'Confirm each tool call',
-      permDangerous: 'Dangerous only',
-      permDangerousDesc: 'bash, pwsh, write, edit, delete need approval',
-      permNever: 'Never ask',
-      permNeverDesc: 'Dangerous: the model acts without approval',
-      permApplied: 'permissions applied',
-      permFailed: 'failed to apply permissions',
-      approvalTitle: 'Approve action',
-      approvalHint: 'The agent wants to run a dangerous tool. Command and arguments are shown in full.',
-      approve: 'Approve',
-      deny: 'Deny',
-      appearance: 'Appearance',
-      dark: 'Dark',
-      light: 'Light',
-      contrast: 'Contrast',
-      system: 'System',
-      fontSize: 'Font size',
-      fontSizeDesc: 'Conversation text in the transcript',
-      zoom: 'UI zoom',
-      zoomDesc: 'Scales the whole window: panels, text, spacing',
-      sidebarWidth: 'Sidebar width',
-      language: 'Language',
-      maximize: 'Maximize to full screen',
-      restore: 'Restore sidebar',
-      reset: 'Reset',
-      ctx: 'context',
-      speedFast: 'fast',
-      speedBalanced: 'balanced',
-      speedHeavy: 'heavy',
-      capTools: 'tools',
-      capReasoning: 'reasoning',
-      capVision: 'vision',
-      noModels: 'Model list unavailable — check .env and the provider',
-      openModelSettings: 'Model settings',
-      tempAuto: 'temperature',
-      tempAutoDesc: 'Not overridden: the provider applies its own default',
-      auto: 'auto',
-      studioAccent: 'Custom accent',
-      studioAccentDesc: 'Round palette: recolors buttons, glows and decor',
-      studioTint: 'Color tint',
-      studioTintDesc: 'Soft color layer over the whole interface',
-      studioMedia: 'Background media',
-      studioMediaDesc: 'gif, mp4, webm or an image behind the UI',
-      studioMediaPick: 'pick file',
-      studioMediaClear: 'remove',
-      studioMediaBusy: 'saving file…',
-      wsTitle: 'Workspace paths',
-      wsEmpty: 'No workspaces yet',
-      wsOpen: 'open in explorer',
-      wsCopy: 'copy path',
-      stopTitle: 'stop the model',
-      send: 'send',
-      queueTitle: 'queued',
-      searchModels: 'filter models…',
-      currentModel: 'current',
-      trajectoryTitle: 'Turns and tools',
-      noTurns: 'No turns yet — send a message to the model',
-      turn: 'Turn',
-      events: 'events',
-    },
-  } as const
-
-  type StrKey = keyof (typeof STR)['ru']
 
   function t(key: StrKey): string {
-    return STR[uiLang][key] ?? STR.ru[key] ?? String(key)
+    return translate(uiLang, key)
   }
 
   /* Описание модели: бэкенд отдаёт только id, поэтому способности
@@ -556,20 +402,8 @@
      иначе «гифка не видно» выглядит как магия. */
   let bgMediaError = $state('')
 
-  function hexToRgb(hex: string): [number, number, number] | null {
-    const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
-    if (!m) return null
-    const n = parseInt(m[1], 16)
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
-  }
-
-  function mixHex(a: string, b: string, t: number): string {
-    const ca = hexToRgb(a)
-    const cb = hexToRgb(b)
-    if (!ca || !cb) return a
-    const ch = ca.map((v, i) => Math.round(v + (cb[i] - v) * t))
-    return '#' + ch.map((v) => v.toString(16).padStart(2, '0')).join('')
-  }
+  /* Цвет и mime живут в lib/studio: чистые функции с тестами, а не инлайн. */
+  import { BG_MIME, bgKindFor, hexToRgb, mixHex } from './lib/studio'
 
   /* Свой акцент перекрывает палитру темы целиком: кнопки, свечения, декор. */
   $effect(() => {
@@ -593,24 +427,13 @@
     localStorage.setItem('swagcod-tint', customTint)
   })
 
-  const BG_MIME: Record<string, string> = {
-    gif: 'image/gif',
-    mp4: 'video/mp4',
-    webm: 'video/webm',
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    webp: 'image/webp',
-    apng: 'image/apng',
-  }
-
   function bgBytesToUrl(name: string, bytes: Uint8Array): void {
     const ext = name.split('.').pop()?.toLowerCase() || ''
     const mime = BG_MIME[ext] || 'application/octet-stream'
     const blob = new Blob([bytes as BlobPart], { type: mime })
     if (bgMediaUrl) URL.revokeObjectURL(bgMediaUrl)
     bgMediaUrl = URL.createObjectURL(blob)
-    bgMediaKind = ext === 'mp4' || ext === 'webm' ? 'video' : 'image'
+    bgMediaKind = bgKindFor(name)
   }
 
   async function applyStoredBgMedia(): Promise<void> {
@@ -1172,20 +995,14 @@
      решение уходит командой respond_approval. Пока человек не решил,
      ход стоит: результат тулза в модель не попадает. -->
 {#if approvalReq}
-  <div class="approval-overlay" role="presentation">
-    <div class="approval-dialog" role="dialog" aria-label={t('approvalTitle')} tabindex="-1">
-      <div class="approval-head">
-        <Icon name="alert" size={16} />
-        <h2>{t('approvalTitle')}</h2>
-      </div>
-      <p class="approval-hint">{t('approvalHint')}</p>
-      <pre class="approval-summary">{approvalReq.summary}</pre>
-      <div class="approval-actions">
-        <button class="approval-btn deny" onclick={() => respondApproval('denied')}>{t('deny')}</button>
-        <button class="approval-btn approve" onclick={() => respondApproval('approved')}>{t('approve')}</button>
-      </div>
-    </div>
-  </div>
+  <ApprovalDialog
+    summary={approvalReq.summary}
+    title={t('approvalTitle')}
+    hint={t('approvalHint')}
+    approveLabel={t('approve')}
+    denyLabel={t('deny')}
+    onRespond={respondApproval}
+  />
 {/if}
 
 {#if showSettings}
@@ -3818,94 +3635,6 @@
   }
 
   /* Settings dialog в стиле DSH */
-  /* Диалог подтверждения опасного действия: поверх всего, красная семья,
-     потому что решение необратимо. Кнопки живые: hover/active отклик. */
-  .approval-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 1200;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    backdrop-filter: blur(3px);
-  }
-  .approval-dialog {
-    width: min(560px, calc(100vw - 48px));
-    background: var(--bg-panel);
-    border: 1px solid rgba(var(--err-rgb), 0.45);
-    border-radius: 12px;
-    padding: 18px 20px;
-    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5), 0 0 24px rgba(var(--err-rgb), 0.18);
-    animation: content-in 0.16s ease-out;
-  }
-  .approval-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--err);
-  }
-  .approval-head h2 {
-    font-size: 15px;
-    margin: 0;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-  .approval-hint {
-    margin: 10px 0 0;
-    color: var(--text-dim);
-    font-size: 12px;
-    line-height: 1.5;
-  }
-  .approval-summary {
-    margin: 12px 0 0;
-    padding: 10px 12px;
-    max-height: 220px;
-    overflow: auto;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    font-size: 12px;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .approval-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-    margin-top: 14px;
-  }
-  .approval-btn {
-    padding: 7px 16px;
-    border-radius: 8px;
-    font-size: 12.5px;
-    cursor: pointer;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text);
-    transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease,
-      color 0.12s ease;
-  }
-  .approval-btn:hover {
-    transform: translateY(-1px);
-  }
-  .approval-btn:active {
-    transform: translateY(0) scale(0.97);
-  }
-  .approval-btn.approve {
-    border-color: rgba(var(--accent-rgb), 0.6);
-    background: rgba(var(--accent-rgb), 0.16);
-    color: var(--accent);
-  }
-  .approval-btn.approve:hover {
-    box-shadow: 0 0 18px rgba(var(--accent-rgb), 0.35);
-  }
-  .approval-btn.deny:hover {
-    border-color: rgba(var(--err-rgb), 0.6);
-    color: var(--err);
-    box-shadow: 0 0 18px rgba(var(--err-rgb), 0.25);
-  }
-
   /* Блоки меню живые: каждый интерактивный блок отвечает на курсор —
      hover приподнимает, нажатие прессует, переходы мгновенные. Действует
      на все списки и панели: сессии, вкладки, палитра, настройки, области,
