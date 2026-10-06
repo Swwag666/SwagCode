@@ -7,6 +7,12 @@
  */
 import { marked } from 'marked'
 import hljs from 'highlight.js/lib/core'
+import DOMPurify from 'dompurify'
+
+// C-5 фикс: marked не санитизирует HTML (опцию sanitize убрали в v5), а
+// текст приходит от модели. Без DOMPurify ответ с <img onerror=...> исполнял
+// бы JS в WebView. CSP держит inline-скрипты, но санитизация — первый рубеж,
+// а не последний: режем всё, что не разметка markdown.
 
 // Регистрируем только нужные грамматики (N-2: не тянем все)
 import javascript from 'highlight.js/lib/languages/javascript'
@@ -47,22 +53,29 @@ marked.setOptions({
 export function renderMarkdown(text: string): string {
   if (!text) return ''
 
-  const html = marked.parse(text, { async: false }) as string
+  const raw = marked.parse(text, { async: false }) as string
 
   // Подсветка код-блоков
-  return html.replace(
+  const highlighted = raw.replace(
     /<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g,
     (_match, lang, code) => {
       const decoded = decodeHtml(code)
-      let highlighted: string
+      let hl: string
       try {
-        highlighted = hljs.highlight(decoded, { language: lang }).value
+        hl = hljs.highlight(decoded, { language: lang }).value
       } catch {
-        highlighted = escapeHtml(decoded)
+        hl = escapeHtml(decoded)
       }
-      return `<div class="code-block-wrap"><button class="copy-btn" data-copy>копировать</button><pre class="code-block"><code class="hljs language-${lang}">${highlighted}</code></pre></div>`
+      return `<div class="code-block-wrap"><button class="copy-btn" data-copy>копировать</button><pre class="code-block"><code class="hljs language-${lang}">${hl}</code></pre></div>`
     }
   )
+
+  // Санитизация ПОСЛЕ подсветки: hljs даёт только span'ы, а всё, что
+  // принесла модель (onerror, script, iframe), вырезается здесь.
+  return DOMPurify.sanitize(highlighted, {
+    USE_PROFILES: { html: true },
+    ADD_ATTR: ['data-copy'],
+  })
 }
 
 /**

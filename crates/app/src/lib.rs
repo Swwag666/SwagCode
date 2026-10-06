@@ -408,9 +408,15 @@ async fn create_session(
     model: Option<String>,
 ) -> Result<SessionBrief, String> {
     let cwd = cwd.trim().to_string();
-    if cwd.is_empty() {
-        return Err("cwd не может быть пустым".into());
-    }
+    // Пустой cwd — домашний каталог: фронтенд больше не хардкодит путь
+    // разработки, а пользователь может открыть сессию где угодно.
+    let cwd = if cwd.is_empty() {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map_err(|_| "не удалось определить домашний каталог".to_string())?
+    } else {
+        cwd
+    };
     let path = std::path::Path::new(&cwd);
     if !path.is_absolute() {
         return Err(format!("cwd должен быть абсолютным: {cwd}"));

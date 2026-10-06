@@ -18,10 +18,12 @@
 
   interface Props {
     root: string
+    /** Id сессии: песочница ядра привязана к cwd сессии, файловые команды ходят с ним. */
+    sessionId: string
     onFileSelect?: (path: string, name: string) => void
   }
 
-  let { root, onFileSelect }: Props = $props()
+  let { root, sessionId, onFileSelect }: Props = $props()
 
   let entries = $state<FileEntry[]>([])
   let loading = $state(false)
@@ -49,7 +51,7 @@
   function openInExplorer(): void {
     if (contextMenu) {
       // C-1 фикс: путь отдельным аргументом, без склейки строк
-      invoke('open_in_explorer', { path: contextMenu.entry.path }).catch(() => {})
+      invoke('open_in_explorer', { sessionId, path: contextMenu.entry.path }).catch(() => {})
     }
     closeContextMenu()
   }

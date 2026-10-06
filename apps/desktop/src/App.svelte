@@ -98,6 +98,10 @@
       permNeverDesc: 'Опасно: модель действует без подтверждений',
       permApplied: 'права применены',
       permFailed: 'не удалось применить права',
+      approvalTitle: 'Подтверждение действия',
+      approvalHint: 'Агент просит выполнить опасный инструмент. Команда и аргументы показаны полностью.',
+      approve: 'Подтвердить',
+      deny: 'Отклонить',
       appearance: 'Тема',
       dark: 'Тёмная',
       light: 'Светлая',
@@ -170,6 +174,10 @@
       permNeverDesc: 'Dangerous: the model acts without approval',
       permApplied: 'permissions applied',
       permFailed: 'failed to apply permissions',
+      approvalTitle: 'Approve action',
+      approvalHint: 'The agent wants to run a dangerous tool. Command and arguments are shown in full.',
+      approve: 'Approve',
+      deny: 'Deny',
       appearance: 'Appearance',
       dark: 'Dark',
       light: 'Light',
@@ -411,21 +419,42 @@
     }
   }
 
-  /* Рабочие области: пути cwd открытых сессий, как в референсном клиенте. */
+  /* Рабочие области: пути cwd открытых сессий, как в референсном клиенте.
+     Строка держит id сессии: граница песочницы в ядре — cwd сессии, и
+     файловые команды ходят с sessionId, а не с хардкодом пути. */
   let showWorkspaces = $state(false)
-  let workspaces = $state<string[]>([])
+  let workspaces = $state<{ cwd: string; id: string }[]>([])
 
   async function loadWorkspaces(): Promise<void> {
     try {
-      const list = await invoke<{ cwd: string }[]>('list_sessions')
-      workspaces = [...new Set(list.map((s) => s.cwd))]
+      const list = await invoke<{ id: string; cwd: string }[]>('list_sessions')
+      const seen = new Set<string>()
+      workspaces = list
+        .filter((s) => (seen.has(s.cwd) ? false : (seen.add(s.cwd), true)))
+        .map((s) => ({ cwd: s.cwd, id: s.id }))
     } catch {
       workspaces = []
     }
   }
 
-  function openWorkspace(path: string): void {
-    invoke('open_in_explorer', { path }).catch(() => {})
+  function openWorkspace(path: string, sessionId: string): void {
+    invoke('open_in_explorer', { sessionId, path }).catch(() => {})
+  }
+
+  /* Диалог подтверждения действия: ядро спрашивает событием
+     approval_required, решение уходит командой respond_approval.
+     Решение принимает человек здесь, но исполняет его ядро — не UI. */
+  let approvalReq = $state<{ call_id: string; tool: string; summary: string } | null>(null)
+
+  async function respondApproval(decision: 'approved' | 'denied'): Promise<void> {
+    if (!approvalReq) return
+    const callId = approvalReq.call_id
+    approvalReq = null
+    try {
+      await invoke('respond_approval', { callId, decision })
+    } catch {
+      // ход уже завершился: канал закрыт, решать нечего
+    }
   }
 
   async function copyWorkspace(path: string): Promise<void> {
@@ -779,6 +808,12 @@
         liveStates[d.session] = d.ok ? 'ok' : 'fail'
         /* Строки хода переводим в готовый вид: волна «думает» гаснет. */
         transcriptFor(d.session).closeTurn(d.turn)
+        /* Ход кончился — висячий запрос подтверждения не имеет смысла. */
+        approvalReq = null
+      }
+      if (e.kind.kind === 'approval_required') {
+        const d = e.kind.data as { turn: string; call_id: string; tool: string; summary: string }
+        approvalReq = { call_id: d.call_id, tool: d.tool, summary: d.summary }
       }
       const sid = sessionOfEvent(e)
       if (!sid) continue
@@ -831,10 +866,13 @@
     URL.revokeObjectURL(url)
   }
 
-  /** Открывает .env в проводнике — раньше кнопка была декоративной. */
+  /** Открывает рабочую директорию текущей сессии в проводнике. */
   async function openConfigFile(): Promise<void> {
+    if (workspaces.length === 0) await loadWorkspaces()
+    const ws = workspaces.find((w) => w.id === currentSession) ?? workspaces[0]
+    if (!ws) return
     try {
-      await invoke('open_in_explorer', { path: 'D:\\SwagCod' })
+      await invoke('open_in_explorer', { sessionId: ws.id, path: ws.cwd })
     } catch (err) {
       console.error('open_in_explorer failed:', err)
     }
@@ -869,14 +907,33 @@
     URL.revokeObjectURL(url)
   }
 
+  /* cwd новых сессий: последняя рабочая область из localStorage. Пустая
+     строка — ядро подставит домашний каталог. Хардкода пути автора нет. */
+  function preferredCwd(): string {
+    try {
+      return localStorage.getItem('swagcod-cwd') ?? ''
+    } catch {
+      return ''
+    }
+  }
+
+  function rememberCwd(cwd: string): void {
+    try {
+      localStorage.setItem('swagcod-cwd', cwd)
+    } catch {
+      // localStorage недоступен — не критично
+    }
+  }
+
   async function createNewSession(): Promise<void> {
     creatingSession = true
     try {
-      const brief = await invoke<{ id: string }>('create_session', {
-        cwd: 'D:\\SwagCod',
+      const brief = await invoke<{ id: string; cwd: string }>('create_session', {
+        cwd: preferredCwd(),
         model: null,
       })
       currentSession = brief.id
+      rememberCwd(brief.cwd)
       transcript = transcriptFor(brief.id)
       items = transcript.items
       revision++
@@ -896,11 +953,12 @@
 
     try {
       if (!currentSession) {
-        const brief = await invoke<{ id: string }>('create_session', {
-          cwd: 'D:\\SwagCod',
+        const brief = await invoke<{ id: string; cwd: string }>('create_session', {
+          cwd: preferredCwd(),
           model: null,
         })
         currentSession = brief.id
+        rememberCwd(brief.cwd)
         transcript = transcriptFor(brief.id)
       }
       /* Своё сообщение пишем в транскрипт сразу: до ответа модели чат уже
@@ -1108,6 +1166,26 @@
 
 {#if glitchActive}
   <div class="glitch-overlay" aria-hidden="true"></div>
+{/if}
+
+<!-- Подтверждение действия: ядро спрашивает событием approval_required,
+     решение уходит командой respond_approval. Пока человек не решил,
+     ход стоит: результат тулза в модель не попадает. -->
+{#if approvalReq}
+  <div class="approval-overlay" role="presentation">
+    <div class="approval-dialog" role="dialog" aria-label={t('approvalTitle')} tabindex="-1">
+      <div class="approval-head">
+        <Icon name="alert" size={16} />
+        <h2>{t('approvalTitle')}</h2>
+      </div>
+      <p class="approval-hint">{t('approvalHint')}</p>
+      <pre class="approval-summary">{approvalReq.summary}</pre>
+      <div class="approval-actions">
+        <button class="approval-btn deny" onclick={() => respondApproval('denied')}>{t('deny')}</button>
+        <button class="approval-btn approve" onclick={() => respondApproval('approved')}>{t('approve')}</button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 {#if showSettings}
@@ -1451,21 +1529,21 @@
           {#if workspaces.length === 0}
             <div class="ws-empty">{t('wsEmpty')}</div>
           {:else}
-            {#each workspaces as w (w)}
+            {#each workspaces as w (w.id)}
               <div class="ws-row">
                 <Icon name="folder" size={12} />
-                <span class="ws-path" title={w}>{w}</span>
+                <span class="ws-path" title={w.cwd}>{w.cwd}</span>
                 <button
                   class="ws-act"
                   title={t('wsOpen')}
                   aria-label={t('wsOpen')}
-                  onclick={() => openWorkspace(w)}
+                  onclick={() => openWorkspace(w.cwd, w.id)}
                 ><Icon name="expand" size={11} /></button>
                 <button
                   class="ws-act"
                   title={t('wsCopy')}
                   aria-label={t('wsCopy')}
-                  onclick={() => copyWorkspace(w)}
+                  onclick={() => copyWorkspace(w.cwd)}
                 ><Icon name="clipboard" size={11} /></button>
               </div>
             {/each}
@@ -3738,6 +3816,94 @@
   }
 
   /* Settings dialog в стиле DSH */
+  /* Диалог подтверждения опасного действия: поверх всего, красная семья,
+     потому что решение необратимо. Кнопки живые: hover/active отклик. */
+  .approval-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(3px);
+  }
+  .approval-dialog {
+    width: min(560px, calc(100vw - 48px));
+    background: var(--bg-panel);
+    border: 1px solid rgba(var(--err-rgb), 0.45);
+    border-radius: 12px;
+    padding: 18px 20px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5), 0 0 24px rgba(var(--err-rgb), 0.18);
+    animation: content-in 0.16s ease-out;
+  }
+  .approval-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--err);
+  }
+  .approval-head h2 {
+    font-size: 15px;
+    margin: 0;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .approval-hint {
+    margin: 10px 0 0;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .approval-summary {
+    margin: 12px 0 0;
+    padding: 10px 12px;
+    max-height: 220px;
+    overflow: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .approval-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .approval-btn {
+    padding: 7px 16px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease,
+      color 0.12s ease;
+  }
+  .approval-btn:hover {
+    transform: translateY(-1px);
+  }
+  .approval-btn:active {
+    transform: translateY(0) scale(0.97);
+  }
+  .approval-btn.approve {
+    border-color: rgba(var(--accent-rgb), 0.6);
+    background: rgba(var(--accent-rgb), 0.16);
+    color: var(--accent);
+  }
+  .approval-btn.approve:hover {
+    box-shadow: 0 0 18px rgba(var(--accent-rgb), 0.35);
+  }
+  .approval-btn.deny:hover {
+    border-color: rgba(var(--err-rgb), 0.6);
+    color: var(--err);
+    box-shadow: 0 0 18px rgba(var(--err-rgb), 0.25);
+  }
+
   .settings-overlay {
     position: fixed;
     inset: 0;
