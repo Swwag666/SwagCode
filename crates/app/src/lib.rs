@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+pub mod crashlog;
 pub mod dpapi;
 
 use serde::Serialize;
@@ -60,6 +61,28 @@ pub struct AppState {
     /// аргументы JSON-ом в stdin. Не-встроенное имя при OnDangerous всегда
     /// уходит на подтверждение (ApprovalPolicy::BUILTIN).
     pub plugins: std::sync::Mutex<Vec<PluginTool>>,
+    /// B-8: сколько раз UI-насос отставал и сколько событий при этом
+    /// потеряно. Диагностический экспорт без этих чисел слеп: «лагает»
+    /// без счётчика — это анекдот, а не наблюдение.
+    pub lagging_events: Arc<std::sync::atomic::AtomicU64>,
+    pub lagging_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// B-8: живые ходы для watchdog — возраст и время последнего события.
+    /// std-мьютекс: обновление на каждом токене стрима должно быть дешевле
+    /// самого токена.
+    pub turn_activity: Arc<std::sync::Mutex<std::collections::HashMap<String, TurnActivity>>>,
+}
+
+/// B-8: запись watchdog о живом ходе.
+#[derive(Debug, Clone)]
+pub struct TurnActivity {
+    pub session: String,
+    pub started_ms: u64,
+    pub last_ms: u64,
+    /// Ход ждёт человека (диалог подтверждения): тишина здесь — не зависание,
+    /// watchdog молчит.
+    pub waiting_human: bool,
+    /// Момент последнего предупреждения: не долбить каждые 30 секунд.
+    pub warned_ms: Option<u64>,
 }
 
 /// Внешний инструмент: spec для модели + команда для исполнения.
@@ -90,8 +113,18 @@ impl Default for AppState {
             watches: Mutex::new(std::collections::HashMap::new()),
             indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
             plugins: std::sync::Mutex::new(Vec::new()),
+            lagging_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            lagging_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            turn_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
+}
+
+/// B-8: момент запуска процесса для uptime в диагностике.
+static START_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn start_ms() -> u64 {
+    *START_MS.get_or_init(swagcod_core::bus::now_ms)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,7 +198,14 @@ impl From<Event> for WireEvent {
 ///
 /// Подписка идёт на bounded-канал шины, поэтому медленный WebView не съест
 /// память, а отставание будет видно как `Lagged` в логе, а не как зависание.
-fn spawn_event_pump(app: AppHandle, bus: Bus) -> tauri::async_runtime::JoinHandle<()> {
+/// B-8: отставания считаются — диагностика отдаёт и число лагов, и объём
+/// потерянных событий.
+fn spawn_event_pump(
+    app: AppHandle,
+    bus: Bus,
+    lagging_events: Arc<std::sync::atomic::AtomicU64>,
+    lagging_dropped: Arc<std::sync::atomic::AtomicU64>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let mut rx = bus.subscribe();
         loop {
@@ -178,6 +218,8 @@ fn spawn_event_pump(app: AppHandle, bus: Bus) -> tauri::async_runtime::JoinHandl
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    lagging_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    lagging_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                     // Не фатально: сообщаем UI, что нужно перечитать снапшот.
                     let _ = app.emit(
                         "swagcod://event",
@@ -783,6 +825,21 @@ async fn start_turn(
             turn: tid.clone(),
             session: swagcod_core::SessionId::new(&sid),
         });
+        /* B-8: watchdog получает запись о живом ходе. Время — now_ms из
+           шины: диагностика и журнал живут на одних часах. */
+        if let Ok(mut activity) = app_state.turn_activity.lock() {
+            let now = swagcod_core::bus::now_ms();
+            activity.insert(
+                turn.clone(),
+                TurnActivity {
+                    session: sid.clone(),
+                    started_ms: now,
+                    last_ms: now,
+                    waiting_human: false,
+                    warned_ms: None,
+                },
+            );
+        }
 
         /* B-3: контекст — калиброванный счёт, компакция сайд-запросом и
            память проекта. Всё до старта машины: машина получает уже
@@ -871,6 +928,8 @@ async fn start_turn(
         let mut last_usage: Option<(u32, u32)> = None;
 
         let outcome = loop {
+            // B-8: каждый шаг машины — признак жизни для watchdog.
+            touch_turn(&app_state, &turn, None);
             if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
                 step = machine.cancel();
             }
@@ -910,6 +969,9 @@ async fn start_turn(
                     let mut stopped = false;
                     let mut stream_error: Option<String> = None;
                     while let Some(event) = rx.recv().await {
+                        // B-8: токен — событие. Долгая генерация reasoning не
+                        // должна выглядеть для watchdog как зависание.
+                        touch_turn(&app_state, &turn, None);
                         if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
                             stopped = true;
                             handle.abort();
@@ -985,7 +1047,11 @@ async fn start_turn(
                     }
                     // Потеря канала (ход остановлен) считаем отказом: молчаливое
                     // «одобрено» было бы дырой в политике подтверждений.
+                    // B-8: на время ожидания человека watchdog замолкает —
+                    // диалог подтверждения не зависание.
+                    touch_turn(&app_state, &turn, Some(true));
                     let res = rx.await;
+                    touch_turn(&app_state, &turn, Some(false));
                     let actor = if res.is_ok() { "user" } else { "system" };
                     let decision = res.unwrap_or(ApprovalDecision::Denied);
                     /* B-7: журнал подтверждений — кто, что, когда. actor=system
@@ -1094,6 +1160,10 @@ async fn start_turn(
         // Ход закончился — убираем ручку, чтобы «стоп» не бил по прошлому.
         let mut turns = app_state.turns.lock().await;
         turns.remove(&turn);
+        // B-8: watchdog больше не следит за мёртвым ходом.
+        if let Ok(mut activity) = app_state.turn_activity.lock() {
+            activity.remove(&turn);
+        }
     });
 
     // Ручка хода доступна команде stop_turn сразу после старта.
@@ -1840,6 +1910,127 @@ fn clear_protected_key(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     store.set_pref("api_key_dpapi", "").map_err(|e| e.to_string())
 }
 
+/* ── B-8: стабильность под наблюдением ──────────────────────────────────────
+ * Watchdog живых ходов, счётчики Lagging, диагностика. Всё локально,
+ * никакой внешней телеметрии (план B-8). */
+
+/// Ход без событий дольше порога считается подозрительно тихим.
+pub const QUIET_TURN_MS: u64 = 5 * 60 * 1000;
+/// Повторное предупреждение — не чаще этого интервала.
+pub const QUIET_REWARN_MS: u64 = 5 * 60 * 1000;
+/// Период обхода watchdog.
+pub const WATCHDOG_TICK_MS: u64 = 30 * 1000;
+
+/// Отметить признак жизни хода. `waiting_human` — Some при входе/выходе
+/// из ожидания человека (диалог подтверждения).
+fn touch_turn(state: &AppState, turn: &str, waiting_human: Option<bool>) {
+    let Ok(mut activity) = state.turn_activity.lock() else {
+        return;
+    };
+    if let Some(a) = activity.get_mut(turn) {
+        a.last_ms = swagcod_core::bus::now_ms();
+        if let Some(w) = waiting_human {
+            a.waiting_human = w;
+        }
+    }
+}
+
+/// Сканирование watchdog — чистая функция: какие ходы тихие и пора
+/// предупредить. Вход: (turn_id, last_ms, waiting_human, warned_ms).
+/// Ждущий человека ход не предупреждается: тишина в диалоге подтверждения
+/// — это не зависание.
+pub fn quiet_turns_to_warn(
+    entries: &[(String, u64, bool, Option<u64>)],
+    now_ms: u64,
+    quiet_ms: u64,
+    rewarn_ms: u64,
+) -> Vec<(String, u64)> {
+    entries
+        .iter()
+        .filter(|(_, last, waiting, warned)| {
+            !waiting
+                && now_ms.saturating_sub(*last) >= quiet_ms
+                && warned.map_or(true, |w| now_ms.saturating_sub(w) >= rewarn_ms)
+        })
+        .map(|(t, last, ..)| (t.clone(), now_ms.saturating_sub(*last)))
+        .collect()
+}
+
+/// Поток watchdog: раз в 30 с проверяет живые ходы и публикует Status
+/// для подозрительно тихих — UI показывает это как строку статуса вместо
+/// вечного «думает».
+fn spawn_watchdog(state: Arc<AppState>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS));
+        let now = swagcod_core::bus::now_ms();
+        let snapshot: Vec<(String, u64, bool, Option<u64>)> = {
+            let Ok(activity) = state.turn_activity.lock() else {
+                continue;
+            };
+            activity
+                .iter()
+                .map(|(k, a)| (k.clone(), a.last_ms, a.waiting_human, a.warned_ms))
+                .collect()
+        };
+        for (turn, idle_ms) in quiet_turns_to_warn(&snapshot, now, QUIET_TURN_MS, QUIET_REWARN_MS) {
+            state.bus.publish(EventKind::Status {
+                message: format!(
+                    "ход {turn} молчит уже {} мин — подозрительно тихо, возможно завис (стоп в любой момент)",
+                    idle_ms / 60_000
+                ),
+            });
+            if let Ok(mut activity) = state.turn_activity.lock() {
+                if let Some(a) = activity.get_mut(&turn) {
+                    a.warned_ms = Some(now);
+                }
+            }
+        }
+    });
+}
+
+/// Диагностический снимок бекенда для экспорта (план B-8): счётчики
+/// Lagging, живые ходы с возрастом и тишиной, шина, uptime.
+#[tauri::command]
+fn get_diagnostics(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let now = swagcod_core::bus::now_ms();
+    let turns: Vec<serde_json::Value> = state
+        .turn_activity
+        .lock()
+        .map(|activity| {
+            activity
+                .iter()
+                .map(|(k, a)| {
+                    serde_json::json!({
+                        "turn": k,
+                        "session": a.session,
+                        "started_ms": a.started_ms,
+                        "age_ms": now.saturating_sub(a.started_ms),
+                        "idle_ms": now.saturating_sub(a.last_ms),
+                        "waiting_human": a.waiting_human,
+                        "quiet": !a.waiting_human
+                            && now.saturating_sub(a.last_ms) >= QUIET_TURN_MS,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "generated_ms": now,
+        "uptime_ms": now.saturating_sub(start_ms()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "bus": {
+            "seq": state.bus.seq(),
+            "subscribers": state.bus.subscriber_count(),
+        },
+        "lagging": {
+            "events": state.lagging_events.load(std::sync::atomic::Ordering::Relaxed),
+            "dropped": state.lagging_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "active_turns": turns,
+        "sessions": state.sessions.try_lock().map(|s| s.len()).unwrap_or(0),
+    })
+}
+
 /// Чтение файла (для просмотра содержимого и diff).
 #[tauri::command]
 async fn read_file(
@@ -1915,6 +2106,11 @@ fn short_id() -> String {
 }
 
 pub fn run() {
+    /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
+       панику инициализации. Лог — на диске, телеметрии нет. */
+    crashlog::install_hook();
+    let _ = start_ms();
+
     // Загружаем .env если есть (ключ провайдера, базовый URL, модель).
     // Не фатально если файла нет — переменные могут быть в окружении.
     let _ = dotenvy::dotenv();
@@ -1952,7 +2148,14 @@ pub fn run() {
             app.manage(state.clone());
 
             let handle = app.handle().clone();
-            spawn_event_pump(handle, state.bus.clone());
+            spawn_event_pump(
+                handle,
+                state.bus.clone(),
+                state.lagging_events.clone(),
+                state.lagging_dropped.clone(),
+            );
+            // B-8: watchdog живых ходов.
+            spawn_watchdog(state.clone());
 
             state.bus.publish(swagcod_core::bus::EventKind::Status {
                 message: format!("SwagCod {} запущен", env!("CARGO_PKG_VERSION")),
@@ -1987,6 +2190,7 @@ pub fn run() {
             approval_log,
             save_protected_key,
             clear_protected_key,
+            get_diagnostics,
             bus_seq,
             start_turn,
             stop_turn,
@@ -2293,5 +2497,85 @@ mod tests {
         assert!(out.ok, "{out:?}");
         assert!(out.output.contains("plugin-out"), "{out:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- B-8: watchdog и активность ходов ----
+
+    #[test]
+    fn watchdog_warns_only_quiet_turns() {
+        let now = 1_000_000u64;
+        let entries = vec![
+            // Тихий 6 минут — предупреждать.
+            ("t-quiet".to_string(), now - 6 * 60_000, false, None),
+            // Активный 10 секунд назад — молчать.
+            ("t-active".to_string(), now - 10_000, false, None),
+            // Ждёт человека 10 минут — молчать: диалог не зависание.
+            ("t-waiting".to_string(), now - 10 * 60_000, true, None),
+            // Тихий, но предупреждён минуту назад — молчать до rewarn.
+            (
+                "t-warned".to_string(),
+                now - 10 * 60_000,
+                false,
+                Some(now - 60_000),
+            ),
+            // Тихий и предупреждён 6 минут назад — снова предупреждать.
+            (
+                "t-rewarn".to_string(),
+                now - 12 * 60_000,
+                false,
+                Some(now - 6 * 60_000),
+            ),
+        ];
+        let mut warned = quiet_turns_to_warn(&entries, now, QUIET_TURN_MS, QUIET_REWARN_MS);
+        warned.sort();
+        let ids: Vec<&str> = warned.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(ids, vec!["t-quiet", "t-rewarn"]);
+        // idle_ms честный: для t-quiet это 6 минут.
+        let quiet = warned.iter().find(|(t, _)| t == "t-quiet").unwrap();
+        assert_eq!(quiet.1, 6 * 60_000);
+    }
+
+    #[test]
+    fn watchdog_threshold_boundary_is_inclusive() {
+        let now = 500_000u64;
+        let exactly = vec![("t".to_string(), now - QUIET_TURN_MS, false, None)];
+        assert_eq!(quiet_turns_to_warn(&exactly, now, QUIET_TURN_MS, QUIET_REWARN_MS).len(), 1);
+        let just_under = vec![("t".to_string(), now - QUIET_TURN_MS + 1, false, None)];
+        assert!(quiet_turns_to_warn(&just_under, now, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
+    }
+
+    #[test]
+    fn touch_turn_updates_activity_and_human_flag() {
+        let state = AppState::default();
+        let now = swagcod_core::bus::now_ms();
+        state.turn_activity.lock().unwrap().insert(
+            "t1".into(),
+            TurnActivity {
+                session: "s1".into(),
+                started_ms: now - 60_000,
+                last_ms: now - 60_000,
+                waiting_human: false,
+                warned_ms: None,
+            },
+        );
+        touch_turn(&state, "t1", Some(true));
+        {
+            let a = state.turn_activity.lock().unwrap();
+            let e = a.get("t1").unwrap();
+            assert!(e.waiting_human, "флаг ожидания человека установлен");
+            assert!(e.last_ms >= now, "время жизни обновлено");
+        }
+        touch_turn(&state, "t1", Some(false));
+        assert!(!state.turn_activity.lock().unwrap()["t1"].waiting_human);
+        // Чужой ход не создаёт запись из воздуха.
+        touch_turn(&state, "t-missing", None);
+        assert!(!state.turn_activity.lock().unwrap().contains_key("t-missing"));
+    }
+
+    #[test]
+    fn quiet_turns_pure_function_has_no_clock() {
+        // Часы — параметр: функция детерминирована и не спит в тестах.
+        let entries: Vec<(String, u64, bool, Option<u64>)> = vec![];
+        assert!(quiet_turns_to_warn(&entries, 0, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
     }
 }

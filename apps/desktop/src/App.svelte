@@ -1058,8 +1058,18 @@
     }
   }
 
-  /** Диагностический снимок: сборка, сессия, шина, внешний вид. */
-  function exportDiagnostics(): void {
+  /** Диагностический снимок: сборка, сессия, шина, внешний вид + бекенд (B-8). */
+  async function exportDiagnostics(): Promise<void> {
+    /* B-8: бекенд-диагностика (Lagging-счётчики, живые ходы с возрастом и
+       тишиной, uptime). В браузере без Tauri поля просто не будет. */
+    let backend: unknown = null
+    if (tauriAvailable) {
+      try {
+        backend = await invoke('get_diagnostics')
+      } catch (err) {
+        backend = { error: String(err) }
+      }
+    }
     const payload = {
       generatedAt: new Date().toISOString(),
       build: info,
@@ -1077,6 +1087,7 @@
         acc[i.kind] = (acc[i.kind] || 0) + 1
         return acc
       }, {}),
+      backend,
     }
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
