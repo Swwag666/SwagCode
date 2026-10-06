@@ -1,12 +1,12 @@
 /// Быстрый тест живого стрима: отправляет запрос провайдеру и печатает события.
 /// Запуск: cargo run --release -p swagcod-app --example live_stream
-use swagcod_provider::{ChatMessage, ChatRequest, Provider, StreamEvent};
+use swagcod_provider::{ChatMessage, ChatRequest, Provider, Router, StreamEvent};
 
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
 
-    let provider = match Provider::from_env() {
+    let provider = match Router::from_env() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("провайдер: {e}");
@@ -14,7 +14,7 @@ async fn main() {
         }
     };
 
-    println!("base_url: {}", provider.base_url());
+    println!("провайдер: {} (эндпоинтов: {})", provider.name(), provider.len());
 
     let request = ChatRequest::new(
         std::env::var("SWAGCOD_MODEL").unwrap_or_else(|_| "fable-ultra-promax".into()),

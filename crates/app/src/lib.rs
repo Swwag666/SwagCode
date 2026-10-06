@@ -18,7 +18,7 @@ use swagcod_core::turn::{
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall, ToolSpec};
-use swagcod_provider::{ChatRequest, Provider, StreamEvent};
+use swagcod_provider::{ChatRequest, Provider, Router, StreamEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
 
@@ -705,7 +705,7 @@ async fn start_turn(
     }
 
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
-    let provider = Provider::from_env().map_err(|e| format!("провайдер: {e}"))?;
+    let provider = Router::from_env().map_err(|e| format!("провайдер: {e}"))?;
 
     let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
@@ -1751,7 +1751,7 @@ async fn read_file(
 /// Список моделей провайдера.
 #[tauri::command]
 async fn list_models() -> Result<serde_json::Value, String> {
-    let provider = Provider::from_env().map_err(|e| format!("провайдер: {e}"))?;
+    let provider = Router::from_env().map_err(|e| format!("провайдер: {e}"))?;
     provider
         .list_models()
         .await

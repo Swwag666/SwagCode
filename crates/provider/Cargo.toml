@@ -16,7 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 
 [features]
 default = ["http"]

@@ -1,4 +1,4 @@
-/*! OpenAI-совместимый провайдер (D-005).
+/*! OpenAI-совместимый провайдер (D-005) и маршрутизация (B-6).
 
 Протокол: `POST /chat/completions` с `stream: true`, ответ — SSE.
 
@@ -14,8 +14,13 @@
    `arguments` — кусками JSON-строки в последующих. Аргументы буферизуются по
    индексу и парсятся только после `finish_reason`.
 
-Также: `usage` в чанках приходит `null`, поэтому токены и стоимость считаются
-на стороне клиента, а не берутся у провайдера.
+Также: `usage` в чанках живого эндпоинта приходит `null`, поэтому токены
+считаются на стороне клиента (калибровка B-3); провайдеры, которые usage
+присылают, отдают его событием [`StreamEvent::Usage`].
+
+B-6: [`Provider`] — trait (stream, list_models), [`OpenAiProvider`] —
+реализация для OpenAI-совместимых эндпоинтов (включая Ollama/llama.cpp с
+пустым ключом), [`Router`] — fallback-цепочка с backoff и jitter.
 */
 
 pub mod sse;
@@ -23,9 +28,13 @@ pub mod types;
 
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod router;
 
 pub use sse::{SseParser, StreamEvent};
 pub use types::{ChatMessage, ChatRequest, Role, ToolCall, ToolSpec};
 
 #[cfg(feature = "http")]
-pub use http::Provider;
+pub use http::{OpenAiProvider, ProviderError};
+#[cfg(feature = "http")]
+pub use router::{backoff_delay, parse_fallbacks, Provider, Router, RouterEndpoint};

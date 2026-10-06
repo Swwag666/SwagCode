@@ -23,16 +23,21 @@ pub enum ProviderError {
     Config(String),
 }
 
-/// Клиент провайдера. Дёшев в создании, клонируется свободно.
+/// Клиент OpenAI-совместимого эндпоинта (B-6: конкретная реализация
+/// trait [`crate::Provider`]). Дёшев в создании, клонируется свободно.
+///
+/// Тот же протокол konuşат Ollama (`/v1`) и llama.cpp (`--api`): для них
+/// base_url другой, а api_key может быть пустым — [`OpenAiProvider::new_open`].
 #[derive(Debug, Clone)]
-pub struct Provider {
+pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
     client: reqwest::Client,
 }
 
-impl Provider {
-    /// `base_url` — например `https://rustvy.xyz/v1`.
+impl OpenAiProvider {
+    /// `base_url` — например `https://rustvy.xyz/v1`. Ключ обязателен:
+    /// облачный эндпоинт без ключа — почти всегда ошибка конфигурации (D-009).
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -47,6 +52,20 @@ impl Provider {
                 "пустой api_key (D-009: ключ читается из .env)".into(),
             ));
         }
+        Self::build(base_url, api_key)
+    }
+
+    /// Локальный эндпоинт без ключа: Ollama, llama.cpp, vLLM без auth.
+    /// Пустой ключ разрешён намеренно — Authorization не отправляется вовсе.
+    pub fn new_open(base_url: impl Into<String>) -> Result<Self, ProviderError> {
+        let base_url = base_url.into();
+        if base_url.trim().is_empty() {
+            return Err(ProviderError::Config("пустой base_url".into()));
+        }
+        Self::build(base_url, String::new())
+    }
+
+    fn build(base_url: String, api_key: String) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             // Таймаут только на соединение: стрим может идти минуты, и обрывать
             // его по общему таймауту нельзя — потеряем ход.
@@ -73,13 +92,20 @@ impl Provider {
         &self.base_url
     }
 
+    /// Заголовок Authorization: пустой ключ = заголовка нет (локальные серверы).
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            rb
+        } else {
+            rb.bearer_auth(&self.api_key)
+        }
+    }
+
     /// Список моделей провайдера. Возвращает сырой JSON: формат `data[]`
     /// различается у агрегаторов, а нормализация нам пока не нужна.
     pub async fn list_models(&self) -> Result<serde_json::Value, ProviderError> {
         let resp = self
-            .client
-            .get(format!("{}/models", self.base_url))
-            .bearer_auth(&self.api_key)
+            .auth(self.client.get(format!("{}/models", self.base_url)))
             .send()
             .await
             .map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -122,14 +148,14 @@ impl Provider {
                     return;
                 }
             };
-            let resp = match client
+            let mut rb = client
                 .post(&url)
-                .bearer_auth(&key)
                 .header("accept", "text/event-stream")
-                .json(&serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default())
-                .send()
-                .await
-            {
+                .json(&serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default());
+            if !key.is_empty() {
+                rb = rb.bearer_auth(&key);
+            }
+            let resp = match rb.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(StreamEvent::Error(format!("http: {e}"))).await;
