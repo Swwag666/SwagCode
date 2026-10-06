@@ -1,0 +1,461 @@
+/*! Персистентность сессий и настроек (этап B-1).
+
+Синхронный SQLite, вмурованный в бинарник (`rusqlite` + `bundled`): философия
+better-sqlite — sync API без async-обвязки, потому что SQLite быстр, а async
+над ним дал бы только сложность. Режим WAL: запись в конце хода не блокирует
+читателей во время стрима.
+
+Схема минимальна и соответствует домену: сессия, ходы, сообщения истории и
+ключ-значение настроек. История хода пишется пачкой в одной транзакции в
+конце хода — оборванный процесс не оставляет полупустой ход (WAL + транзакция).
+*/
+
+use std::path::Path;
+
+use rusqlite::{params, Connection};
+
+use crate::session::{Session, SessionId, SessionStatus, TurnRecord};
+use swagcod_provider::types::{ChatMessage, Role, ToolCall};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("база: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("файл: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
+/// Схема и режимы. WAL и NORMAL выставляются сразу: после перезапуска
+/// приложения база обязана продолжать писать без настройки извне.
+const SCHEMA: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS sessions(
+  id TEXT PRIMARY KEY,
+  cwd TEXT NOT NULL,
+  model TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  created_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS turns(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  started_ms INTEGER NOT NULL,
+  ended_ms INTEGER,
+  ok INTEGER NOT NULL,
+  failure TEXT,
+  content TEXT NOT NULL,
+  reasoning TEXT NOT NULL,
+  tool_calls_json TEXT NOT NULL DEFAULT '[]',
+  est_in INTEGER NOT NULL DEFAULT 0,
+  est_out INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ord INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  reasoning TEXT NOT NULL DEFAULT '',
+  tool_call_id TEXT,
+  tool_calls_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS prefs(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
+"#;
+
+/// Хранилище: синхронный контракт домена над персистентностью.
+///
+/// Реализация одна (`SqliteStore`), но контракт отдельный: тесты и будущие
+/// бэкенды (например, репликация) не зависят от SQLite напрямую.
+pub trait Store {
+    fn create_session(&self, s: &Session) -> StoreResult<()>;
+    fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()>;
+    fn delete_session(&self, id: &str) -> StoreResult<()>;
+    /// Все сессии с историей и ходами, в порядке создания.
+    fn load_all(&self) -> StoreResult<Vec<Session>>;
+    fn load_session(&self, id: &str) -> StoreResult<Option<Session>>;
+    /// Ход плюс снимок истории пишутся одной транзакцией.
+    fn save_turn(&self, session_id: &str, turn: &TurnRecord, history: &[ChatMessage]) -> StoreResult<()>;
+    fn get_pref(&self, key: &str) -> StoreResult<Option<String>>;
+    fn set_pref(&self, key: &str, value: &str) -> StoreResult<()>;
+}
+
+/// SQLite-реализация контракта [`Store`].
+pub struct SqliteStore {
+    conn: Connection,
+}
+
+impl SqliteStore {
+    /// Открыть (и создать) базу по пути, подняв схему и режимы.
+    pub fn open(path: &Path) -> StoreResult<Self> {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn })
+    }
+
+    /// In-memory база для тестов: та же схема, те же режимы.
+    pub fn in_memory() -> StoreResult<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn })
+    }
+
+    /// Целостность базы: используется краш-тестами после обрыва процесса.
+    pub fn integrity_check(&self) -> StoreResult<String> {
+        let ok: String = self.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        Ok(ok)
+    }
+}
+
+fn role_to_str(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+fn role_from_str(s: &str) -> Role {
+    match s {
+        "system" => Role::System,
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => Role::Tool,
+    }
+}
+
+impl Store for SqliteStore {
+    fn create_session(&self, s: &Session) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions(id, cwd, model, title, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![s.id.as_str(), s.cwd, s.model, s.title, s.created_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()> {
+        self.conn
+            .execute("UPDATE sessions SET title = ?2 WHERE id = ?1", params![id, title])?;
+        Ok(())
+    }
+
+    fn delete_session(&self, id: &str) -> StoreResult<()> {
+        // Каскад удаляет ходы и сообщения следом за сессией.
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    fn load_all(&self) -> StoreResult<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, cwd, model, title, created_ms FROM sessions ORDER BY created_ms, id",
+        )?;
+        let ids: Vec<(String, String, String, String, u64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, i64>(4)? as u64,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, cwd, model, title, created_ms) in ids {
+            let mut ses = Session::new(SessionId::new(&id), cwd, model);
+            ses.title = title;
+            ses.created_ms = created_ms;
+            ses.status = SessionStatus::Idle;
+            fill_session(&self.conn, &mut ses)?;
+            out.push(ses);
+        }
+        Ok(out)
+    }
+
+    fn load_session(&self, id: &str) -> StoreResult<Option<Session>> {
+        let row = self.conn.query_row(
+            "SELECT cwd, model, title, created_ms FROM sessions WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            },
+        );
+        let (cwd, model, title, created_ms) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ses = Session::new(SessionId::new(id), cwd, model);
+        ses.title = title;
+        ses.created_ms = created_ms;
+        ses.status = SessionStatus::Idle;
+        fill_session(&self.conn, &mut ses)?;
+        Ok(Some(ses))
+    }
+
+    fn save_turn(&self, session_id: &str, turn: &TurnRecord, history: &[ChatMessage]) -> StoreResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let tools_json = serde_json::to_string(&turn.tool_calls)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                turn.id.as_str(),
+                session_id,
+                turn.started_ms as i64,
+                turn.ended_ms.map(|v| v as i64),
+                turn.ok,
+                turn.failure,
+                turn.content,
+                turn.reasoning,
+                tools_json,
+                turn.est_input_tokens as i64,
+                turn.est_output_tokens as i64,
+            ],
+        )?;
+        // Снимок истории целиком: порядок и содержимое восстанавливаются
+        // байт-в-байт, без учёта инкрементальных хвостов.
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO messages(session_id, ord, role, content, reasoning, tool_call_id, tool_calls_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (ord, m) in history.iter().enumerate() {
+                let tools = serde_json::to_string(&m.tool_calls)?;
+                stmt.execute(params![
+                    session_id,
+                    ord as i64,
+                    role_to_str(m.role),
+                    m.content,
+                    m.reasoning,
+                    m.tool_call_id,
+                    tools,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn get_pref(&self, key: &str) -> StoreResult<Option<String>> {
+        let row = self
+            .conn
+            .query_row("SELECT value FROM prefs WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            });
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn set_pref(&self, key: &str, value: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
+/// Ходы и сообщения сессии из базы в живую структуру.
+fn fill_session(conn: &Connection, ses: &mut Session) -> StoreResult<()> {
+    let mut tstmt = conn.prepare(
+        "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out
+         FROM turns WHERE session_id = ?1 ORDER BY started_ms, id",
+    )?;
+    let turns = tstmt
+        .query_map(params![ses.id.as_str()], |r| {
+            let tools_json: String = r.get(7)?;
+            Ok(TurnRecord {
+                id: crate::session::TurnId::new(r.get::<_, String>(0)?),
+                started_ms: r.get::<_, i64>(1)? as u64,
+                ended_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                ok: r.get(3)?,
+                failure: r.get(4)?,
+                content: r.get(5)?,
+                reasoning: r.get(6)?,
+                tool_calls: serde_json::from_str(&tools_json).unwrap_or_default(),
+                est_input_tokens: r.get::<_, i64>(8)? as u32,
+                est_output_tokens: r.get::<_, i64>(9)? as u32,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    ses.turns = turns;
+
+    let mut mstmt = conn.prepare(
+        "SELECT role, content, reasoning, tool_call_id, tool_calls_json
+         FROM messages WHERE session_id = ?1 ORDER BY ord, id",
+    )?;
+    let history = mstmt
+        .query_map(params![ses.id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .map(|row| {
+            let (role, content, reasoning, tool_call_id, tools_json) = row?;
+            let tool_calls: Vec<ToolCall> = serde_json::from_str(&tools_json)?;
+            Ok::<_, StoreError>(ChatMessage {
+                role: role_from_str(&role),
+                content,
+                reasoning,
+                tool_calls,
+                tool_call_id,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ses.history = history;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::TurnId;
+
+    fn sample_session() -> Session {
+        let mut ses = Session::new(SessionId::new("s-1"), "D:/proj", "test-model");
+        ses.title = "проба".to_string();
+        ses.push_user_message("привет");
+        ses.push_assistant_message(ChatMessage {
+            role: Role::Assistant,
+            content: "здравствуй".to_string(),
+            reasoning: "думаю".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "c-1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::Map::new(),
+            }],
+            tool_call_id: None,
+        });
+        ses.push_tool_result("c-1", "содержимое файла");
+        ses
+    }
+
+    fn sample_turn(n: u64) -> TurnRecord {
+        TurnRecord {
+            id: TurnId::new(format!("t-{n}")),
+            started_ms: 1000 + n,
+            ended_ms: Some(2000 + n),
+            content: format!("ответ {n}"),
+            reasoning: format!("мысли {n}"),
+            tool_calls: vec![],
+            est_input_tokens: 10,
+            est_output_tokens: 20,
+            ok: true,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn roundtrip_history_is_byte_equal() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        let turn = sample_turn(1);
+        store.save_turn(ses.id.as_str(), &turn, &ses.history).unwrap();
+
+        let loaded = store.load_session("s-1").unwrap().expect("сессия есть");
+        assert_eq!(serde_json::to_string(&loaded.history).unwrap(), serde_json::to_string(&ses.history).unwrap());
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0], turn);
+        assert_eq!(loaded.title, "проба");
+        assert_eq!(loaded.cwd, "D:/proj");
+    }
+
+    #[test]
+    fn load_all_keeps_creation_order_and_delete_cascades() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = sample_session();
+        let mut b = Session::new(SessionId::new("s-2"), "D:/other", "test-model");
+        b.created_ms = a.created_ms + 5;
+        store.create_session(&a).unwrap();
+        store.create_session(&b).unwrap();
+        store.save_turn(a.id.as_str(), &sample_turn(1), &a.history).unwrap();
+
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id.as_str(), "s-1");
+        assert_eq!(all[1].id.as_str(), "s-2");
+
+        store.delete_session("s-1").unwrap();
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id.as_str(), "s-2");
+        // Каскад: ходов и сообщений удалённой сессии в базе не осталось.
+        let turns: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM turns WHERE session_id = 's-1'", [], |r| r.get(0))
+            .unwrap();
+        let msgs: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 's-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(turns, 0);
+        assert_eq!(msgs, 0);
+    }
+
+    #[test]
+    fn prefs_set_get_overwrite() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert_eq!(store.get_pref("theme").unwrap(), None);
+        store.set_pref("theme", "dark").unwrap();
+        store.set_pref("theme", "matrix").unwrap();
+        assert_eq!(store.get_pref("theme").unwrap().as_deref(), Some("matrix"));
+    }
+
+    #[test]
+    fn crash_between_writes_keeps_db_intact() {
+        // База в файле: первый владелец роняет соединение без закрытия
+        // (имитация обрыва процесса), WAL обязана пережить это.
+        let dir = std::env::temp_dir().join(format!("swagcod-store-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crash.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let ses = sample_session();
+            store.create_session(&ses).unwrap();
+            store.save_turn(ses.id.as_str(), &sample_turn(1), &ses.history).unwrap();
+            // Намеренно не закрываем: соединение уходит без drop-семантики
+            // закрытия, как при kill процесса.
+            std::mem::forget(store);
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.integrity_check().unwrap(), "ok");
+        let loaded = store.load_session("s-1").unwrap().expect("сессия пережила обрыв");
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.history.len(), 3);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

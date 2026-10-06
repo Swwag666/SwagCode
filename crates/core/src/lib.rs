@@ -13,6 +13,7 @@
 
 pub mod bus;
 pub mod session;
+pub mod store;
 pub mod turn;
 
 pub use bus::{Bus, BusError, Event, EventKind};

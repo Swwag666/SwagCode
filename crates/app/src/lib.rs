@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId};
+use swagcod_core::store::Store;
 use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
@@ -39,6 +40,10 @@ pub struct AppState {
     /// команда `respond_approval` стреляет в sender. Решение человека
     /// приходит в ядро, а не исполняется в UI (DECISIONS.md §2).
     pub approvals: Mutex<std::collections::HashMap<String, oneshot::Sender<ApprovalDecision>>>,
+    /// B-1: персистентность сессий и настроек. Синхронный SQLite за
+    /// std-мьютексом: операции миллисекундные, async над ними дал бы
+    /// только сложность (философия better-sqlite из плана B-1).
+    pub store: std::sync::Mutex<swagcod_core::store::SqliteStore>,
 }
 
 impl Default for AppState {
@@ -49,6 +54,10 @@ impl Default for AppState {
             config: Mutex::new(TurnConfig::default()),
             turns: Mutex::new(std::collections::HashMap::new()),
             approvals: Mutex::new(std::collections::HashMap::new()),
+            store: std::sync::Mutex::new(
+                swagcod_core::store::SqliteStore::in_memory()
+                    .expect("in-memory SQLite не может не открыться"),
+            ),
         }
     }
 }
@@ -469,6 +478,13 @@ async fn create_session(
     let id = SessionId::new(format!("s-{}", short_id()));
     let session = Session::new(id.clone(), cwd, model);
     let brief = SessionBrief::from(&session);
+    /* B-1: сессия сразу уходит в store — перезапуск не потеряет даже
+       сессию без единого хода. */
+    if let Ok(store) = state.store.lock() {
+        if let Err(e) = store.create_session(&session) {
+            eprintln!("store: сессия не записана: {e}");
+        }
+    }
     state.sessions.lock().await.push(session);
     state.bus.publish(swagcod_core::bus::EventKind::Status {
         message: format!("сессия {id} создана"),
@@ -492,6 +508,50 @@ async fn set_approval_policy(
 #[tauri::command]
 async fn bus_seq(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
     Ok(state.bus.seq())
+}
+
+/// B-1: файл базы в локальном профиле: %LOCALAPPDATA%\SwagCod\swagcod.db.
+fn db_path() -> Result<std::path::PathBuf, String> {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "не удалось определить локальный профиль".to_string())?;
+    Ok(std::path::PathBuf::from(base).join("SwagCod").join("swagcod.db"))
+}
+
+/// B-1: удаление сессии из памяти и из store — закрытие давнего stub в UI.
+/// Занятую сессию не удаляем: ход пишет историю прямо сейчас.
+#[tauri::command]
+async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    {
+        let sessions = state.sessions.lock().await;
+        match sessions.iter().find(|s| s.id.to_string() == session_id) {
+            Some(s) if s.status.is_busy() => {
+                return Err("нельзя удалить сессию: идёт ход".into())
+            }
+            None => return Err(format!("сессия {session_id} не найдена")),
+            Some(_) => {}
+        }
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.retain(|s| s.id.to_string() != session_id);
+    }
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.delete_session(&session_id).map_err(|e| e.to_string())
+}
+
+/// B-1: настройки ключ-значение в store. Фронтенд пишет с debounce 500 мс,
+/// чтобы не дёргать диск на каждый чих студии тем.
+#[tauri::command]
+fn get_pref(state: State<'_, Arc<AppState>>, key: String) -> Result<Option<String>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.get_pref(&key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_pref(state: State<'_, Arc<AppState>>, key: String, value: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.set_pref(&key, &value).map_err(|e| e.to_string())
 }
 
 /// Запустить ход: сообщение пользователя → агентский цикл → журнал сессии.
@@ -736,13 +796,20 @@ async fn start_turn(
                 // История сессии — это история машины: assistant с tool_calls
                 // всегда закрыт ответами tool, следующий запрос валиден.
                 session.history = machine.history().to_vec();
-                session.turns.push(record);
+                session.turns.push(record.clone());
                 session.status = match outcome {
                     TurnOutcome::Cancelled => swagcod_core::session::SessionStatus::Cancelled,
                     TurnOutcome::Failed => swagcod_core::session::SessionStatus::Failed,
                     _ => swagcod_core::session::SessionStatus::Idle,
                 };
                 session.current_turn = None;
+                /* B-1: ход и снимок истории уходят в store одной транзакцией
+                   прямо здесь, в конце хода. */
+                if let Ok(store) = app_state.store.lock() {
+                    if let Err(e) = store.save_turn(&sid, &record, &session.history) {
+                        eprintln!("store: ход не записан: {e}");
+                    }
+                }
             }
         }
 
@@ -1112,7 +1179,26 @@ pub fn run() {
             }
         }))
         .setup(|app| {
-            let state = Arc::new(AppState::default());
+            let mut state = AppState::default();
+            /* B-1: файловая база в локальном профиле и сидирование сессий
+               из неё — история переживает перезапуск приложения. */
+            match db_path() {
+                Ok(path) => match swagcod_core::store::SqliteStore::open(&path) {
+                    Ok(store) => state.store = std::sync::Mutex::new(store),
+                    Err(e) => eprintln!("store: не открыл базу {path:?}: {e}"),
+                },
+                Err(e) => eprintln!("store: нет пути базы: {e}"),
+            }
+            let state = Arc::new(state);
+            if let Ok(store) = state.store.lock() {
+                match store.load_all() {
+                    Ok(loaded) => {
+                        let mut sessions = state.sessions.blocking_lock();
+                        *sessions = loaded;
+                    }
+                    Err(e) => eprintln!("store: не прочитал сессии: {e}"),
+                }
+            }
             app.manage(state.clone());
 
             let handle = app.handle().clone();
@@ -1133,6 +1219,9 @@ pub fn run() {
             save_session_log,
             list_sessions,
             create_session,
+            delete_session,
+            get_pref,
+            set_pref,
             set_approval_policy,
             bus_seq,
             start_turn,

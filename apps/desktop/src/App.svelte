@@ -201,7 +201,10 @@
     root.style.setProperty('--row-estimate', `${Math.round(fontSize * 5.5)}px`)
   })
 
-  $effect(() => { localStorage.setItem('swagcod-appearance', appearance) })
+  $effect(() => {
+    localStorage.setItem('swagcod-appearance', appearance)
+    persistPref('appearance', appearance)
+  })
   $effect(() => { localStorage.setItem('swagcod-fontsize', String(fontSize)) })
   $effect(() => { localStorage.setItem('swagcod-zoom', String(uiZoom)) })
   $effect(() => {
@@ -210,11 +213,37 @@
   })
   $effect(() => { localStorage.setItem('swagcod-sidebar-w', String(Math.round(sidebarWidth))) })
   $effect(() => { localStorage.setItem('swagcod-sidebar-collapsed', sidebarCollapsed ? '1' : '0') })
-  $effect(() => { localStorage.setItem('swagcod-perm', permissionMode) })
-  $effect(() => { localStorage.setItem('swagcod-lang', uiLang) })
-  $effect(() => { localStorage.setItem('swagcod-model', modelName) })
+  $effect(() => {
+    localStorage.setItem('swagcod-perm', permissionMode)
+    persistPref('perm', permissionMode)
+  })
+  $effect(() => {
+    localStorage.setItem('swagcod-lang', uiLang)
+    persistPref('lang', uiLang)
+  })
+  $effect(() => {
+    localStorage.setItem('swagcod-model', modelName)
+    persistPref('model', modelName)
+  })
 
   const transcriptsBySession = new Map<string, TranscriptModel>()
+
+  /* B-1: настройки дублируются в store ядра с debounce 500 мс — диск не
+     дёргается на каждый чих студии тем, а перезапуск на другой машине
+     профиля сможет их прочитать. localStorage остаётся для мгновенного
+     применения до старта ядра. */
+  const prefTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  function persistPref(key: string, value: string): void {
+    const old = prefTimers.get(key)
+    if (old) clearTimeout(old)
+    prefTimers.set(
+      key,
+      setTimeout(() => {
+        prefTimers.delete(key)
+        invoke('set_pref', { key, value }).catch(() => {})
+      }, 500),
+    )
+  }
   /** Указатель на транскрипт активной сессии (меняется при переключении). */
   let transcript: TranscriptModel = new TranscriptModel()
   /* Массив элементов НЕ $state: его мутирует модель транскрипции, а UI

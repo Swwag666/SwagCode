@@ -61,9 +61,16 @@
     contextMenu = null
   }
 
-  function deleteSession(): void {
-    // TODO: invoke delete_session
+  async function deleteSession(): Promise<void> {
+    const target = contextMenu?.session.id
     closeContextMenu()
+    if (!target) return
+    try {
+      await invoke('delete_session', { sessionId: target })
+    } catch (e) {
+      console.error('delete_session', e)
+    }
+    await refresh()
   }
 
   async function refresh(): Promise<void> {
