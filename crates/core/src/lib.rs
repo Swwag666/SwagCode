@@ -18,6 +18,6 @@ pub mod turn;
 pub use bus::{Bus, BusError, Event, EventKind};
 pub use session::{Session, SessionId, SessionStatus, TurnId, TurnRecord};
 pub use turn::{
-    ApprovalDecision, ApprovalPolicy, TurnConfig, TurnOutcome, TurnReport, DEFAULT_MAX_ITERATIONS,
-    MAX_TOOL_OUTPUT_BYTES,
+    builtin_tool_specs, ApprovalDecision, ApprovalPolicy, ToolOutcome, TurnConfig, TurnMachine,
+    TurnOutcome, TurnReport, TurnStep, DEFAULT_MAX_ITERATIONS, MAX_TOOL_OUTPUT_BYTES,
 };

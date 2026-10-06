@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use swagcod_provider::sse::StreamEvent;
-use swagcod_provider::types::{ChatMessage, Role, ToolCall};
+use swagcod_provider::types::{ChatMessage, Role, ToolCall, ToolSpec};
 
+use crate::bus::now_ms;
 use crate::session::{TurnId, TurnRecord};
 
 /// Максимум итераций «модель → тулзы» внутри одного хода.
@@ -229,6 +230,248 @@ pub fn describe_call(call: &ToolCall) -> String {
     let args = serde_json::to_string(&call.arguments).unwrap_or_default();
     let short: String = args.chars().take(300).collect();
     format!("{} {short}", call.name)
+}
+
+/* ── Цикл хода: чистая state machine ───────────────────────────────────────
+ * [`TurnMachine`] — тот самый [`TurnRunner`]-цикл из шапки модуля, но без
+ * сети и файлов: она принимает накопленный стрим и результаты тулзов и
+ * говорит драйверу (crates/app), какое действие выполнить следующим.
+ * Драйвер поэтому тонкий, а весь цикл прогоняется headless на записанных
+ * стримах: лимит итераций, approval и история проверяются без ключа. */
+
+/// Результат выполнения одного вызова инструмента.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutcome {
+    pub ok: bool,
+    pub output: String,
+}
+
+/// Следующее действие для драйвера цикла.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnStep {
+    /// Отправить `history` модели и стримить ответ до конца.
+    RequestModel { history: Vec<ChatMessage> },
+    /// Вызов требует решения человека: драйвер показывает диалог и вернёт
+    /// ответ через [`TurnMachine::on_approval`].
+    AwaitApproval { call: ToolCall },
+    /// Выполнить вызов и вернуть результат через [`TurnMachine::on_tool_result`].
+    ExecuteTool { call: ToolCall },
+    /// Ход закончен; отчёт берётся [`TurnMachine::report`].
+    Finish { outcome: TurnOutcome },
+}
+
+/// State machine одного хода: история + очередь вызовов текущего ответа.
+///
+/// Инвариант: каждое сообщение ассистента с `tool_calls` в истории всегда
+/// закрыто сообщениями `tool` по каждому вызову — иначе OpenAI-совместимый
+/// сервер отклонит следующий запрос. Отклонённый вызов тоже закрывается
+/// сообщением `tool` с текстом отказа.
+#[derive(Debug)]
+pub struct TurnMachine {
+    config: TurnConfig,
+    history: Vec<ChatMessage>,
+    iterations: usize,
+    executed_calls: usize,
+    /// Вызовы последнего ответа модели, которые ещё не обработаны.
+    pending: Vec<ToolCall>,
+    content: String,
+    reasoning: String,
+    started_ms: u64,
+}
+
+impl TurnMachine {
+    /// Начать ход. Первый шаг всегда — запрос модели.
+    pub fn new(config: TurnConfig, history: Vec<ChatMessage>) -> (Self, TurnStep) {
+        let machine = Self {
+            config,
+            history,
+            iterations: 0,
+            executed_calls: 0,
+            pending: Vec::new(),
+            content: String::new(),
+            reasoning: String::new(),
+            started_ms: now_ms(),
+        };
+        let step = machine.request_step();
+        (machine, step)
+    }
+
+    fn request_step(&self) -> TurnStep {
+        TurnStep::RequestModel {
+            history: self.history.clone(),
+        }
+    }
+
+    /// Стрим текущего запроса закончился, `acc` — накопленный ответ.
+    pub fn on_stream(&mut self, acc: StreamAccumulator) -> TurnStep {
+        self.iterations += 1;
+        push_joined(&mut self.content, &acc.content);
+        push_joined(&mut self.reasoning, &acc.reasoning);
+        self.history.push(build_assistant_message(&acc));
+
+        // Модель закончила сама: вызовов нет — ход завершён.
+        if acc.tool_calls.is_empty() {
+            self.pending.clear();
+            return TurnStep::Finish {
+                outcome: TurnOutcome::Completed,
+            };
+        }
+        self.pending = acc.tool_calls;
+        self.next_call_step()
+    }
+
+    /// Решение человека по вызову, стоящему первым в очереди.
+    pub fn on_approval(&mut self, decision: ApprovalDecision) -> TurnStep {
+        let Some(call) = self.pending.first().cloned() else {
+            return TurnStep::Finish {
+                outcome: TurnOutcome::Failed,
+            };
+        };
+        match decision {
+            ApprovalDecision::Approved => TurnStep::ExecuteTool { call },
+            ApprovalDecision::Denied => {
+                self.close_call(
+                    &call,
+                    ToolOutcome {
+                        ok: false,
+                        output: "вызов отклонён пользователем".into(),
+                    },
+                );
+                self.after_queue()
+            }
+        }
+    }
+
+    /// Результат выполнения вызова, стоявшего первым в очереди.
+    pub fn on_tool_result(&mut self, outcome: ToolOutcome) -> TurnStep {
+        let Some(call) = self.pending.first().cloned() else {
+            return TurnStep::Finish {
+                outcome: TurnOutcome::Failed,
+            };
+        };
+        self.executed_calls += 1;
+        self.close_call(&call, outcome);
+        self.after_queue()
+    }
+
+    /// Прервать ход снаружи (кнопка «стоп»): драйвер больше не спрашивает шагов.
+    pub fn cancel(&self) -> TurnStep {
+        TurnStep::Finish {
+            outcome: TurnOutcome::Cancelled,
+        }
+    }
+
+    /// Отчёт о ходе для журнала сессии.
+    pub fn report(&self, outcome: TurnOutcome, ended_ms: u64) -> TurnReport {
+        TurnReport {
+            outcome,
+            content: self.content.clone(),
+            reasoning: self.reasoning.clone(),
+            iterations: self.iterations,
+            tool_calls: self.executed_calls,
+            started_ms: self.started_ms,
+            ended_ms,
+        }
+    }
+
+    /// История на текущий момент: драйвер сохраняет её в сессию после хода.
+    pub fn history(&self) -> &[ChatMessage] {
+        &self.history
+    }
+
+    fn close_call(&mut self, call: &ToolCall, outcome: ToolOutcome) {
+        self.pending.remove(0);
+        self.history.push(ChatMessage {
+            role: Role::Tool,
+            // Большой вывод режем здесь, а не в исполнителе: лимит — свойство
+            // контекста, а не конкретного тулза.
+            content: truncate_output(&outcome.output),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call.id.clone()),
+        });
+    }
+
+    /// Очередь опустела: либо следующий вызов, либо новый запрос модели.
+    fn after_queue(&mut self) -> TurnStep {
+        if !self.pending.is_empty() {
+            return self.next_call_step();
+        }
+        if self.iterations >= self.config.max_iterations {
+            // Модель зациклилась: останавливаем предсказуемо, не ошибкой.
+            return TurnStep::Finish {
+                outcome: TurnOutcome::IterationLimit,
+            };
+        }
+        self.request_step()
+    }
+
+    fn next_call_step(&self) -> TurnStep {
+        let Some(call) = self.pending.first().cloned() else {
+            // Очередь пуста: решение примет after_queue/on_stream.
+            return TurnStep::Finish {
+                outcome: TurnOutcome::Completed,
+            };
+        };
+        if self.config.approval_policy.requires_approval(&call.name) {
+            TurnStep::AwaitApproval { call }
+        } else {
+            TurnStep::ExecuteTool { call }
+        }
+    }
+}
+
+fn push_joined(dst: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    if !dst.is_empty() {
+        dst.push_str("\n\n");
+    }
+    dst.push_str(part);
+}
+
+/// Встроенные инструменты агента: имена совпадают со списком
+/// [`ApprovalPolicy::DANGEROUS`] там, где вызов меняет систему.
+pub fn builtin_tool_specs() -> Vec<ToolSpec> {
+    let path_only = serde_json::json!({
+        "type": "object",
+        "properties": { "path": { "type": "string", "description": "Path inside the session working directory" } },
+        "required": ["path"]
+    });
+    vec![
+        ToolSpec {
+            name: "read".into(),
+            description: "Read a text file inside the session working directory. Returns its content.".into(),
+            parameters: path_only.clone(),
+        },
+        ToolSpec {
+            name: "list".into(),
+            description: "List directory entries inside the session working directory.".into(),
+            parameters: path_only,
+        },
+        ToolSpec {
+            name: "write".into(),
+            description: "Create or overwrite a text file inside the session working directory.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+        },
+        ToolSpec {
+            name: "bash".into(),
+            description: "Run a shell command with the session working directory as cwd. Returns stdout, stderr and exit code.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -534,5 +777,167 @@ mod tests {
         assert!(matches!(&mapped[0], EventKind::Reasoning { text, .. } if text == "r"));
         assert!(matches!(&mapped[1], EventKind::Content { text, .. } if text == "c"));
         assert!(!sid.is_empty());
+    }
+
+    // ---- turn machine: весь цикл хода headless, без сети ----
+
+    fn acc_text(text: &str) -> StreamAccumulator {
+        StreamAccumulator {
+            content: text.into(),
+            ..Default::default()
+        }
+    }
+
+    fn acc_tool(id: &str, name: &str) -> StreamAccumulator {
+        StreamAccumulator {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: Default::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn never_cfg() -> TurnConfig {
+        TurnConfig {
+            approval_policy: ApprovalPolicy::Never,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn machine_finishes_completed_when_model_stops() {
+        let (mut m, step) = TurnMachine::new(TurnConfig::default(), vec![ChatMessage::user("hi")]);
+        assert!(matches!(step, TurnStep::RequestModel { ref history } if history.len() == 1));
+        let step = m.on_stream(acc_text("привет"));
+        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::Completed });
+        let rep = m.report(TurnOutcome::Completed, 1);
+        assert_eq!(rep.content, "привет");
+        assert_eq!(rep.iterations, 1);
+        // user + assistant
+        assert_eq!(m.history().len(), 2);
+    }
+
+    #[test]
+    fn machine_closes_tool_call_with_tool_message_and_loops() {
+        let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: Default::default(),
+        };
+        let step = m.on_stream(acc_tool("c1", "read"));
+        assert_eq!(step, TurnStep::ExecuteTool { call });
+        let step = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: "file body".into(),
+        });
+        match step {
+            TurnStep::RequestModel { history } => {
+                assert_eq!(history.len(), 3);
+                assert_eq!(history[2].role, Role::Tool);
+                assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
+                assert_eq!(history[2].content, "file body");
+            }
+            other => panic!("ожидали RequestModel, получили {other:?}"),
+        }
+        let step = m.on_stream(acc_text("done"));
+        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::Completed });
+        let rep = m.report(TurnOutcome::Completed, 2);
+        assert_eq!(rep.iterations, 2);
+        assert_eq!(rep.tool_calls, 1);
+    }
+
+    #[test]
+    fn machine_gates_dangerous_call_behind_approval() {
+        let cfg = TurnConfig {
+            approval_policy: ApprovalPolicy::OnDangerous,
+            ..Default::default()
+        };
+        let (mut m, _) = TurnMachine::new(cfg, vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool("c1", "bash"));
+        assert!(
+            matches!(step, TurnStep::AwaitApproval { .. }),
+            "bash обязан уйти на подтверждение: {step:?}"
+        );
+        let step = m.on_approval(ApprovalDecision::Denied);
+        match step {
+            TurnStep::RequestModel { history } => {
+                assert_eq!(history[2].role, Role::Tool);
+                assert!(
+                    history[2].content.contains("отклонён"),
+                    "модель должна увидеть отказ: {}",
+                    history[2].content
+                );
+            }
+            other => panic!("после отказа ждём новый запрос модели: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_approved_call_executes() {
+        let cfg = TurnConfig {
+            approval_policy: ApprovalPolicy::Always,
+            ..Default::default()
+        };
+        let (mut m, _) = TurnMachine::new(cfg, vec![ChatMessage::user("go")]);
+        let _ = m.on_stream(acc_tool("c1", "read"));
+        let step = m.on_approval(ApprovalDecision::Approved);
+        assert!(matches!(step, TurnStep::ExecuteTool { .. }));
+    }
+
+    #[test]
+    fn machine_stops_looping_at_iteration_limit() {
+        let cfg = TurnConfig {
+            max_iterations: 2,
+            ..never_cfg()
+        };
+        let (mut m, _) = TurnMachine::new(cfg, vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool("c1", "read"));
+        assert!(matches!(step, TurnStep::ExecuteTool { .. }));
+        let step = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: "x".into(),
+        });
+        assert!(
+            matches!(step, TurnStep::RequestModel { .. }),
+            "лимит ещё не исчерпан: {step:?}"
+        );
+        let step = m.on_stream(acc_tool("c2", "read"));
+        assert!(matches!(step, TurnStep::ExecuteTool { .. }));
+        let step = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: "x".into(),
+        });
+        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::IterationLimit });
+    }
+
+    #[test]
+    fn machine_truncates_huge_tool_output_before_history() {
+        let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
+        let _ = m.on_stream(acc_tool("c1", "read"));
+        let big = "z".repeat(MAX_TOOL_OUTPUT_BYTES * 3);
+        let _ = m.on_tool_result(ToolOutcome { ok: true, output: big });
+        let tool_msg = m.history().iter().find(|m| m.role == Role::Tool).unwrap();
+        assert!(
+            tool_msg.content.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "вывод тулза не должен раздувать контекст"
+        );
+    }
+
+    #[test]
+    fn builtin_specs_match_approval_dangerous_list() {
+        let p = ApprovalPolicy::OnDangerous;
+        for spec in builtin_tool_specs() {
+            let expected = matches!(spec.name.as_str(), "write" | "bash");
+            assert_eq!(
+                p.requires_approval(&spec.name),
+                expected,
+                "тулз {} должен соответствовать списку опасных",
+                spec.name
+            );
+            assert!(spec.parameters.get("properties").is_some());
+        }
     }
 }
