@@ -64,23 +64,26 @@
  * используют, поэтому тема переключается мгновенно и целиком.
  */
 :root[data-appearance='light'] {
-  --bg: #f2f2f6;
-  --bg-panel: #ffffff;
-  --bg-elevated: #ffffff;
-  --bg-hover: #e8e8f0;
-  --border: #d6d6e0;
-  --border-strong: #b4b4c4;
+  /* Белый приглушён: чистый #ffffff резал глаз, панели чуть темнее бумаги. */
+  --bg: #e8eaef;
+  --bg-panel: #f3f5f8;
+  --bg-elevated: #f7f9fb;
+  --bg-hover: #dde1e8;
+  --border: #d0d4dd;
+  --border-strong: #aeb4c2;
 
   --text: #17171e;
   --text-dim: #55555f;
   --text-faint: #8b8b9a;
 
   /* Светлая тема — не «тёмная с белым фоном», а самостоятельная сине-зелёная
-     палитра: акцент, ховеры, границы-тинты и свечение одного семейства. */
+     палитра: акцент, ховеры, границы-тинты и свечение одного семейства.
+     Свечение в светлой теме сильнее, чем было: на приглушённом белом оно
+     читается, а не тонет. */
   --accent: #0e9384;
   --accent-hover: #14b8a6;
   --accent-dim: #9ad4cc;
-  --accent-glow: rgba(14, 147, 132, 0.25);
+  --accent-glow: rgba(14, 147, 132, 0.45);
   --accent-rgb: 14, 147, 132;
 
   --ok: #1a7f37;
@@ -88,8 +91,8 @@
   --err-rgb: 198, 40, 40;
   --warn: #8a6100;
 
-  --surface-sidebar: rgba(248, 248, 252, 0.98);
-  --surface-chrome: rgba(255, 255, 255, 0.94);
+  --surface-sidebar: rgba(238, 241, 246, 0.96);
+  --surface-chrome: rgba(244, 247, 250, 0.92);
   --surface-inset: rgba(20, 20, 40, 0.04);
   --surface-overlay: rgba(30, 30, 45, 0.35);
   --shadow-strong: 0 24px 64px rgba(20, 20, 40, 0.18);

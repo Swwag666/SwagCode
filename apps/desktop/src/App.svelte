@@ -2523,18 +2523,20 @@
     height: 100%;
     object-fit: cover;
     z-index: 0;
-    opacity: 0.6;
-    filter: blur(2px) brightness(0.72) saturate(1.15);
+    opacity: 0.75;
+    filter: blur(2px) brightness(0.62) saturate(1.2);
     pointer-events: none;
   }
 
   /* Когда медиафон включён, непрозрачных плиток не остаётся: иначе кадр
-     виден только в щелях между панелями и выглядит как баг. */
+     виден только в щелях между панелями и выглядит как баг. Панели становятся
+     стеклом: сюжет читается сквозь интерфейс, как в референсных плеерах. */
   .media-on .sidebar,
   .media-on .content,
   .media-on .content-header,
   .media-on .input-box {
-    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    background: color-mix(in srgb, var(--bg) 42%, transparent);
+    backdrop-filter: blur(14px) saturate(1.1);
   }
 
   /* Тонировка поверх всего: soft-light красит панели и текст одинаково
@@ -3902,6 +3904,42 @@
     border-color: rgba(var(--err-rgb), 0.6);
     color: var(--err);
     box-shadow: 0 0 18px rgba(var(--err-rgb), 0.25);
+  }
+
+  /* Блоки меню живые: каждый интерактивный блок отвечает на курсор —
+     hover приподнимает, нажатие прессует, переходы мгновенные. Действует
+     на все списки и панели: сессии, вкладки, палитра, настройки, области,
+     карточки моделей. */
+  :global(.session-item),
+  :global(.tab),
+  :global(.palette-item),
+  :global(.settings-nav-item),
+  :global(.ws-row),
+  :global(.model-card),
+  :global(.sessions-add),
+  :global(.section-actions button) {
+    transition: background 0.13s ease, color 0.13s ease, transform 0.13s ease,
+      box-shadow 0.13s ease, border-color 0.13s ease;
+  }
+  :global(.session-item:hover),
+  :global(.tab:hover),
+  :global(.palette-item:hover),
+  :global(.settings-nav-item:hover),
+  :global(.ws-row:hover),
+  :global(.model-card:hover),
+  :global(.sessions-add:hover),
+  :global(.section-actions button:hover) {
+    transform: translateY(-1px);
+  }
+  :global(.session-item:active),
+  :global(.tab:active),
+  :global(.palette-item:active),
+  :global(.settings-nav-item:active),
+  :global(.ws-row:active),
+  :global(.model-card:active),
+  :global(.sessions-add:active),
+  :global(.section-actions button:active) {
+    transform: translateY(0) scale(0.985);
   }
 
   .settings-overlay {

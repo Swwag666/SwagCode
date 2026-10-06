@@ -1181,6 +1181,24 @@ mod tests {
         assert_eq!(base64_encode(b"SwagCod"), "U3dhZ0NvZA==");
     }
 
+    #[tokio::test]
+    async fn background_save_load_delete_roundtrip() {
+        // Путь на диск обязан работать: раньше ошибка сохранения глоталась,
+        // и медиафон «не ставился» без видимой причины.
+        let name = format!("roundtrip-{}.gif", short_id());
+        let data: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+        let b64 = base64_encode(&data);
+        let saved = save_background(name.clone(), b64).await.expect("save");
+        assert_eq!(saved, name);
+        let loaded = load_background(name.clone()).await.expect("load");
+        assert_eq!(base64_decode(&loaded).expect("decode"), data);
+        delete_background(name.clone()).await.expect("delete");
+        assert!(
+            load_background(name).await.is_err(),
+            "после удаления файл не должен читаться"
+        );
+    }
+
     #[test]
     fn short_ids_are_unique() {
         let ids: Vec<String> = (0..1000).map(|_| short_id()).collect();
