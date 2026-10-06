@@ -83,6 +83,7 @@ export const STR = {
       glowStrong: 'сильное',
       browse: 'обзор…',
       zoomHotkeys: 'Масштаб всего окна; горячие клавиши Ctrl++ / Ctrl+- / Ctrl+0',
+      chatCreating: 'чат создаётся…',
     },
     en: {
       newSession: 'New Session',
@@ -166,6 +167,7 @@ export const STR = {
       glowStrong: 'strong',
       browse: 'browse…',
       zoomHotkeys: 'Scales the whole window; hotkeys Ctrl++ / Ctrl+- / Ctrl+0',
+      chatCreating: 'chat is being created…',
     },
   } as const
 

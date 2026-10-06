@@ -198,6 +198,9 @@
 
   .sessions-list {
     overflow-y: auto;
+    /* Горизонтального ползунка в списке сессий не бывает вообще: длинные
+        пути уходят в многоточие, а не растягивают строку. */
+    overflow-x: hidden;
     flex: 1;
     transition: background 0.15s;
   }
@@ -362,6 +365,31 @@
   .state-run {
     color: var(--accent);
     filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), calc(0.55 * var(--glow-k))));
+    animation: run-pulse 1.4s ease-in-out infinite;
+  }
+
+  /* Мозг за работой: импульсы бегут по контурам — штрихи стекают по путям
+     SVG, как нейроны по извилинам. Просили в первом чате. */
+  .state-run :global(path),
+  .state-run :global(circle) {
+    stroke-dasharray: 5 3;
+    animation: neuron-flow 1.1s linear infinite;
+  }
+
+  @keyframes neuron-flow {
+    to {
+      stroke-dashoffset: -16;
+    }
+  }
+
+  @keyframes run-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(1.12);
+    }
   }
 
   .state-err {
@@ -412,6 +440,8 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
+    min-width: 0;
+    flex: 1;
     min-width: 0;
     transition: all 0.15s;
   }

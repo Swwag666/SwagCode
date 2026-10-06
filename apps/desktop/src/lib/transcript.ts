@@ -248,6 +248,9 @@ export class Transcript {
       }
 
       case 'status': {
+        /* «сессия … создана» — служебное рождение, не реплика: в чате его
+           заменяет анимация сборки, транскрипт начинается со слов человека. */
+        if (/^сессия\s+\S+\s+создана$/i.test(k.data.message)) return false
         this.push({
           key: this.key('st'),
           kind: 'status',

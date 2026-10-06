@@ -579,21 +579,44 @@
     }
   })
 
-  let sending = $state(false)
-  let thinking = $state(false)
+  /* Занятость — ПО СЕССИЯМ, а не глобально: раньше один идущий ход держал
+     «думает» на весь интерфейс, и реплика из второго чата уезжала в очередь
+     первого, а потом и отправлялась в первый чат. Живой статус приходит из
+     шины (liveStates), sendingSession живёт между invoke и turn_started. */
+  let sendingSession = $state<string | null>(null)
   let inputText = $state('')
   let creatingSession = $state(false)
   let streamStartTime = $state<number | null>(null)
   let tokensPerSec = $state<number | null>(null)
   let turnTokens = $state(0)
 
-  /* Очередь сообщений: пока нейронка думает, новые реплики не теряются и не
-     льются в занятую сессию — они ждут своего хода и уходят по очереди. */
-  let queue = $state<string[]>([])
-
   /* Живые статусы сессий прямо из событий шины: список сессий не ждёт
      опроса ядра, мозг/галочка/треугольник появляются в тот же кадр. */
   let liveStates = $state<Record<string, 'running' | 'ok' | 'fail'>>({})
+
+  /** Нейронка думает именно в открытом сейчас чате. */
+  let thinking = $derived(liveStates[currentSession ?? ''] === 'running')
+  /** Отправка идёт именно в открытый сейчас чат. */
+  let sending = $derived(sendingSession !== null && sendingSession === currentSession)
+
+  /* Очередь сообщений — своя у каждой сессии: пока нейронка думает, новые
+     реплики не теряются и не льются в чужой разговор. */
+  let queues = $state<Record<string, string[]>>({})
+  let queue = $derived(queues[currentSession ?? ''] ?? [])
+
+  function queueFor(sid: string): string[] {
+    let q = queues[sid]
+    if (!q) {
+      q = []
+      queues[sid] = q
+    }
+    return q
+  }
+
+  function sessionBusy(sid: string | null): boolean {
+    if (!sid) return false
+    return liveStates[sid] === 'running' || sendingSession === sid
+  }
 
   async function stopTurn(): Promise<void> {
     if (!currentSession) return
@@ -605,19 +628,22 @@
     transcriptFor(currentSession).closeAll()
     items = transcriptFor(currentSession).items
     revision++
-    thinking = false
-    sending = false
+    if (sendingSession === currentSession) sendingSession = null
   }
 
   function removeFromQueue(index: number): void {
-    queue.splice(index, 1)
+    const sid = currentSession
+    if (!sid) return
+    queueFor(sid).splice(index, 1)
   }
 
-  async function drainQueue(): Promise<void> {
-    if (queue.length === 0 || thinking || sending) return
-    const next = queue.shift()
+  /** Очередь конкретной сессии продолжает её разговор после конца хода. */
+  async function drainQueue(sid: string): Promise<void> {
+    const q = queues[sid]
+    if (!q || q.length === 0 || sessionBusy(sid)) return
+    const next = q.shift()
     if (next === undefined) return
-    await sendText(next)
+    await sendText(next, sid)
   }
 
   const bootStart = performance.now()
@@ -648,13 +674,6 @@
       tokensPerSec = elapsed > 0 ? Math.round(turnTokens / elapsed) : null
       streamStartTime = null
     }
-    if (hasEnd) {
-      turnsCount++
-      thinking = false
-      sending = false
-      /* Ход закончился — очередь продолжает разговор сама. */
-      void drainQueue()
-    }
 
     // Раскладываем события по сессиям: чужой ход не попадает в активный чат,
     // а дописывается в свою транскрипцию молча.
@@ -677,6 +696,10 @@
         transcriptFor(d.session).closeTurn(d.turn)
         /* Ход кончился — висячий запрос подтверждения не имеет смысла. */
         approvalReq = null
+        if (sendingSession === d.session) sendingSession = null
+        if (d.session === currentSession) turnsCount++
+        /* Ход закончился — очередь ЭТОЙ сессии продолжает её разговор сама. */
+        void drainQueue(d.session)
       }
       if (e.kind.kind === 'approval_required') {
         const d = e.kind.data as { turn: string; call_id: string; tool: string; summary: string }
@@ -817,29 +840,39 @@
     }
   }
 
-  /** Отправка одной реплики. Очередь вызывает её же после конца хода. */
-  async function sendText(text: string): Promise<void> {
-    if (!text || sending) return
-    sending = true
-    thinking = true
-
+  /** Отправка одной реплики в конкретную сессию. Очередь вызывает её же
+      после конца хода — и всегда в ту сессию, где реплику написали. */
+  async function sendText(text: string, targetSession?: string): Promise<void> {
+    if (!text) return
+    let sid = targetSession ?? currentSession
+    if (sid && sessionBusy(sid)) {
+      /* Чат занят своим ходом: реплика ждёт в ЕГО очереди, а не в чужой. */
+      queueFor(sid).push(text)
+      return
+    }
+    if (sendingSession !== null) return
     try {
-      if (!currentSession) {
+      if (!sid) {
         const brief = await invoke<{ id: string; cwd: string }>('create_session', {
           cwd: preferredCwd(),
           model: null,
         })
+        sid = brief.id
         currentSession = brief.id
+        sessionCwds[brief.id] = brief.cwd
         rememberCwd(brief.cwd)
         transcript = transcriptFor(brief.id)
       }
+      sendingSession = sid
       /* Своё сообщение пишем в транскрипт сразу: до ответа модели чат уже
          показывает ход пользователя. */
-      transcriptFor(currentSession).addUser(text)
-      items = transcriptFor(currentSession).items
-      revision++
+      transcriptFor(sid).addUser(text)
+      if (sid === currentSession) {
+        items = transcriptFor(sid).items
+        revision++
+      }
       await invoke('start_turn', {
-        sessionId: currentSession,
+        sessionId: sid,
         message: text,
         model: modelName || null,
         // Температура — автоматом от провайдера: None не сериализуется в тело
@@ -854,22 +887,20 @@
         kind: { kind: 'error', data: { turn: null, message: `ошибка: ${err}` } },
       })
       bus.flush()
-      sending = false
-      thinking = false
+      if (sendingSession === sid) sendingSession = null
     }
   }
 
-  /** Enter/кнопка: если нейронка занята — реплика встаёт в очередь, а не
-      уходит вторым параллельным ходом в занятую сессию. */
+  /** Enter/кнопка: если нейронка занята В ЭТОМ чате — реплика встаёт в его
+      очередь, а не уходит вторым параллельным ходом и не в чужой чат. */
   async function sendMessage(): Promise<void> {
     const text = inputText.trim()
     if (!text) return
-    if (thinking || sending) {
-      queue.push(text)
-      inputText = ''
+    inputText = ''
+    if (sessionBusy(currentSession)) {
+      if (currentSession) queueFor(currentSession).push(text)
       return
     }
-    inputText = ''
     await sendText(text)
   }
 
@@ -1544,6 +1575,19 @@
           </div>
         {/if}
         <div class="transcript-wrap">
+          {#if items.length === 0}
+            <!-- Первое сообщение-статус больше не печатается в чат: рождение
+                 чата показывает анимация сборки, а первой строкой транскрипта
+                 остаётся слово человека. -->
+            <div class="chat-birth" aria-label={t('chatCreating')}>
+              <div class="birth-lines">
+                <span class="birth-line l1"></span>
+                <span class="birth-line l2"></span>
+                <span class="birth-line l3"></span>
+              </div>
+              <span class="birth-label">{t('chatCreating')}</span>
+            </div>
+          {/if}
           <Transcript items={filteredItems} {revision} {bookmarks} onToggleBookmark={toggleBookmark} />
         </div>
       {:else}
@@ -2703,6 +2747,56 @@
 
   .transcript-area:hover {
     background: rgba(255, 255, 255, 0.005);
+  }
+
+  /* Рождение чата: скелет-строки собираются и дышат свечением, пока
+     транскрипт пуст. Служебное «сессия создана» в чат не печатается. */
+  .chat-birth {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 48px 24px;
+    animation: fade-in 0.25s ease-out;
+  }
+  .birth-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: min(420px, 70%);
+  }
+  .birth-line {
+    height: 8px;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      rgba(var(--accent-rgb), calc(0.05 * var(--glow-k))) 0%,
+      rgba(var(--accent-rgb), calc(0.22 * var(--glow-k))) 50%,
+      rgba(var(--accent-rgb), calc(0.05 * var(--glow-k))) 100%
+    );
+    background-size: 220% 100%;
+    animation: birth-sheen 1.6s ease-in-out infinite;
+  }
+  .birth-line.l1 { width: 100%; }
+  .birth-line.l2 { width: 78%; animation-delay: 0.18s; }
+  .birth-line.l3 { width: 55%; animation-delay: 0.36s; }
+  @keyframes birth-sheen {
+    0% { background-position: 120% 0; opacity: 0.5; }
+    50% { background-position: 0% 0; opacity: 1; }
+    100% { background-position: -120% 0; opacity: 0.5; }
+  }
+  .birth-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    animation: birth-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes birth-pulse {
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 1; text-shadow: 0 0 10px rgba(var(--accent-rgb), calc(0.4 * var(--glow-k))); }
   }
 
   @keyframes fade-in {

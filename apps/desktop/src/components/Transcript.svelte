@@ -156,6 +156,17 @@
   let expanded = $state<TranscriptItem | null>(null)
   let readerScale = $state(1)
 
+  /* Мысли свёрнуты по-умолчанию, как в DeepSeek: ответ виден сразу,
+     размышления — за кликом. Ключи элементов, которые раскрыли вручную. */
+  let openThoughts = $state<Set<string>>(new Set())
+
+  function toggleThoughts(key: string): void {
+    const next = new Set(openThoughts)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    openThoughts = next
+  }
+
   function readerZoomIn(): void {
     readerScale = Math.min(2.5, Math.round((readerScale + 0.1) * 10) / 10)
   }
@@ -259,6 +270,17 @@
             </span>
           {/if}
           <span class="badge">{labelOf(item.kind)}</span>
+          {#if item.kind === 'reasoning'}
+            <button
+              class="thoughts-toggle"
+              aria-expanded={openThoughts.has(item.key)}
+              onclick={() => toggleThoughts(item.key)}
+              title={openThoughts.has(item.key) ? 'свернуть мысли' : 'раскрыть мысли'}
+            >
+              <Icon name="chevron-down" size={11} />
+              {openThoughts.has(item.key) ? 'свернуть' : 'раскрыть'}
+            </button>
+          {/if}
           {#if item.tool}<span class="tool">{item.tool}</span>{/if}
           {#if item.elapsedMs !== undefined}<span class="elapsed">{item.elapsedMs} мс</span>{/if}
           {#if item.ok === false}<span class="failed">ошибка</span>{/if}
@@ -278,17 +300,21 @@
             <Icon name="expand" size={13} />
           </button>
         </div>
-        <div class="row-body">
-          {#if item.kind === 'assistant' || item.kind === 'reasoning'}
-            {#if item.done}
-              {@html renderMarkdown(item.text || '')}
+        <!-- Мысли свёрнуты, пока их не раскрыли: ответ читается без
+             простыни размышлений, а стрим «думает» виден по волне в шапке. -->
+        {#if item.kind !== 'reasoning' || openThoughts.has(item.key)}
+          <div class="row-body">
+            {#if item.kind === 'assistant' || item.kind === 'reasoning'}
+              {#if item.done}
+                {@html renderMarkdown(item.text || '')}
+              {:else}
+                {@html renderStreaming(item.text || '')}
+              {/if}
             {:else}
-              {@html renderStreaming(item.text || '')}
+              {item.text || '\u00a0'}
             {/if}
-          {:else}
-            {item.text || '\u00a0'}
-          {/if}
-        </div>
+          </div>
+        {/if}
       </div>
     {/if}
   {/each}
@@ -410,6 +436,34 @@
   .row-reasoning {
     color: var(--text-dim);
     font-style: italic;
+  }
+
+  /* Кнопка раскрытия мыслей:_chevron поворачивается, свечение подсказывает
+     кликабельность. Ответ это не трогает — он виден всегда. */
+  .thoughts-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-faint);
+    font: inherit;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    transition: color 0.15s ease;
+  }
+  .thoughts-toggle:hover {
+    color: var(--accent);
+    text-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.35 * var(--glow-k)));
+  }
+  .thoughts-toggle :global(.icon) {
+    transition: transform 0.15s ease;
+  }
+  .thoughts-toggle[aria-expanded='true'] :global(.icon) {
+    transform: rotate(180deg);
   }
 
   .row-user {
