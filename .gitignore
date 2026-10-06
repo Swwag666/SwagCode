@@ -27,6 +27,10 @@ bench-out/
 flamegraph.svg
 perf.data
 
+# Локальные помощники: voidsearch — внешний инструмент веб-поиска, живёт на
+# диске, но в репозиторий не ездит (решение от ревизии 7).
+voidsearch/
+
 # ОС / редакторы
 .DS_Store
 Thumbs.db
