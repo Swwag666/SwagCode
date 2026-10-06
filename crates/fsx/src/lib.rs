@@ -1,10 +1,28 @@
-/*! Файловые операции: обход дерева, поиск, watch, diff. Этап 2.
+/*! Файловые операции: обход дерева, поиск, watch, diff (этап B-4).
 
-Сейчас — заготовка и чистая логика diff, которую можно мерить бенчем
-(цель: diff на 5000-строчном патче < 50 мс, DECISIONS.md §2).
+Чистая логика diff (цель: 5000 строк < 50 мс в release, DECISIONS.md §2),
+барьер песочницы `is_within`, индекс файлов с учётом .gitignore и
+nucleo-fuzzy-поиск (модуль `index`), watch с debounce 200 мс (модуль `watch`).
 */
 
+pub mod index;
+pub mod watch;
+
+pub use index::FileIndex;
+pub use watch::{watch, WatchHandle};
+
 use serde::{Deserialize, Serialize};
+
+/// Ошибки файловой подсистемы.
+#[derive(Debug, thiserror::Error)]
+pub enum FsxError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("notify: {0}")]
+    Notify(#[from] notify::Error),
+    #[error("путь не существует: {}", .0.display())]
+    NotFound(std::path::PathBuf),
+}
 
 /// Одна изменённая строка в diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,7 +349,8 @@ mod tests {
         assert!(is_within(root, root));
     }
 
-    /// Бенч-заготовка: цель — 5000 строк < 50 мс (DECISIONS.md §2).
+    /// Бенч бюджета: 5000 строк < 50 мс в release (план B-4 ужесточил
+    /// порог до реального бюджета; в debug LCS медленнее — 500 мс).
     #[test]
     fn diff_5000_line_patch_is_fast() {
         let old: String = (0..5000).map(|i| format!("line {i}\n")).collect();
@@ -348,9 +367,10 @@ mod tests {
         let d = diff_text(&old, &new);
         let elapsed = start.elapsed();
         assert!(d.added > 100, "diff должен найти изменения");
+        let budget_ms: u128 = if cfg!(debug_assertions) { 500 } else { 50 };
         assert!(
-            elapsed.as_millis() < 500,
-            "слишком медленно: {} мс (цель < 50 мс в release)",
+            elapsed.as_millis() < budget_ms,
+            "слишком медленно: {} мс (бюджет < {budget_ms} мс)",
             elapsed.as_millis()
         );
     }

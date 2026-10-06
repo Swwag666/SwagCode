@@ -641,8 +641,29 @@
     path: string
     text: string
   }
+
+  /** Ответ команды diff_against_head (B-4). */
+  interface DiffLine {
+    change: 'same' | 'added' | 'removed'
+    old_no: number | null
+    new_no: number | null
+    text: string
+  }
+  interface DiffView {
+    head_exists: boolean
+    added: number
+    removed: number
+    lines: DiffLine[]
+  }
   let filesTabs = $state<FileTab[]>([])
   let filesActive = $state<string>('files')
+  /* B-4: живое дерево — счётчик растёт от file_changed, {#key} перемонтирует
+     FileTree. Поиск по индексу с fuzzy-ранжированием и diff против git HEAD. */
+  let treeRefresh = $state(0)
+  let filesQuery = $state('')
+  let filesResults = $state<string[] | null>(null)
+  let filesDiff = $state<DiffView | null>(null)
+  let filesDiffFor = $state<string | null>(null)
   let maximized = $state(false)
   let logNote = $state('')
 
@@ -759,7 +780,67 @@
 
   function closeFileTab(id: string): void {
     filesTabs = filesTabs.filter((tb) => tb.id !== id)
-    if (filesActive === id) filesActive = 'files'
+    if (filesActive === id) {
+      filesActive = 'files'
+      filesDiff = null
+      filesDiffFor = null
+    }
+  }
+
+  /* B-4: watch живой только пока панель файлов открыта — ресурсы не жгутся
+     впустую. Смена сессии перезапускает наблюдателя. */
+  $effect(() => {
+    const sid = currentSession
+    const on = filesOpen
+    if (!sid || !on) return
+    void invoke('start_watch', { sessionId: sid }).catch(() => {})
+    return () => {
+      void invoke('stop_watch', { sessionId: sid }).catch(() => {})
+    }
+  })
+
+  /* B-4: fuzzy-поиск по индексу (.gitignore уважается). Debounce 300 мс:
+     индекс кэшируется на бэке, но каждый чих всё равно лишний IPC. */
+  let searchTimer: ReturnType<typeof setTimeout> | null = null
+  $effect(() => {
+    const q = filesQuery.trim()
+    const sid = currentSession
+    if (searchTimer) clearTimeout(searchTimer)
+    if (!sid || !q) {
+      filesResults = null
+      return
+    }
+    searchTimer = setTimeout(() => {
+      void invoke<string[]>('search_files', { sessionId: sid, query: q, limit: 50 })
+        .then((r) => {
+          filesResults = r
+        })
+        .catch(() => {
+          filesResults = []
+        })
+    }, 300)
+  })
+
+  /** B-4: diff открытого файла против git HEAD. Повторный клик гасит diff. */
+  async function toggleFileDiff(tabId: string): Promise<void> {
+    const tab = filesTabs.find((tb) => tb.id === tabId)
+    if (!tab || !currentSession) return
+    if (filesDiffFor === tabId && filesDiff) {
+      filesDiff = null
+      filesDiffFor = null
+      return
+    }
+    try {
+      filesDiff = await invoke<DiffView>('diff_against_head', {
+        sessionId: currentSession,
+        path: tab.path,
+      })
+      filesDiffFor = tabId
+    } catch (e) {
+      logNote = String(e)
+      filesDiff = null
+      filesDiffFor = null
+    }
   }
 
   /* Окно без системной рамки: свои кнопки свернуть/развернуть/закрыть. */
@@ -907,6 +988,12 @@
       if (e.kind.kind === 'approval_required') {
         const d = e.kind.data as { turn: string; call_id: string; tool: string; summary: string }
         approvalReq = { call_id: d.call_id, tool: d.tool, summary: d.summary }
+      }
+      if (e.kind.kind === 'file_changed') {
+        /* B-4: файлы сессии изменились — дерево перерисовывается само,
+           без опроса. Чужие сессии не трогаем. */
+        const d = e.kind.data as { session: string; paths: string[] }
+        if (d.session === currentSession) treeRefresh++
       }
       const sid = sessionOfEvent(e)
       if (!sid) continue
@@ -2235,19 +2322,62 @@
           </div>
           <div class="files-path" title={filesRoot}>{filesRoot}</div>
           {#if filesActive === 'files'}
-            {#if currentSession && filesRoot}
-              <FileTree
-                root={filesRoot}
-                sessionId={currentSession}
-                onFileSelect={(p, n) => void openFileFromTree(p, n)}
+            <div class="files-search">
+              <input
+                type="text"
+                value={filesQuery}
+                oninput={(e) => (filesQuery = e.currentTarget.value)}
+                placeholder={t('searchFiles')}
               />
+            </div>
+            {#if currentSession && filesRoot}
+              {#if filesResults !== null}
+                <div class="files-results">
+                  {#each filesResults as r}
+                    <button
+                      class="files-result"
+                      onclick={() => {
+                        void openFileFromTree(r, r.split('/').pop() ?? r)
+                        filesQuery = ''
+                      }}
+                    >{r}</button>
+                  {:else}
+                    <div class="files-empty">{t('searchNoResults')}</div>
+                  {/each}
+                </div>
+              {:else}
+                {#key treeRefresh}
+                  <FileTree
+                    root={filesRoot}
+                    sessionId={currentSession}
+                    onFileSelect={(p, n) => void openFileFromTree(p, n)}
+                  />
+                {/key}
+              {/if}
             {:else}
               <div class="files-empty">{t('noSession')}</div>
             {/if}
           {:else}
             {@const tab = filesTabs.find((tb) => tb.id === filesActive)}
             {#if tab}
-              <pre class="file-tab-body">{tab.text}</pre>
+              <div class="file-tab-tools">
+                <button class="diff-btn" onclick={() => void toggleFileDiff(tab.id)} title={t('diffGit')}>
+                  Δ git{#if filesDiffFor === tab.id && filesDiff} · {filesDiff.head_exists ? `${filesDiff.added}+ ${filesDiff.removed}−` : t('diffNoHead')}{/if}
+                </button>
+              </div>
+              {#if filesDiffFor === tab.id && filesDiff}
+                <div class="diff-body" role="log" aria-live="polite">
+                  {#each filesDiff.lines as dl}
+                    <div class="diff-line {dl.change}">
+                      <span class="diff-no">{dl.old_no ?? ''}</span>
+                      <span class="diff-no">{dl.new_no ?? ''}</span>
+                      <span class="diff-text">{dl.change === 'added' ? '+ ' : dl.change === 'removed' ? '− ' : '  '}{dl.text}</span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <pre class="file-tab-body">{tab.text}</pre>
+              {/if}
             {/if}
           {/if}
         </aside>
@@ -5995,6 +6125,124 @@
     color: var(--text-dim);
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* B-4: поиск по индексу, результаты, diff против git HEAD. */
+  .files-search {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .files-search input {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 8px;
+    outline: none;
+  }
+
+  .files-search input:focus {
+    border-color: var(--accent-dim);
+  }
+
+  .files-results {
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
+    padding: 4px 0;
+  }
+
+  .files-result {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .files-result:hover {
+    background: rgba(var(--accent-rgb), 0.08);
+    color: var(--text);
+  }
+
+  .file-tab-tools {
+    display: flex;
+    gap: 6px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .diff-btn {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+
+  .diff-btn:hover {
+    border-color: var(--accent-dim);
+    color: var(--text);
+  }
+
+  .diff-body {
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 8px 0;
+  }
+
+  .diff-line {
+    display: flex;
+    gap: 8px;
+    padding: 0 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .diff-line.added {
+    background: rgba(80, 200, 120, 0.1);
+    color: #7ee2a8;
+  }
+
+  .diff-line.removed {
+    background: rgba(255, 100, 100, 0.08);
+    color: #ff9d9d;
+  }
+
+  .diff-line.same {
+    color: var(--text-faint);
+  }
+
+  .diff-no {
+    flex: 0 0 34px;
+    text-align: right;
+    color: var(--text-faint);
+    opacity: 0.6;
+    user-select: none;
+  }
+
+  .diff-text {
+    flex: 1;
+    min-width: 0;
   }
 
   .log-note {

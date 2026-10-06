@@ -47,6 +47,12 @@ pub struct AppState {
     /// B-2: реестр PTY-сессий. Arc: сливной поток вывода живёт дольше
     /// команды, которая его подняла.
     pub ptys: std::sync::Arc<swagcod_pty::PtyManager>,
+    /// B-4: наблюдатели рабочих директорий. Дроп ручки останавливает watcher.
+    pub watches: Mutex<std::collections::HashMap<String, swagcod_fsx::WatchHandle>>,
+    /// B-4: кэш индексов файлов с TTL — поиск не должен обходить репозиторий
+    /// на каждое нажатие клавиши.
+    pub indexes:
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<swagcod_fsx::FileIndex>)>>,
 }
 
 impl Default for AppState {
@@ -62,6 +68,8 @@ impl Default for AppState {
                     .expect("in-memory SQLite не может не открыться"),
             ),
             ptys: std::sync::Arc::new(swagcod_pty::PtyManager::new()),
+            watches: Mutex::new(std::collections::HashMap::new()),
+            indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -539,6 +547,11 @@ async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> 
     {
         let mut sessions = state.sessions.lock().await;
         sessions.retain(|s| s.id.to_string() != session_id);
+    }
+    // B-4: watcher и кэш индекса умирают вместе с сессией.
+    state.watches.lock().await.remove(&session_id);
+    if let Ok(mut m) = state.indexes.lock() {
+        m.remove(&session_id);
     }
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.delete_session(&session_id).map_err(|e| e.to_string())
@@ -1135,6 +1148,148 @@ async fn list_dir(
     Ok(entries)
 }
 
+/* ── B-4: живая файловая система ──────────────────────────────────────────
+ * Watch с debounce 200 мс шлёт FileChanged в шину, fuzzy-поиск по индексу
+ * с учётом .gitignore, diff рабочего файла против git HEAD через diff_text. */
+
+#[tauri::command]
+async fn start_watch(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    if state.watches.lock().await.contains_key(&session_id) {
+        return Ok(());
+    }
+    let cwd = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?
+            .cwd
+            .clone()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = swagcod_fsx::watch(std::path::Path::new(&cwd), tx).map_err(|e| e.to_string())?;
+    let bus = state.bus.clone();
+    let sid = session_id.clone();
+    std::thread::Builder::new()
+        .name(format!("fsx-events-{session_id}"))
+        .spawn(move || {
+            while let Ok(paths) = rx.recv() {
+                let paths: Vec<String> = paths
+                    .iter()
+                    .take(50)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .collect();
+                bus.publish(EventKind::FileChanged {
+                    session: swagcod_core::SessionId::new(&sid),
+                    paths,
+                });
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    state.watches.lock().await.insert(session_id, handle);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_watch(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    state.watches.lock().await.remove(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn search_files(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let cwd = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?
+            .cwd
+            .clone()
+    };
+    let limit = limit.unwrap_or(50);
+    // Кэш 5 с: debounce ввода на фронте плюс свежий индекс после FileChanged.
+    let cached = state.indexes.lock().ok().and_then(|m| {
+        m.get(&session_id)
+            .filter(|(t, _)| t.elapsed().as_secs() < 5)
+            .map(|(_, i)| i.clone())
+    });
+    let idx = match cached {
+        Some(i) => i,
+        None => {
+            let built = std::sync::Arc::new(
+                swagcod_fsx::FileIndex::build(std::path::Path::new(&cwd))
+                    .map_err(|e| e.to_string())?,
+            );
+            if let Ok(mut m) = state.indexes.lock() {
+                m.insert(session_id.clone(), (std::time::Instant::now(), built.clone()));
+            }
+            built
+        }
+    };
+    Ok(idx.search(&query, limit))
+}
+
+/// Ответ diff против git HEAD: сам diff плюс факт существования файла в HEAD.
+#[derive(Serialize)]
+struct DiffView {
+    head_exists: bool,
+    added: u32,
+    removed: u32,
+    lines: Vec<swagcod_fsx::DiffLine>,
+}
+
+#[tauri::command]
+async fn diff_against_head(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<DiffView, String> {
+    let cwd = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?
+            .cwd
+            .clone()
+    };
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    let abs = sandbox_path(&cwd_path, &path)?;
+    let work = std::fs::read_to_string(&abs).map_err(|e| format!("рабочий файл: {e}"))?;
+    let rel = abs
+        .strip_prefix(&cwd_path)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    // git show HEAD:<rel>: не-репозиторий или новый файл — не ошибка,
+    // а пустая левая сторона diff.
+    let head_out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("git")
+            .args(["show", &format!("HEAD:{rel}")])
+            .current_dir(&cwd_path)
+            .output(),
+    )
+    .await;
+    let (head_exists, head) = match head_out {
+        Ok(Ok(o)) if o.status.success() => (true, String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => (false, String::new()),
+    };
+    let d = swagcod_fsx::diff_text(&head, &work);
+    Ok(DiffView {
+        head_exists,
+        added: d.added,
+        removed: d.removed,
+        lines: d.lines,
+    })
+}
+
 /* ── Исполнитель тулзов агента ────────────────────────────────────────────
  * Песочница — cwd сессии: модель не читает и не пишет вне рабочей
  * директории, даже если человек подтвердил вызов. Оболочка достигается
@@ -1459,6 +1614,10 @@ pub fn run() {
             pty_write,
             pty_resize,
             pty_kill,
+            start_watch,
+            stop_watch,
+            search_files,
+            diff_against_head,
             set_approval_policy,
             bus_seq,
             start_turn,

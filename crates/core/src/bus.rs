@@ -82,6 +82,10 @@ pub enum EventKind {
     PtyOutput { pty: String, ops: Vec<serde_json::Value> },
     /// B-2: процесс за PTY завершился.
     PtyExit { pty: String, code: u32 },
+    /// B-4: в наблюдаемой рабочей директории изменились файлы.
+    /// Пути относительные, батч после debounce 200 мс: дерево и diff
+    /// оживают без опроса.
+    FileChanged { session: SessionId, paths: Vec<String> },
 }
 
 /// Событие с монотонной меткой порядка.

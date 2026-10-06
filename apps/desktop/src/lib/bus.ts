@@ -38,6 +38,7 @@ export type EventKind =
   | { kind: 'status'; data: { message: string } }
   | { kind: 'pty_output'; data: { pty: string; ops: PtyOp[] } }
   | { kind: 'pty_exit'; data: { pty: string; code: number } }
+  | { kind: 'file_changed'; data: { session: string; paths: string[] } }
 
 /** Операция ANSI-парсера из Rust (crates/pty/src/ansi.rs, serde tag "t"). */
 export type PtyOp =
