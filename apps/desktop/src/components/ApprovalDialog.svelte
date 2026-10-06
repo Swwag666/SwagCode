@@ -110,12 +110,12 @@
     transform: translateY(0) scale(0.97);
   }
   .approval-btn.approve {
-    border-color: rgba(var(--accent-rgb), 0.6);
-    background: rgba(var(--accent-rgb), 0.16);
+    border-color: rgba(var(--accent-rgb), calc(0.6 * var(--glow-k)));
+    background: rgba(var(--accent-rgb), calc(0.16 * var(--glow-k)));
     color: var(--accent);
   }
   .approval-btn.approve:hover {
-    box-shadow: 0 0 18px rgba(var(--accent-rgb), 0.35);
+    box-shadow: 0 0 18px rgba(var(--accent-rgb), calc(0.35 * var(--glow-k)));
   }
   .approval-btn.deny:hover {
     border-color: rgba(var(--err-rgb), 0.6);

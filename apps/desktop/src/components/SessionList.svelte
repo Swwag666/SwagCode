@@ -192,7 +192,7 @@
   .sessions-add:hover {
     color: var(--accent);
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     transform: scale(1.1) rotate(90deg);
   }
 
@@ -228,7 +228,7 @@
   }
 
   .session-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .session-item:nth-child(even):hover {
@@ -236,8 +236,8 @@
   }
 
   .session-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateX(4px);
   }
 
@@ -253,23 +253,23 @@
   }
 
   .session-item.active {
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border-left: 3px solid var(--accent);
-    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), 0.05), 0 0 16px rgba(var(--accent-rgb), 0.1);
+    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k))), 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .session-item.active:nth-child(odd):hover {
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.15), 0 0 32px rgba(var(--accent-rgb), 0.2);
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k))), 0 0 32px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     transform: translateX(6px);
   }
 
   .session-item.active:nth-child(even):hover {
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.12), 0 0 24px rgba(var(--accent-rgb), 0.18);
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k))), 0 0 24px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
     transform: translateX(5px);
   }
 
   .session-item.active:hover {
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.08), 0 0 20px rgba(var(--accent-rgb), 0.15);
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k))), 0 0 20px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .session-item.active .session-name:nth-child(odd):hover {
@@ -361,7 +361,7 @@
 
   .state-run {
     color: var(--accent);
-    filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), 0.55));
+    filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), calc(0.55 * var(--glow-k))));
   }
 
   .state-err {
@@ -528,19 +528,19 @@
   }
 
   .session-context-menu:nth-child(odd):hover {
-    box-shadow: 0 8px 40px rgba(var(--accent-rgb), 0.25);
+    box-shadow: 0 8px 40px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
     border-color: var(--accent);
     transform: scale(1.03);
   }
 
   .session-context-menu:nth-child(even):hover {
-    box-shadow: 0 8px 36px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 8px 36px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     border-color: var(--accent-dim);
     transform: scale(1.02);
   }
 
   .session-context-menu:hover {
-    box-shadow: 0 8px 32px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 8px 32px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     border-color: var(--accent-dim);
   }
 
@@ -570,10 +570,10 @@
   }
 
   .session-context-menu button:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.25);
+    background: rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
     color: var(--accent-hover);
     transform: translateX(8px) scale(1.05);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.25);
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
   }
 
   .session-context-menu button:nth-child(even):hover {
@@ -584,7 +584,7 @@
   }
 
   .session-context-menu button:hover {
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     color: var(--accent);
     transform: translateX(2px);
   }

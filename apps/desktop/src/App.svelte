@@ -6,6 +6,7 @@
    */
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
+  import { open as openDialog } from '@tauri-apps/plugin-dialog'
   import { bus, type WireEvent } from './lib/bus'
   import { Transcript } from './components'
   import BackgroundFX from './components/BackgroundFX.svelte'
@@ -65,6 +66,16 @@
   )
   let fontSize = $state(readNum(localStorage.getItem('swagcod-fontsize'), 10, 24, 13))
   let uiZoom = $state(readNum(localStorage.getItem('swagcod-zoom'), 0.6, 2, 1))
+
+  /* Сила свечения: множитель альфы всех акцентных теней (--glow-k в :root).
+     Три уровня в настройках; выбор персистится локально. */
+  const GLOW_K = { soft: 0.45, normal: 1, strong: 1.9 } as const
+  type GlowLevel = keyof typeof GLOW_K
+  function readGlow(): GlowLevel {
+    const v = localStorage.getItem('swagcod-glow')
+    return v === 'soft' || v === 'strong' ? v : 'normal'
+  }
+  let glowLevel = $state<GlowLevel>(readGlow())
   let sidebarWidth = $state(readNum(localStorage.getItem('swagcod-sidebar-w'), 200, 560, 260))
   let sidebarCollapsed = $state(localStorage.getItem('swagcod-sidebar-collapsed') === '1')
   let resizing = $state(false)
@@ -191,6 +202,10 @@
   $effect(() => { localStorage.setItem('swagcod-appearance', appearance) })
   $effect(() => { localStorage.setItem('swagcod-fontsize', String(fontSize)) })
   $effect(() => { localStorage.setItem('swagcod-zoom', String(uiZoom)) })
+  $effect(() => {
+    document.documentElement.style.setProperty('--glow-k', String(GLOW_K[glowLevel]))
+    localStorage.setItem('swagcod-glow', glowLevel)
+  })
   $effect(() => { localStorage.setItem('swagcod-sidebar-w', String(Math.round(sidebarWidth))) })
   $effect(() => { localStorage.setItem('swagcod-sidebar-collapsed', sidebarCollapsed ? '1' : '0') })
   $effect(() => { localStorage.setItem('swagcod-perm', permissionMode) })
@@ -240,6 +255,10 @@
     transcript = transcriptFor(id)
     items = transcript.items
     revision++
+    /* Последняя область следует за пользователем: переключился в сессию
+       проекта — «+» и авто-создание пойдут в ту же папку. */
+    const cwd = sessionCwds[id]
+    if (cwd) rememberCwd(cwd)
     void loadSessionHistory(id)
   }
 
@@ -270,10 +289,16 @@
      файловые команды ходят с sessionId, а не с хардкодом пути. */
   let showWorkspaces = $state(false)
   let workspaces = $state<{ cwd: string; id: string }[]>([])
+  /* id сессии → её cwd: «+» открывает новую сессию в той же папке, где
+     сидит пользователь, а не каждый раз в домашней. */
+  let sessionCwds = $state<Record<string, string>>({})
 
   async function loadWorkspaces(): Promise<void> {
     try {
       const list = await invoke<{ id: string; cwd: string }[]>('list_sessions')
+      const map: Record<string, string> = {}
+      for (const s of list) map[s.id] = s.cwd
+      sessionCwds = map
       const seen = new Set<string>()
       workspaces = list
         .filter((s) => (seen.has(s.cwd) ? false : (seen.add(s.cwd), true)))
@@ -308,6 +333,25 @@
       await navigator.clipboard.writeText(path)
     } catch {
       // буфер недоступен — не критично
+    }
+  }
+
+  /* Нативный выбор папки (диалог Windows через plugin-dialog): сессия
+     стартует в выбранной папке, путь запоминается как последняя область.
+     Отказ от выбора — не ошибка: просто ничего не происходит. */
+  let browseError = $state('')
+
+  async function browseFolder(): Promise<void> {
+    browseError = ''
+    try {
+      const sel = await openDialog({ directory: true, multiple: false, title: t('browse') })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return
+      rememberCwd(path)
+      await createNewSession(path)
+      showWorkspaces = false
+    } catch (err) {
+      browseError = err instanceof Error ? err.message : String(err)
     }
   }
 
@@ -730,9 +774,13 @@
     URL.revokeObjectURL(url)
   }
 
-  /* cwd новых сессий: последняя рабочая область из localStorage. Пустая
-     строка — ядро подставит домашний каталог. Хардкода пути автора нет. */
+  /* cwd новых сессий: папка текущей сессии (пользователь жмёт «+», сидя
+     в проекте — получает вторую сессию там же), затем последняя область
+     из localStorage. Пустая строка — ядро подставит домашний каталог
+     активного пользователя Windows. Хардкода пути автора нет. */
   function preferredCwd(): string {
+    const cur = currentSession ? sessionCwds[currentSession] : undefined
+    if (cur) return cur
     try {
       return localStorage.getItem('swagcod-cwd') ?? ''
     } catch {
@@ -748,14 +796,15 @@
     }
   }
 
-  async function createNewSession(): Promise<void> {
+  async function createNewSession(cwdOverride?: string): Promise<void> {
     creatingSession = true
     try {
       const brief = await invoke<{ id: string; cwd: string }>('create_session', {
-        cwd: preferredCwd(),
+        cwd: cwdOverride ?? preferredCwd(),
         model: null,
       })
       currentSession = brief.id
+      sessionCwds[brief.id] = brief.cwd
       rememberCwd(brief.cwd)
       transcript = transcriptFor(brief.id)
       items = transcript.items
@@ -922,6 +971,9 @@
         }
         /* Пользовательский медиафон восстанавливаем из хранилища приложения. */
         void applyStoredBgMedia()
+        /* Карта сессия→cwd нужна до первого «+»: новая сессия идёт в папку,
+           где сидит пользователь, а не в домашнюю. */
+        void loadWorkspaces()
         try {
           const raw = await invoke<{ data: { id: string }[] }>('list_models')
           models = raw.data.map((m) => m.id)
@@ -1063,6 +1115,17 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
+                  <span class="label-title">{t('glowTitle')}</span>
+                  <span class="label-desc">{t('glowDesc')}</span>
+                </div>
+                <div class="appearance-options">
+                  <button class="appearance-btn" class:active={glowLevel === 'soft'} onclick={() => (glowLevel = 'soft')}>{t('glowSoft')}</button>
+                  <button class="appearance-btn" class:active={glowLevel === 'normal'} onclick={() => (glowLevel = 'normal')}>{t('glowNormal')}</button>
+                  <button class="appearance-btn" class:active={glowLevel === 'strong'} onclick={() => (glowLevel = 'strong')}>{t('glowStrong')}</button>
+                </div>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
                   <span class="label-title">{t('fontSize')}</span>
                   <span class="label-desc">{t('fontSizeDesc')}</span>
                 </div>
@@ -1076,7 +1139,7 @@
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('zoom')}</span>
-                  <span class="label-desc">{t('zoomDesc')}</span>
+                  <span class="label-desc">{t('zoomHotkeys')}</span>
                 </div>
                 <div class="zoom-control settings-zoom">
                   <button onclick={zoomOut} aria-label="−">−</button>
@@ -1310,7 +1373,7 @@
         </div>
         <span class="name">SwagCod</span>
       </div>
-      <button class="new-session-btn" onclick={createNewSession} disabled={creatingSession} title={t('newSession')}>
+      <button class="new-session-btn" onclick={() => void createNewSession()} disabled={creatingSession} title={t('newSession')}>
         {#if creatingSession}
           <span class="spinner"></span>
         {:else}
@@ -1365,6 +1428,14 @@
               </div>
             {/each}
           {/if}
+          <div class="ws-browse-row">
+            <button class="ws-browse" onclick={() => void browseFolder()} title={t('browse')}>
+              <Icon name="folder" size={12} /> {t('browse')}
+            </button>
+            {#if browseError}
+              <span class="ws-err">{browseError}</span>
+            {/if}
+          </div>
         </div>
       {/if}
       <SessionList
@@ -1452,19 +1523,9 @@
           <button class="tab" class:active={activeTab === 'chat'} onclick={() => (activeTab = 'chat')} role="tab" aria-selected={activeTab === 'chat'}>{t('chat')}</button>
           <button class="tab" class:active={activeTab === 'trajectory'} onclick={() => (activeTab = 'trajectory')} role="tab" aria-selected={activeTab === 'trajectory'}>{t('trajectory')}</button>
         </div>
-        <div class="header-tools">
-          <div class="zoom-control" title={t('zoom')}>
-            <button onclick={zoomOut} aria-label="уменьшить">−</button>
-            <button class="zoom-value" onclick={zoomReset} title={t('reset')}>{Math.round(uiZoom * 100)}%</button>
-            <button onclick={zoomIn} aria-label="увеличить">+</button>
-          </div>
-          <button
-            class="header-icon-btn"
-            onclick={() => (sidebarCollapsed = !sidebarCollapsed)}
-            title={sidebarCollapsed ? t('restore') : t('maximize')}
-            aria-label={sidebarCollapsed ? t('restore') : t('maximize')}
-          ><Icon name={sidebarCollapsed ? 'collapse' : 'expand'} size={14} /></button>
-        </div>
+        <!-- Зум и сворачивание панели уехали в настройки: в шапке они
+             дублировали их и съедали место. Горячие клавиши остались:
+             Ctrl++ / Ctrl+- / Ctrl+0 / Ctrl+B. -->
       </div>
     </div>
 
@@ -1710,8 +1771,8 @@
   }
 
   main.dsh-layout:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.008);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.008 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   main.dsh-layout:nth-child(even):hover {
@@ -1720,8 +1781,8 @@
   }
 
   main.dsh-layout:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .sidebar {
@@ -1735,8 +1796,8 @@
   }
 
   .sidebar:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.008);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.008 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .sidebar:nth-child(even):hover {
@@ -1745,8 +1806,8 @@
   }
 
   .sidebar:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   @keyframes sidebar-in {
@@ -1767,22 +1828,22 @@
   }
 
   .sidebar-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border-bottom-color: var(--accent-dim);
     transform: translateY(-2px);
   }
 
   .sidebar-header:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.06);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
     border-bottom-color: var(--accent-dim);
     transform: translateY(-1px);
   }
 
   .sidebar-header:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .brand {
@@ -1795,8 +1856,8 @@
 
   .brand:nth-child(odd):hover {
     gap: 16px;
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
@@ -1861,7 +1922,7 @@
   .new-session-btn {
     width: 100%;
     padding: 10px 14px;
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border: 1px solid var(--accent-dim);
     border-radius: 8px;
     color: var(--text);
@@ -1875,27 +1936,27 @@
   }
 
   .new-session-btn:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.25);
-    box-shadow: 0 0 32px rgba(var(--accent-rgb), 0.45);
+    background: rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
+    box-shadow: 0 0 32px rgba(var(--accent-rgb), calc(0.45 * var(--glow-k)));
     transform: translateY(-4px) scale(1.02);
   }
 
   .new-session-btn:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.2);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.4);
+    background: rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.4 * var(--glow-k)));
     transform: translateY(-3px) scale(1.01);
   }
 
   .new-session-btn:hover {
-    background: rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     border-color: var(--accent);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.3);
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
   .new-session-btn:active {
     transform: translateY(0);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
   }
 
   .new-session-btn:disabled {
@@ -1948,13 +2009,13 @@
   }
 
   .sidebar-section:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .sidebar-section:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-radius: 8px;
   }
 
@@ -1970,8 +2031,8 @@
   }
 
   .sidebar-section:first-child:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .sidebar-section:last-child {
@@ -1979,8 +2040,8 @@
   }
 
   .sidebar-section:last-child:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .section-header {
@@ -2008,8 +2069,8 @@
 
   .section-actions:nth-child(odd):hover {
     gap: 12px;
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-radius: 6px;
   }
 
@@ -2063,22 +2124,22 @@
   }
 
   .sidebar-footer:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border-top-color: var(--accent-dim);
     transform: translateY(-2px);
   }
 
   .sidebar-footer:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.06);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
     border-top-color: var(--accent-dim);
     transform: translateY(-1px);
   }
 
   .sidebar-footer:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .waveform {
@@ -2154,22 +2215,22 @@
   }
 
   .sidebar-stats:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: scale(1.06);
     border-color: var(--accent-dim);
   }
 
   .sidebar-stats:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: scale(1.04);
     border-color: var(--accent-dim);
   }
 
   .sidebar-stats:hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
     transform: scale(1.02);
   }
 
@@ -2182,8 +2243,8 @@
   }
 
   .stat:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateY(-3px) scale(1.08);
   }
 
@@ -2195,9 +2256,9 @@
 
   .stat:hover {
     transform: translateY(-2px) scale(1.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.05);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
     border-radius: 4px;
-    background: rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .stat:hover .stat-value {
@@ -2238,23 +2299,23 @@
   }
 
   .status-line:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateX(5px);
     border-left-color: var(--accent);
   }
 
   .status-line:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateX(4px);
     border-left-color: var(--accent-dim);
   }
 
   .status-line:hover {
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
     transform: translateX(2px);
     padding: 2px 4px;
     border-radius: 4px;
@@ -2293,24 +2354,24 @@
   }
 
   .settings-btn:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.15);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.2);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     transform: translateX(5px);
     border-color: var(--accent);
   }
 
   .settings-btn:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.12);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.18);
+    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
     transform: translateX(4px);
     border-color: var(--accent-dim);
   }
 
   .settings-btn:hover {
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     color: var(--accent);
     transform: translateX(2px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .content {
@@ -2347,12 +2408,13 @@
 
   /* Когда медиафон включён, непрозрачных плиток не остаётся: иначе кадр
      виден только в щелях между панелями и выглядит как баг. Панели становятся
-     стеклом: сюжет читается сквозь интерфейс, как в референсных плеерах. */
+     стеклом: сюжет читается сквозь интерфейс, как в референсных плеерах.
+     Плотность стекла — переменная темы: светлая не темнеет в тряпку. */
   .media-on .sidebar,
   .media-on .content,
   .media-on .content-header,
   .media-on .input-box {
-    background: color-mix(in srgb, var(--bg) 42%, transparent);
+    background: color-mix(in srgb, var(--bg) var(--panel-glass), transparent);
     backdrop-filter: blur(14px) saturate(1.1);
   }
 
@@ -2368,8 +2430,8 @@
   }
 
   .content:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.008);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.008 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .content:nth-child(even):hover {
@@ -2378,8 +2440,8 @@
   }
 
   .content:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   @keyframes content-in {
@@ -2399,8 +2461,8 @@
   }
 
   .content-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border-bottom-color: var(--accent-dim);
   }
 
@@ -2411,8 +2473,8 @@
   }
 
   .content-header:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .session-title {
@@ -2425,8 +2487,8 @@
 
   .session-title:nth-child(odd):hover {
     gap: 20px;
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
@@ -2538,8 +2600,8 @@
 
   .tabs:nth-child(odd):hover {
     gap: 12px;
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
   }
 
   .tabs:nth-child(even):hover {
@@ -2566,8 +2628,8 @@
   }
 
   .tab:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
@@ -2579,8 +2641,8 @@
 
   .tab:hover {
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .tab.active {
@@ -2589,19 +2651,19 @@
   }
 
   .tab.active:hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
   }
 
   .tab.active:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.15);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.25);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
     transform: translateY(-3px);
   }
 
   .tab.active:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.12);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.22);
+    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
@@ -2660,22 +2722,22 @@
   }
 
   .search-bar:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     border-color: var(--accent-dim);
     transform: translateY(-2px);
   }
 
   .search-bar:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     border-color: var(--accent-dim);
     transform: translateY(-1px);
   }
 
   .search-bar:hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
   }
 
   @keyframes slide-down {
@@ -2704,26 +2766,26 @@
 
   .search-input:nth-child(odd):hover {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
   .search-input:nth-child(even):hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateY(-1px);
   }
 
   .search-input:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.08);
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
   }
 
   .search-input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .search-count {
@@ -2756,7 +2818,7 @@
   }
 
   .transcript-wrap:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.005);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
   }
 
   .transcript-wrap:nth-child(even):hover {
@@ -2764,8 +2826,8 @@
   }
 
   .transcript-wrap:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-radius: 8px;
   }
 
@@ -2788,8 +2850,8 @@
   }
 
   .trajectory-wrap:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-radius: 8px;
   }
 
@@ -2800,8 +2862,8 @@
   }
 
   .trajectory-wrap:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .trajectory-header {
@@ -2817,8 +2879,8 @@
   }
 
   .trajectory-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
@@ -2830,8 +2892,8 @@
 
   .trajectory-header:hover {
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .trajectory-list {
@@ -2842,8 +2904,8 @@
   }
 
   .trajectory-list:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
     border-radius: 8px;
   }
 
@@ -2869,9 +2931,9 @@
   }
 
   .trajectory-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateX(8px);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.18);
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
     border-left-color: var(--accent);
   }
 
@@ -2883,10 +2945,10 @@
   }
 
   .trajectory-item:hover {
-    background: rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-left-color: var(--accent);
     transform: translateX(2px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.08);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
   }
 
   .traj-icon {
@@ -2972,21 +3034,21 @@
 
   .turn-group:nth-child(odd):hover {
     border-color: var(--accent);
-    box-shadow: 0 0 32px rgba(var(--accent-rgb), 0.25);
+    box-shadow: 0 0 32px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
     transform: translateY(-4px) scale(1.01);
-    background: rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .turn-group:nth-child(even):hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     transform: translateY(-3px) scale(1.005);
     background: rgba(255, 255, 255, 0.02);
   }
 
   .turn-group:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateY(-1px);
   }
 
@@ -3003,8 +3065,8 @@
   }
 
   .turn-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.1);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateY(-3px);
     border-bottom-color: var(--accent);
   }
@@ -3017,8 +3079,8 @@
   }
 
   .turn-header:hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
   }
 
   .turn-icon {
@@ -3093,8 +3155,8 @@
   }
 
   .turn-items:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
   }
 
   .turn-items:nth-child(even):hover {
@@ -3115,8 +3177,8 @@
   }
 
   .input-area:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     border-top-color: var(--accent-dim);
   }
 
@@ -3127,8 +3189,8 @@
   }
 
   .input-area:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .stream-progress {
@@ -3174,12 +3236,12 @@
 
   .input-box:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .input-box:focus-within {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .chat-input {
@@ -3197,8 +3259,8 @@
   }
 
   .chat-input:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     transform: scale(1.01);
   }
 
@@ -3230,8 +3292,8 @@
   }
 
   .input-actions:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.06);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     gap: 12px;
   }
 
@@ -3278,10 +3340,10 @@
   }
 
   .model-selector:hover {
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     color: var(--accent);
     border: 1px solid var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .send-btn {
@@ -3471,7 +3533,7 @@
 
   .palette:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 16px 56px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 16px 56px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: scale(1.01);
   }
 
@@ -3505,7 +3567,7 @@
   }
 
   .palette-input:hover {
-    background: rgba(var(--accent-rgb), 0.01);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
     border-bottom-color: var(--accent-dim);
   }
 
@@ -3517,8 +3579,8 @@
   }
 
   .palette-list:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), 0.06);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
     border-radius: 8px;
   }
 
@@ -3543,43 +3605,43 @@
   }
 
   .palette-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateX(8px);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
   }
 
   .palette-item:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateX(6px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.18);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
   }
 
   .palette-item:hover {
-    background: rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     transform: translateX(4px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .palette-item.selected {
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     color: var(--accent);
     border-left: 2px solid var(--accent);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .palette-item.selected:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.2);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.25);
+    background: rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
   }
 
   .palette-item.selected:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.18);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.22);
+    background: rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
   }
 
   .palette-item.selected:hover {
-    background: rgba(var(--accent-rgb), 0.15);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.2);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
   }
 
   .palette-empty {
@@ -3714,7 +3776,7 @@
 
   .settings-dialog:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 24px 72px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 24px 72px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     transform: scale(1.01);
   }
 
@@ -3739,7 +3801,7 @@
   }
 
   .settings-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.01);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
   }
 
   .settings-header:nth-child(even):hover {
@@ -3747,8 +3809,8 @@
   }
 
   .settings-header:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .settings-header h2 {
@@ -3797,20 +3859,20 @@
 
   .settings-action-btn:nth-child(odd):hover {
     transform: translateY(-2px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
   }
 
   .settings-action-btn:nth-child(even):hover {
     transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .settings-action-btn:hover {
     border-color: var(--accent);
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
     transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .settings-close {
@@ -3848,7 +3910,7 @@
   }
 
   .settings-body:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.005);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
   }
 
   .settings-body:nth-child(even):hover {
@@ -3856,8 +3918,8 @@
   }
 
   .settings-body:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .settings-nav {
@@ -3870,8 +3932,8 @@
   }
 
   .settings-nav:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
   }
 
   .settings-nav:nth-child(even):hover {
@@ -3880,8 +3942,8 @@
   }
 
   .settings-nav:hover {
-    background: rgba(var(--accent-rgb), 0.01);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.03);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .settings-nav-item {
@@ -3898,9 +3960,9 @@
   }
 
   .settings-nav-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     transform: translateX(6px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .settings-nav-item:nth-child(even):hover {
@@ -3917,25 +3979,25 @@
   }
 
   .settings-nav-item.active {
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     color: var(--accent);
     transition: all 0.15s;
   }
 
   .settings-nav-item.active:hover {
-    background: rgba(var(--accent-rgb), 0.15);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .settings-nav-item.active:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.25);
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), 0.3);
+    background: rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
+    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
     transform: translateX(6px);
   }
 
   .settings-nav-item.active:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.22);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.28);
+    background: rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.28 * var(--glow-k)));
     transform: translateX(5px);
   }
 
@@ -3947,8 +4009,8 @@
   }
 
   .settings-content:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
   }
 
   .settings-content:nth-child(even):hover {
@@ -3957,8 +4019,8 @@
   }
 
   .settings-content:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
   .settings-section {
@@ -3969,8 +4031,8 @@
   }
 
   .settings-section:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.02);
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), 0.04);
+    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
+    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
     border-radius: 12px;
     padding: 12px;
     margin: -12px;
@@ -3985,8 +4047,8 @@
   }
 
   .settings-section:hover {
-    background: rgba(var(--accent-rgb), 0.005);
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), 0.02);
+    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
+    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
     border-radius: 8px;
     padding: 8px;
     margin: -8px;
@@ -4006,8 +4068,8 @@
   }
 
   .settings-row:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
     transform: translateX(4px);
   }
 
@@ -4018,11 +4080,11 @@
   }
 
   .settings-row:hover {
-    background: rgba(var(--accent-rgb), 0.01);
+    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
     padding-left: 8px;
     padding-right: 8px;
     border-radius: 6px;
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.03);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
   }
 
   .settings-label {
@@ -4113,26 +4175,26 @@
 
   .settings-select:nth-child(odd):hover {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
   .settings-select:nth-child(even):hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateY(-1px);
   }
 
   .settings-select:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.08);
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
   }
 
   .settings-select:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .appearance-options {
@@ -4162,43 +4224,43 @@
 
   .appearance-btn:nth-child(odd):hover {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.1);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .appearance-btn:nth-child(even):hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
   }
 
   .appearance-btn:hover {
     border-color: var(--accent-dim);
     color: var(--text);
     transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .appearance-btn.active {
     border-color: var(--accent);
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .appearance-btn.active:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.15);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.25);
+    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
   }
 
   .appearance-btn.active:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.12);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.22);
+    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
   }
 
   .appearance-btn.active:hover {
-    background: rgba(var(--accent-rgb), 0.1);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.2);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
   }
 
   .font-size-control {
@@ -4242,26 +4304,26 @@
 
   .settings-number:nth-child(odd):hover {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateY(-2px);
   }
 
   .settings-number:nth-child(even):hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.04);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
     transform: translateY(-1px);
   }
 
   .settings-number:hover {
     border-color: var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.08);
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
   }
 
   .settings-number:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .settings-range {
@@ -4358,18 +4420,18 @@
   }
 
   .toggle-slider:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), 0.1);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .toggle-slider:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), 0.08);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
   }
 
   .toggle-slider:hover {
-    background: rgba(var(--accent-rgb), 0.05);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .toggle-slider:before:nth-child(odd):hover {
@@ -4409,13 +4471,13 @@
   .toggle-switch input:checked + .toggle-slider {
     background: var(--accent-dim);
     border-color: var(--accent);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
     transition: all 0.15s;
   }
 
   .toggle-switch:hover input:checked + .toggle-slider {
     background: var(--accent);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), 0.3);
+    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
   }
 
   .toggle-switch input:checked + .toggle-slider:before {
@@ -4431,7 +4493,7 @@
 
   .toggle-switch:hover .toggle-slider {
     border-color: var(--accent);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   @keyframes screen-glitch {
@@ -4499,13 +4561,6 @@
     gap: 12px;
   }
 
-  .header-tools {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
   .zoom-control {
     display: flex;
     align-items: center;
@@ -4530,8 +4585,8 @@
 
   .zoom-control button:hover {
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.1);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.12);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
   }
 
   .zoom-control .zoom-value {
@@ -4554,7 +4609,7 @@
   .header-icon-btn:hover {
     color: var(--accent);
     border-color: var(--accent-dim);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
     transform: translateY(-1px);
   }
 
@@ -4623,7 +4678,7 @@
     font-family: var(--mono);
     font-size: 10px;
     color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.1);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     border: 1px solid var(--accent-dim);
     border-radius: 10px;
     padding: 1px 8px;
@@ -4644,7 +4699,7 @@
 
   .model-filter:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .model-list {
@@ -4679,15 +4734,15 @@
 
   .model-card:hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
     transform: translateX(2px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.1);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .model-card.selected {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.09);
-    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), 0.08);
+    background: rgba(var(--accent-rgb), calc(0.09 * var(--glow-k)));
+    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
   }
 
   .model-name {
@@ -4818,13 +4873,13 @@
 
   .perm-card:hover {
     border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), 0.05);
+    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
     transform: translateX(2px);
   }
 
   .perm-card.selected {
     border-color: var(--accent);
-    background: rgba(var(--accent-rgb), 0.09);
+    background: rgba(var(--accent-rgb), calc(0.09 * var(--glow-k)));
   }
 
   .perm-icon {
@@ -4916,7 +4971,7 @@
   .step-btn:hover {
     color: var(--accent);
     border-color: var(--accent-dim);
-    box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 10px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .settings-zoom {
@@ -4944,7 +4999,7 @@
 
   .color-well:hover {
     border-color: var(--accent);
-    box-shadow: 0 0 14px rgba(var(--accent-rgb), 0.35);
+    box-shadow: 0 0 14px rgba(var(--accent-rgb), calc(0.35 * var(--glow-k)));
     transform: scale(1.06);
   }
 
@@ -5007,6 +5062,39 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--text-faint);
+  }
+
+  .ws-browse-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .ws-browse {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 11.5px;
+    transition: background 0.13s ease, color 0.13s ease, transform 0.13s ease,
+      border-color 0.13s ease;
+  }
+  .ws-browse:hover {
+    color: var(--text);
+    border-color: rgba(var(--accent-rgb), calc(0.5 * var(--glow-k)));
+    transform: translateY(-1px);
+  }
+  .ws-browse:active {
+    transform: translateY(0) scale(0.98);
+  }
+  .ws-err {
+    color: var(--err);
+    font-size: 11px;
   }
 
   .ws-empty {

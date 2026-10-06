@@ -485,7 +485,7 @@
     background-image: linear-gradient(
       90deg,
       var(--text-faint) 20%,
-      rgba(var(--accent-rgb), 0.95) 50%,
+      rgba(var(--accent-rgb), calc(0.95 * var(--glow-k))) 50%,
       var(--text-faint) 80%
     );
     background-size: 220% 100%;
@@ -514,7 +514,7 @@
       text-shadow: none;
     }
     50% {
-      text-shadow: 0 0 10px rgba(var(--accent-rgb), 0.35);
+      text-shadow: 0 0 10px rgba(var(--accent-rgb), calc(0.35 * var(--glow-k)));
     }
   }
 
@@ -550,8 +550,8 @@
 
   .row-approval {
     border-left: 3px solid var(--accent);
-    background: rgba(var(--accent-rgb), 0.03);
-    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), 0.06);
+    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
+    box-shadow: inset 0 0 12px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
   }
 
   .row-approval .badge {
@@ -800,7 +800,7 @@
   .reader-btn:hover {
     color: var(--accent);
     border-color: var(--accent-dim);
-    box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.15);
+    box-shadow: 0 0 10px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
   }
 
   .reader-value {

@@ -25,3 +25,4 @@ swagcod-provider.workspace = true
 swagcod-pty.workspace = true
 swagcod-fsx.workspace = true
 dotenvy = "0.15"
+tauri-plugin-dialog = "2.0.0-rc.8"

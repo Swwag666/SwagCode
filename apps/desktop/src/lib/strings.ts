@@ -76,6 +76,13 @@ export const STR = {
       noTurns: 'Нет ходов — отправьте сообщение модели',
       turn: 'Ход',
       events: 'событий',
+      glowTitle: 'Свечение',
+      glowDesc: 'Сила акцентных теней и подсветок интерфейса',
+      glowSoft: 'мягкое',
+      glowNormal: 'обычное',
+      glowStrong: 'сильное',
+      browse: 'обзор…',
+      zoomHotkeys: 'Масштаб всего окна; горячие клавиши Ctrl++ / Ctrl+- / Ctrl+0',
     },
     en: {
       newSession: 'New Session',
@@ -152,6 +159,13 @@ export const STR = {
       noTurns: 'No turns yet — send a message to the model',
       turn: 'Turn',
       events: 'events',
+      glowTitle: 'Glow',
+      glowDesc: 'Strength of accent shadows and highlights',
+      glowSoft: 'soft',
+      glowNormal: 'normal',
+      glowStrong: 'strong',
+      browse: 'browse…',
+      zoomHotkeys: 'Scales the whole window; hotkeys Ctrl++ / Ctrl+- / Ctrl+0',
     },
   } as const
 
