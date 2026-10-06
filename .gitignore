@@ -21,7 +21,9 @@ apps/desktop/build/
 crates/app/gen/schemas/
 
 # Замеры и артефакты: двоичный шум, воспроизводится скриптами и пробами.
-bench-out/
+# Числа бюджета — источник правды для README, поэтому startup.json в коммите.
+bench-out/*
+!bench-out/startup.json
 *.tmp
 .tmp-*
 flamegraph.svg

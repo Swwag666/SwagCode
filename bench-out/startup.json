@@ -1,0 +1,53 @@
+﻿{
+    "timestamp":  "2026-10-03T19:29:03.8716289+03:00",
+    "machine":  "Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz",
+    "ramGb":  15.9,
+    "summary":  {
+                    "exe":  "swagcod-app.exe",
+                    "exeSizeMb":  4.56,
+                    "runs":  5,
+                    "settleSeconds":  10,
+                    "startupMsMedian":  34.9,
+                    "startupMsBest":  29.3,
+                    "startupMsWorst":  101.4,
+                    "rssMbMedian":  326.1,
+                    "rssMbMax":  330.7,
+                    "processesMax":  7,
+                    "budgetStartupMs":  400,
+                    "budgetRssMb":  150,
+                    "startupInBudget":  true,
+                    "rssInBudget":  false
+                },
+    "runs":  [
+                 {
+                     "run":  1,
+                     "startupMs":  101.4,
+                     "rssMb":  326.1,
+                     "processes":  7
+                 },
+                 {
+                     "run":  2,
+                     "startupMs":  29.3,
+                     "rssMb":  326.7,
+                     "processes":  7
+                 },
+                 {
+                     "run":  3,
+                     "startupMs":  33.7,
+                     "rssMb":  325.8,
+                     "processes":  7
+                 },
+                 {
+                     "run":  4,
+                     "startupMs":  36.3,
+                     "rssMb":  330.7,
+                     "processes":  7
+                 },
+                 {
+                     "run":  5,
+                     "startupMs":  34.9,
+                     "rssMb":  325.6,
+                     "processes":  7
+                 }
+             ]
+}

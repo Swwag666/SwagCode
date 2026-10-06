@@ -88,6 +88,9 @@ jobs:
 
   # Замеры старта и памяти требуют GUI и WebView2, поэтому гоняются локально:
   #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/bench-startup.ps1 -OutFile bench-out/startup.json
-  # Результаты коммитятся в bench-out/ как точка сравнения между этапами.
+  # В bench-out/ коммитится только startup.json (числа бюджета для README);
+  # скриншоты и пробы игнорируются как двоичный шум.
   # В CI их нет: headless-раннер не поднимет WebView2, а число получилось бы
   # нерепрезентативным и создавало ложное ощущение контроля над бюджетом.
+  # Бюджеты старта и private bytes скрипт читает из env-переменных выше
+  # (BUDGET_STARTUP_MS, BUDGET_OUR_PRIVATE_MB, BUDGET_FAMILY_PRIVATE_MB).

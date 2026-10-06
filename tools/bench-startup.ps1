@@ -90,6 +90,11 @@ for ($i = 1; $i -le $Runs; $i++) {
     $family = @($family | Where-Object { $_ } | Sort-Object Id -Unique)
     $rssBytes = ($family | Measure-Object WorkingSet64 -Sum).Sum
     $rssMb = [math]::Round($rssBytes / 1MB, 1)
+    # Private bytes: the budget metric of DECISIONS.md section 2 (D-013).
+    # RSS counts shared pages twice across the family, private does not.
+    $ourPrivateMb = 0.0
+    if ($main) { $ourPrivateMb = [math]::Round($main.PrivateMemorySize64 / 1MB, 1) }
+    $famPrivateMb = [math]::Round((($family | Measure-Object PrivateMemorySize64 -Sum).Sum) / 1MB, 1)
     $procCount = $family.Count
 
     # Kill the whole tree or the next run measures someone else's memory.
@@ -101,15 +106,17 @@ for ($i = 1; $i -le $Runs; $i++) {
     $startupMs = $null
     if ($windowFound) { $startupMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1) }
     $results += [pscustomobject]@{
-        run       = $i
-        startupMs = $startupMs
-        rssMb     = $rssMb
-        processes = $procCount
+        run           = $i
+        startupMs     = $startupMs
+        rssMb         = $rssMb
+        ourPrivateMb  = $ourPrivateMb
+        famPrivateMb  = $famPrivateMb
+        processes     = $procCount
     }
 
     $status = if ($windowFound) { 'ok' } else { 'WINDOW NOT FOUND' }
-    Write-Host ("run {0}: startup {1} ms | RSS {2} MB | processes {3} | {4}" -f `
-        $i, $startupMs, $rssMb, $procCount, $status)
+    Write-Host ("run {0}: startup {1} ms | RSS {2} MB | private our/fam {3}/{4} MB | procs {5} | {6}" -f `
+        $i, $startupMs, $rssMb, $ourPrivateMb, $famPrivateMb, $procCount, $status)
 }
 
 $valid = @($results | Where-Object { $null -ne $_.startupMs })
@@ -127,25 +134,37 @@ function Get-Median([double[]]$values) {
 
 $startups = @($valid | ForEach-Object { [double]$_.startupMs })
 $rsss     = @($results | ForEach-Object { [double]$_.rssMb })
+$ourPrivs = @($results | ForEach-Object { [double]$_.ourPrivateMb })
+$famPrivs = @($results | ForEach-Object { [double]$_.famPrivateMb })
 
-$budgetStartupMs = 400
+# Budgets come from CI env (see .github/workflows/ci.yml) with local defaults,
+# so the same numbers gate CI comments and local runs.
+$budgetStartupMs = if ($env:BUDGET_STARTUP_MS) { [int]$env:BUDGET_STARTUP_MS } else { 400 }
 $budgetRssMb = 150
+$budgetOurPrivateMb = if ($env:BUDGET_OUR_PRIVATE_MB) { [int]$env:BUDGET_OUR_PRIVATE_MB } else { 40 }
+$budgetFamPrivateMb = if ($env:BUDGET_FAMILY_PRIVATE_MB) { [int]$env:BUDGET_FAMILY_PRIVATE_MB } else { 200 }
 
 $summary = [pscustomobject]@{
-    exe             = (Split-Path $ExePath -Leaf)
-    exeSizeMb       = [math]::Round($exeInfo.Length / 1MB, 2)
-    runs            = $Runs
-    settleSeconds   = $SettleSeconds
-    startupMsMedian = [math]::Round((Get-Median $startups), 1)
-    startupMsBest   = ($startups | Measure-Object -Minimum).Minimum
-    startupMsWorst  = ($startups | Measure-Object -Maximum).Maximum
-    rssMbMedian     = [math]::Round((Get-Median $rsss), 1)
-    rssMbMax        = ($rsss | Measure-Object -Maximum).Maximum
-    processesMax    = ($results | Measure-Object processes -Maximum).Maximum
-    budgetStartupMs = $budgetStartupMs
-    budgetRssMb     = $budgetRssMb
-    startupInBudget = ($null -ne (Get-Median $startups)) -and ((Get-Median $startups) -lt $budgetStartupMs)
-    rssInBudget     = ((Get-Median $rsss) -lt $budgetRssMb)
+    exe                  = (Split-Path $ExePath -Leaf)
+    exeSizeMb            = [math]::Round($exeInfo.Length / 1MB, 2)
+    runs                 = $Runs
+    settleSeconds        = $SettleSeconds
+    startupMsMedian      = [math]::Round((Get-Median $startups), 1)
+    startupMsBest        = ($startups | Measure-Object -Minimum).Minimum
+    startupMsWorst       = ($startups | Measure-Object -Maximum).Maximum
+    rssMbMedian          = [math]::Round((Get-Median $rsss), 1)
+    rssMbMax             = ($rsss | Measure-Object -Maximum).Maximum
+    ourPrivateMbMedian   = [math]::Round((Get-Median $ourPrivs), 1)
+    famPrivateMbMedian   = [math]::Round((Get-Median $famPrivs), 1)
+    processesMax         = ($results | Measure-Object processes -Maximum).Maximum
+    budgetStartupMs      = $budgetStartupMs
+    budgetRssMb          = $budgetRssMb
+    budgetOurPrivateMb   = $budgetOurPrivateMb
+    budgetFamPrivateMb   = $budgetFamPrivateMb
+    startupInBudget      = ($null -ne (Get-Median $startups)) -and ((Get-Median $startups) -lt $budgetStartupMs)
+    rssInBudget          = ((Get-Median $rsss) -lt $budgetRssMb)
+    ourPrivateInBudget   = ((Get-Median $ourPrivs) -lt $budgetOurPrivateMb)
+    famPrivateInBudget   = ((Get-Median $famPrivs) -lt $budgetFamPrivateMb)
 }
 
 Write-Host ""
@@ -157,7 +176,13 @@ $rssOk = [bool]$summary.rssInBudget
 $fmt = if ($startupOk) { 'Green' } else { 'Red' }
 Write-Host ("cold start < {0} ms : {1}" -f $budgetStartupMs, $(if ($startupOk) { 'IN BUDGET' } else { 'OVER BUDGET' })) -ForegroundColor $fmt
 $fmt2 = if ($rssOk) { 'Green' } else { 'Yellow' }
-Write-Host ("RSS at rest < {0} MB : {1}" -f $budgetRssMb, $(if ($rssOk) { 'IN BUDGET' } else { 'OVER BUDGET' })) -ForegroundColor $fmt2
+Write-Host ("RSS at rest < {0} MB : {1} (informational, D-013)" -f $budgetRssMb, $(if ($rssOk) { 'IN BUDGET' } else { 'OVER BUDGET' })) -ForegroundColor $fmt2
+$ourPrivOk = [bool]$summary.ourPrivateInBudget
+$fmt3 = if ($ourPrivOk) { 'Green' } else { 'Red' }
+Write-Host ("our private < {0} MB : {1}" -f $budgetOurPrivateMb, $(if ($ourPrivOk) { 'IN BUDGET' } else { 'OVER BUDGET' })) -ForegroundColor $fmt3
+$famPrivOk = [bool]$summary.famPrivateInBudget
+$fmt4 = if ($famPrivOk) { 'Green' } else { 'Red' }
+Write-Host ("family private < {0} MB : {1}" -f $budgetFamPrivateMb, $(if ($famPrivOk) { 'IN BUDGET' } else { 'OVER BUDGET' })) -ForegroundColor $fmt4
 
 if ($OutFile) {
     $payload = [pscustomobject]@{
