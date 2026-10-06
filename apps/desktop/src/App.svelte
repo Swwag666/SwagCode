@@ -1847,6 +1847,8 @@
       </div>
     </div>
 
+    <div class="content-body">
+      <div class="content-main">
     <div class="transcript-area" class:fade={activeTab}>
       {#if activeTab === 'chat'}
         {#if showSearch}
@@ -2085,32 +2087,38 @@
         </div>
       {/if}
     </div>
+      </div>
 
-    <!-- Панель Files: дерево папки, в которой живёт чат. Открывается
-         последней кнопкой шапки, как в референсе. -->
-    {#if filesOpen}
-      <aside class="files-panel" aria-label={t('filesPanel')}>
-        <div class="files-head">
-          <Icon name="folder-open" size={13} />
-          <span class="files-path" title={filesRoot}>{filesRoot}</span>
-          <button
-            class="header-icon-btn"
-            title={t('closeFiles')}
-            aria-label={t('closeFiles')}
-            onclick={() => (filesOpen = false)}
-          ><Icon name="close" size={12} /></button>
-        </div>
-        {#if currentSession && filesRoot}
-          <FileTree
-            root={filesRoot}
-            sessionId={currentSession}
-            onFileSelect={(p, n) => void openFileFromTree(p, n)}
-          />
-        {:else}
-          <div class="files-empty">{t('noSession')}</div>
-        {/if}
-      </aside>
-    {/if}
+      <!-- Панель Files: дерево папки, в которой живёт чат. Открывается
+           последней кнопкой шапки, как в референсе. Часть лейаута:
+           контент уезжает влево, панель выезжает справа. -->
+      {#if filesOpen}
+        <aside class="files-panel" aria-label={t('filesPanel')}>
+          <div class="files-head">
+            <div class="files-head-row">
+              <Icon name="folder-open" size={13} />
+              <span class="files-cap">{t('filesPanel')}</span>
+              <button
+                class="header-icon-btn"
+                title={t('closeFiles')}
+                aria-label={t('closeFiles')}
+                onclick={() => (filesOpen = false)}
+              ><Icon name="close" size={12} /></button>
+            </div>
+            <span class="files-path" title={filesRoot}>{filesRoot}</span>
+          </div>
+          {#if currentSession && filesRoot}
+            <FileTree
+              root={filesRoot}
+              sessionId={currentSession}
+              onFileSelect={(p, n) => void openFileFromTree(p, n)}
+            />
+          {:else}
+            <div class="files-empty">{t('noSession')}</div>
+          {/if}
+        </aside>
+      {/if}
+    </div>
   </div>
 </main>
 
@@ -2839,10 +2847,13 @@
   }
 
   .content-header {
-    padding: 12px 20px;
+    padding: 12px 0 12px 20px;
     border-bottom: 1px solid var(--border);
     background: var(--surface-chrome);
     transition: background 0.15s;
+    /* Шапка выше панели Files и её меню: поповеры шапки не режутся панелью. */
+    position: relative;
+    z-index: 70;
   }
 
   .content-header:nth-child(odd):hover {
@@ -5687,14 +5698,15 @@
     color: var(--text);
   }
 
-  /* Свои кнопки окна: системную рамку выключили в tauri.conf.json. */
+  /* Свои кнопки окна: системную рамку выключили в tauri.conf.json.
+     Кнопки прижаты к правому верхнему углу, тулзы шапки — чуть правее. */
   .win-controls {
     display: flex;
     align-items: center;
-    margin-left: 10px;
+    margin-left: 6px;
     border-left: 1px solid var(--border);
-    padding-left: 8px;
-    gap: 2px;
+    padding-left: 4px;
+    gap: 0;
   }
 
   .win-btn {
@@ -5702,8 +5714,8 @@
     border: none;
     color: var(--text-dim);
     cursor: pointer;
-    padding: 5px 8px;
-    border-radius: 5px;
+    padding: 7px 12px;
+    border-radius: 0;
     display: flex;
     align-items: center;
     transition: all 0.12s;
@@ -5719,36 +5731,77 @@
     color: #fff;
   }
 
-  /* Панель Files поверх контента справа, контент ужимается padding'ом. */
-  .content {
-    position: relative;
+  /* Панель Files — часть лейаута: контент плавно уезжает влево, панель
+     выезжает справа, ничего не накладывается и не обрезается. */
+  .content-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  .content-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
 
   .files-panel {
-    position: absolute;
-    top: 44px;
-    right: 0;
-    bottom: 0;
-    width: 300px;
-    background: var(--panel-glass-bg, var(--bg-panel));
+    width: 320px;
+    flex-shrink: 0;
+    background: var(--bg-panel);
     border-left: 1px solid var(--border);
+    box-shadow: inset 1px 0 0 rgba(var(--accent-rgb), calc(0.22 * var(--glow-k))),
+      -16px 0 40px rgba(0, 0, 0, 0.35);
     display: flex;
     flex-direction: column;
-    z-index: 40;
-    box-shadow: -12px 0 30px rgba(0, 0, 0, 0.35);
+    min-height: 0;
+    animation: files-in 0.18s ease-out;
+  }
+
+  @keyframes files-in {
+    from {
+      transform: translateX(28px);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+
+  /* Под медиафоном панель Files стеклянная, как остальные поверхности. */
+  .media-on .files-panel {
+    background: rgba(14, 14, 18, var(--panel-glass));
+    backdrop-filter: blur(14px);
   }
 
   .files-head {
     display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-inset);
+  }
+
+  .files-head-row {
+    display: flex;
     align-items: center;
     gap: 7px;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
     color: var(--text-dim);
   }
 
-  .files-path {
+  .files-cap {
     flex: 1;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 10px;
+    font-family: var(--mono);
+  }
+
+  .files-path {
     min-width: 0;
     font-size: 10px;
     font-family: var(--mono);
@@ -5756,6 +5809,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    padding-left: 20px;
   }
 
   .files-empty {
@@ -5763,11 +5817,6 @@
     color: var(--text-faint);
     font-size: 11px;
     font-family: var(--mono);
-  }
-
-  .content:has(.files-panel) .transcript-area,
-  .content:has(.files-panel) .input-area {
-    margin-right: 300px;
   }
 
   .file-overlay {

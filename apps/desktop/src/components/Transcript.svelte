@@ -43,6 +43,11 @@
   const heights: HeightCache = new Map()
   /** Узлы строк по ключу: по ним снимаем измеренную высоту. */
   let rowNodes = new Map<string, HTMLElement>()
+  /** Версия кэша высот: растёт от ResizeObserver строк, чтобы derived
+      окна и распорок пересчитывались на живом росте текста, а не только
+      на батчах шины. */
+  let heightsVersion = $state(0)
+  let rowRO: ResizeObserver | null = null
 
   // C-2 фикс: сбрасываем кэш высот только когда набор ДЕЙСТВИТЕЛЬНО новый
   // (другая сессия, очистка, поиск), а не на каждую пересборку derived-массива:
@@ -61,6 +66,7 @@
     // revision — триггер пересчёта: массив items мутируется моделью напрямую.
     void revision
     void items.length
+    void heightsVersion
     return clampWindow(computeWindow(items.length, scrollTop, viewportHeight, heights), maxRendered)
   })
 
@@ -71,6 +77,7 @@
    * offsetHeight здесь дало бы принудительный layout на каждый кадр.
    */
   let bottomSpacer = $derived.by(() => {
+    void heightsVersion
     let rendered = 0
     for (const i of win.indices) {
       rendered += heights.get(i) ?? ESTIMATED_ITEM_HEIGHT
@@ -117,6 +124,7 @@
   function trackRow(node: HTMLElement, key: string): { update: (k: string) => void; destroy: () => void } {
     let current = key
     rowNodes.set(current, node)
+    rowRO?.observe(node)
     return {
       update(next: string) {
         if (next === current) return
@@ -125,6 +133,7 @@
         rowNodes.set(current, node)
       },
       destroy() {
+        rowRO?.unobserve(node)
         rowNodes.delete(current)
       },
     }
@@ -216,6 +225,18 @@
     })
     ro.observe(scroller)
 
+    /* Строки растут на живом стриме: свой ResizeObserver меряет их сам,
+       поэтому окно виртуализации и распорки не отстают от текста и ничего
+       не обрезается по старой высоте. */
+    rowRO = new ResizeObserver(() => {
+      measure()
+      heightsVersion++
+      if (stickToBottom && scroller) {
+        scroller.scrollTop = scroller.scrollHeight
+        scrollTop = scroller.scrollTop
+      }
+    })
+
     // W-10 фикс: делегированный слушатель для кнопки "копировать"
     const onClick = (e: MouseEvent) => {
       const btn = (e.target as HTMLElement).closest('[data-copy]')
@@ -231,6 +252,8 @@
 
     return () => {
       ro.disconnect()
+      rowRO?.disconnect()
+      rowRO = null
       scroller?.removeEventListener('click', onClick)
     }
   })
@@ -410,10 +433,10 @@
   .row {
     padding: 8px 14px;
     border-bottom: 1px solid var(--border);
-    /* Изолируем перерисовку строки от остального документа. */
-    contain: content;
     /* N-4 фикс: убрали row-appear — при виртуализации анимация проигрывается
-       для каждой строки входящей в окно при скролле, что заметно и раздражает */
+       для каждой строки входящей в окно при скролле, что заметно и раздражает.
+       contain: content тоже убран: paint-containment резал растущие на
+       стриме строки по старой высоте. */
   }
 
   .row-head {
