@@ -466,8 +466,26 @@
     transform: rotate(180deg);
   }
 
+  /* Реплика человека — не серая простыня, а акцентная плашка в стиле
+     интерфейса: скошенный уголок, тинт акцента, внутреннее свечение. */
   .row-user {
-    background: var(--bg-panel);
+    background: linear-gradient(
+      135deg,
+      rgba(var(--accent-rgb), calc(0.12 * var(--glow-k))),
+      rgba(var(--accent-rgb), calc(0.03 * var(--glow-k))) 70%
+    );
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    box-shadow: inset 0 0 22px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
+  }
+
+  .row-user .badge {
+    color: var(--accent);
+    text-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.45 * var(--glow-k)));
+  }
+
+  .row-user .row-body {
+    color: var(--text);
   }
 
   .row-error {

@@ -142,6 +142,14 @@ export class Transcript {
           ex.text += k.data.text
           return true
         }
+        /* Продолжение ответа после преждевременно закрытого куска льём в
+           последний assistant-элемент хода: ответ читается одним блоком,
+           а не рваными огрызками «Похоже на» / «•». */
+        const last = this.lastAssistant(k.data.turn)
+        if (last) {
+          last.text += k.data.text
+          return true
+        }
         this.push({
           key: this.key('a'),
           kind: 'assistant',
@@ -267,6 +275,17 @@ export class Transcript {
         return false
       }
     }
+  }
+
+  /** Последний ответный элемент хода: для склейки продолжений ответа. */
+  private lastAssistant(turn: string): TranscriptItem | undefined {
+    const idxs = this.byTurn.get(turn)
+    if (!idxs) return undefined
+    for (let i = idxs.length - 1; i >= 0; i--) {
+      const it = this.items[idxs[i]]
+      if (it.kind === 'assistant') return it
+    }
+    return undefined
   }
 
   private closeStreaming(turn: string): void {

@@ -83,7 +83,7 @@ describe('Transcript · reasoning отдельным каналом', () => {
     expect(t.items.every((i) => i.done)).toBe(true)
   })
 
-  it('новый content после закрытия создаёт новый элемент', () => {
+  it('content после закрытия склеивается с последним ответом хода (D-034)', () => {
     const t = new Transcript()
     t.applyBatch([ev(1, { kind: 'content', data: { turn: 't1', text: 'a' } })])
     t.applyBatch([
@@ -91,9 +91,9 @@ describe('Transcript · reasoning отдельным каналом', () => {
     ])
     t.applyBatch([ev(3, { kind: 'content', data: { turn: 't1', text: 'b' } })])
     const as = t.items.filter((i) => i.kind === 'assistant')
-    expect(as).toHaveLength(2)
-    expect(as[0].text).toBe('a')
-    expect(as[1].text).toBe('b')
+    // Ответ — один блок: огрызки «Похоже на» / «•» больше не живут отдельно.
+    expect(as).toHaveLength(1)
+    expect(as[0].text).toBe('ab')
   })
 })
 

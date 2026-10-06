@@ -238,20 +238,24 @@
     return tr
   }
 
-  /** Куда отнести событие: своя сессия хода, иначе активная. */
+  /** Куда отнести событие: своя сессия хода. Фолбэк в активный чат — только
+      для ошибок без хода (например, отказ invoke): стрим без известной
+      сессии выбрасывается, иначе чужой ход льётся в открытое окно. */
   function sessionOfEvent(ev: WireEvent): string | null {
-    const k = ev.kind as { data?: { session?: string; turn?: string } }
+    const k = ev.kind as { kind: string; data?: { session?: string; turn?: string } }
     const direct = k.data?.session
     if (direct) return direct
     const turn = k.data?.turn
     if (turn && turnSession.has(turn)) return turnSession.get(turn) ?? null
-    return currentSession
+    if (k.kind === 'error') return currentSession
+    return null
   }
 
   /** Переключение сессии: свой транскрипт, своя история с ядра. */
   function switchSession(id: string): void {
     if (id === currentSession) return
     currentSession = id
+    chatBirth = false
     transcript = transcriptFor(id)
     items = transcript.items
     revision++
@@ -586,6 +590,9 @@
   let sendingSession = $state<string | null>(null)
   let inputText = $state('')
   let creatingSession = $state(false)
+  /* Анимация рождения чата: включается кнопкой создания, гаснет с первым
+     сообщением. Пассивно на старте приложения не горит. */
+  let chatBirth = $state(false)
   let streamStartTime = $state<number | null>(null)
   let tokensPerSec = $state<number | null>(null)
   let turnTokens = $state(0)
@@ -598,6 +605,12 @@
   let thinking = $derived(liveStates[currentSession ?? ''] === 'running')
   /** Отправка идёт именно в открытый сейчас чат. */
   let sending = $derived(sendingSession !== null && sendingSession === currentSession)
+  /* Плашка рождения перечитывается на каждый revision: items мутируется
+     моделью напрямую, и без триггера плашка залипала бы над живым чатом. */
+  let birthVisible = $derived.by(() => {
+    void revision
+    return chatBirth && items.length === 0
+  })
 
   /* Очередь сообщений — своя у каждой сессии: пока нейронка думает, новые
      реплики не теряются и не льются в чужой разговор. */
@@ -821,9 +834,13 @@
 
   async function createNewSession(cwdOverride?: string): Promise<void> {
     creatingSession = true
+    /* Защита от событийного аргумента: onclick={onCreate} передаёт клик
+       первым параметром, и MouseEvent раньше уезжал в cwd — сессия не
+       создавалась, а «второй чат» оказывался первым. */
+    const cwd = typeof cwdOverride === 'string' && cwdOverride !== '' ? cwdOverride : undefined
     try {
       const brief = await invoke<{ id: string; cwd: string }>('create_session', {
-        cwd: cwdOverride ?? preferredCwd(),
+        cwd: cwd ?? preferredCwd(),
         model: null,
       })
       currentSession = brief.id
@@ -833,6 +850,10 @@
       items = transcript.items
       revision++
       sessionRefreshTick++
+      /* Анимация рождения горит только у только что созданного чата и
+         гаснет с первым сообщением. На старте приложения её нет. */
+      chatBirth = true
+      void loadWorkspaces()
     } catch (err) {
       console.error('create_session failed:', err)
     } finally {
@@ -1472,7 +1493,7 @@
       <SessionList
         activeId={currentSession}
         onSelect={switchSession}
-        onCreate={createNewSession}
+        onCreate={() => void createNewSession()}
         refreshTick={sessionRefreshTick}
         liveStates={liveStates}
       />
@@ -1575,7 +1596,7 @@
           </div>
         {/if}
         <div class="transcript-wrap">
-          {#if items.length === 0}
+          {#if birthVisible}
             <!-- Первое сообщение-статус больше не печатается в чат: рождение
                  чата показывает анимация сборки, а первой строкой транскрипта
                  остаётся слово человека. -->
