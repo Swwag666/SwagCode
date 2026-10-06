@@ -35,6 +35,14 @@
     | 'alert'
     | 'brain'
     | 'folder'
+    | 'folder-open'
+    | 'sliders'
+    | 'external'
+    | 'dots'
+    | 'download'
+    | 'minimize'
+    | 'maximize'
+    | 'restore'
     | 'stop'
 
   interface Props {
@@ -93,6 +101,29 @@
     plus: '<path d="M12 5.2v13.6M5.2 12h13.6"/>',
     folder:
       '<path d="M3.4 6.4h6l1.8 2.4h9.4v10.8H3.4z"/>',
+    'folder-open':
+      '<path d="M3.4 6.4h6l1.8 2.4h7.4v2"/>' +
+      '<path d="M3.4 19.6l2.6-8h15l-2.6 8z"/>',
+    sliders:
+      '<path d="M4 7.2h9M17 7.2h3M4 16.8h3M11 16.8h9"/>' +
+      '<circle cx="15" cy="7.2" r="2.1"/>' +
+      '<circle cx="9" cy="16.8" r="2.1"/>',
+    external:
+      '<path d="M13.6 4.4h6v6"/>' +
+      '<path d="M19.6 4.4L11 13"/>' +
+      '<path d="M18 14.2v5.4H4.4V6h5.4"/>',
+    dots:
+      '<circle cx="5.4" cy="12" r="1.5" fill="currentColor" stroke="none"/>' +
+      '<circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/>' +
+      '<circle cx="18.6" cy="12" r="1.5" fill="currentColor" stroke="none"/>',
+    download:
+      '<path d="M12 4.2v10.4M7.4 10.2l4.6 4.6 4.6-4.6"/>' +
+      '<path d="M4.6 19.4h14.8"/>',
+    minimize: '<path d="M5 12h14"/>',
+    maximize: '<rect x="5.4" y="5.4" width="13.2" height="13.2" rx="1.6"/>',
+    restore:
+      '<rect x="4.6" y="7.4" width="12" height="12" rx="1.6"/>' +
+      '<path d="M8.2 7.4v-2.8h11.2v11.2h-2.8"/>',
     stop: '<rect x="6.8" y="6.8" width="10.4" height="10.4" rx="1.6" fill="currentColor" stroke="none"/>',
     alert:
       '<path d="M12 3.6L22 20.4H2z"/>' +

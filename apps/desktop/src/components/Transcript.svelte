@@ -9,7 +9,7 @@
    */
   import { onMount, tick } from 'svelte'
   import Icon from './Icon.svelte'
-  import { renderMarkdown, renderStreaming } from '../lib/markdown'
+  import { renderMarkdown } from '../lib/markdown'
   import {
     clampWindow,
     computeWindow,
@@ -284,7 +284,7 @@
           {#if item.tool}<span class="tool">{item.tool}</span>{/if}
           {#if item.elapsedMs !== undefined}<span class="elapsed">{item.elapsedMs} мс</span>{/if}
           {#if item.ok === false}<span class="failed">ошибка</span>{/if}
-          {#if !item.done}<span class="streaming">▁▂▃▅▇▅▃▂▁</span>{/if}
+          {#if !item.done}<span class="live-dot" aria-hidden="true"></span>{/if}
           <button
             class="bookmark-btn"
             class:active={bookmarks.has(item.key)}
@@ -305,11 +305,9 @@
         {#if item.kind !== 'reasoning' || openThoughts.has(item.key)}
           <div class="row-body">
             {#if item.kind === 'assistant' || item.kind === 'reasoning'}
-              {#if item.done}
-                {@html renderMarkdown(item.text || '')}
-              {:else}
-                {@html renderStreaming(item.text || '')}
-              {/if}
+              <!-- Маркдаун рендерится ЖИВЬЁМ на каждом батче: «расшифровка»
+                   ответа больше не запаздывает до конца хода. -->
+              {@html renderMarkdown(item.text || '')}
             {:else}
               {item.text || '\u00a0'}
             {/if}
@@ -630,11 +628,19 @@
     color: var(--accent);
   }
 
-  .streaming {
-    color: var(--accent);
-    font-size: 9px;
-    letter-spacing: -1px;
-    animation: wave 1.2s ease-in-out infinite;
+  /* Живой ход: тихая пульсирующая точка вместо красной «волны». */
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.6 * var(--glow-k)));
+    animation: live-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes live-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1.15); }
   }
 
   .bookmark-btn {
@@ -677,11 +683,6 @@
     color: var(--accent);
     transform: scale(1.2);
     text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  @keyframes wave {
-    0%, 100% { opacity: 0.4; transform: scaleY(0.8); }
-    50% { opacity: 1; transform: scaleY(1.2); }
   }
 
   .tool {

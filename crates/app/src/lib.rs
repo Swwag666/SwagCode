@@ -65,6 +65,9 @@ pub struct SessionBrief {
     /// Результат последнего хода: UI рисует честный индикатор
     /// (ошибка / работа / готово), а не «всегда зелёную точку».
     pub last_ok: Option<bool>,
+    /// Когда сессия последний раз шевелилась: конец последнего хода или
+    /// создание. Сайдбар сортирует группы «по обновлению» как DeepSeek.
+    pub last_activity_ms: u64,
 }
 
 impl From<&Session> for SessionBrief {
@@ -82,6 +85,11 @@ impl From<&Session> for SessionBrief {
             turns: s.turns.len(),
             est_context_tokens: s.estimate_context_tokens(),
             last_ok: s.turns.last().map(|t| t.ok),
+            last_activity_ms: s
+                .turns
+                .last()
+                .map(|t| t.ended_ms.unwrap_or(t.started_ms))
+                .unwrap_or(s.created_ms),
         }
     }
 }
@@ -393,6 +401,35 @@ async fn session_transcript(
         }));
     }
     Ok(out)
+}
+
+/// Журнал сессии в файл, выбранный в нативном диалоге: JSONL wire-событий
+/// в том же формате, что шина. Белый список расширений не даёт случайно
+/// затереть журналом исходники или exe.
+#[tauri::command]
+async fn save_session_log(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let target = std::path::PathBuf::from(&path);
+    match target.extension().and_then(|e| e.to_str()) {
+        Some("jsonl") | Some("json") | Some("txt") | Some("log") => {}
+        _ => return Err("журнал сохраняется только в .jsonl / .json / .txt / .log".into()),
+    }
+    let events = session_transcript(state, session_id).await?;
+    let mut body = String::new();
+    for e in &events {
+        body.push_str(&serde_json::to_string(e).map_err(|e| format!("json: {e}"))?);
+        body.push('\n');
+    }
+    if let Some(dir) = target.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("папка: {e}"))?;
+        }
+    }
+    std::fs::write(&target, body).map_err(|e| format!("не записал журнал: {e}"))?;
+    Ok(target.display().to_string())
 }
 
 #[tauri::command]
@@ -1093,6 +1130,7 @@ pub fn run() {
             load_background,
             delete_background,
             session_transcript,
+            save_session_log,
             list_sessions,
             create_session,
             set_approval_policy,

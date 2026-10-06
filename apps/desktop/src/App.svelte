@@ -6,12 +6,14 @@
    */
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
-  import { open as openDialog } from '@tauri-apps/plugin-dialog'
+  import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import { bus, type WireEvent } from './lib/bus'
   import { Transcript } from './components'
   import BackgroundFX from './components/BackgroundFX.svelte'
   import Splash from './components/Splash.svelte'
   import SessionList from './components/SessionList.svelte'
+  import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
@@ -593,6 +595,122 @@
   /* Анимация рождения чата: включается кнопкой создания, гаснет с первым
      сообщением. Пассивно на старте приложения не горит. */
   let chatBirth = $state(false)
+  /* Сайdbar и шапка как в референсе: фильтр сессий, поповер группировки,
+     меню папки сессии, панель Files и окно без системной рамки. */
+  let sessionFilterOpen = $state(false)
+  let sessionFilter = $state('')
+  let groupPop = $state(false)
+  let folderMenu = $state(false)
+  let dotsMenu = $state(false)
+  let filesOpen = $state(false)
+  let maximized = $state(false)
+  let fileReader = $state<{ name: string; text: string } | null>(null)
+  let logNote = $state('')
+
+  function readLocal(key: string, def: string): string {
+    try {
+      return localStorage.getItem(key) ?? def
+    } catch {
+      return def
+    }
+  }
+
+  let groupMode = $state<'workspace' | 'list'>(
+    readLocal('swagcod-group', 'workspace') === 'list' ? 'list' : 'workspace',
+  )
+  let orderMode = $state<'manual' | 'updated'>(
+    readLocal('swagcod-order', 'updated') === 'manual' ? 'manual' : 'updated',
+  )
+
+  function setGroupMode(m: 'workspace' | 'list'): void {
+    groupMode = m
+    try {
+      localStorage.setItem('swagcod-group', m)
+    } catch {
+      /* приватный режим: настройка живёт до перезапуска */
+    }
+  }
+
+  function setOrderMode(m: 'manual' | 'updated'): void {
+    orderMode = m
+    try {
+      localStorage.setItem('swagcod-order', m)
+    } catch {
+      /* приватный режим: настройка живёт до перезапуска */
+    }
+  }
+
+  /** Папка текущей сессии в проводнике Windows. */
+  async function openActiveFolder(): Promise<void> {
+    const cwd = currentSession ? sessionCwds[currentSession] : undefined
+    if (!cwd || !currentSession) return
+    try {
+      await invoke('open_in_explorer', { sessionId: currentSession, path: cwd })
+    } catch (e) {
+      logNote = String(e)
+    }
+  }
+
+  /** Журнал сессии в файл через нативный диалог сохранения. */
+  async function downloadSessionLog(): Promise<void> {
+    if (!currentSession) return
+    folderMenu = false
+    dotsMenu = false
+    try {
+      const sel = await saveDialog({
+        defaultPath: `swagcod-${currentSession.slice(0, 8)}.jsonl`,
+        filters: [{ name: 'Журнал SwagCod', extensions: ['jsonl', 'json', 'txt', 'log'] }],
+      })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return
+      const saved = await invoke<string>('save_session_log', { sessionId: currentSession, path })
+      logNote = saved
+    } catch (e) {
+      logNote = String(e)
+    }
+  }
+
+  async function copySessionId(): Promise<void> {
+    dotsMenu = false
+    if (!currentSession) return
+    try {
+      await navigator.clipboard.writeText(currentSession)
+      logNote = currentSession
+    } catch {
+      /* клипборд недоступен вне фокуса окна */
+    }
+  }
+
+  /** Файл из панели Files: текст через песочницу ядра (cwd сессии). */
+  async function openFileFromTree(path: string, name: string): Promise<void> {
+    if (!currentSession) return
+    try {
+      const text = await invoke<string>('read_file', { sessionId: currentSession, path })
+      fileReader = { name, text }
+    } catch (e) {
+      logNote = String(e)
+    }
+  }
+
+  /* Окно без системной рамки: свои кнопки свернуть/развернуть/закрыть. */
+  const appWindow = getCurrentWindow()
+
+  function winMinimize(): void {
+    void appWindow.minimize()
+  }
+
+  async function winToggleMax(): Promise<void> {
+    try {
+      await appWindow.toggleMaximize()
+      maximized = await appWindow.isMaximized()
+    } catch {
+      /* браузерный режим: окна нет */
+    }
+  }
+
+  function winClose(): void {
+    void appWindow.close()
+  }
   let streamStartTime = $state<number | null>(null)
   let tokensPerSec = $state<number | null>(null)
   let turnTokens = $state(0)
@@ -611,6 +729,8 @@
     void revision
     return chatBirth && items.length === 0
   })
+  /** Папка текущего чата для панели Files. */
+  let filesRoot = $derived(currentSession ? (sessionCwds[currentSession] ?? '') : '')
 
   /* Очередь сообщений — своя у каждой сессии: пока нейронка думает, новые
      реплики не теряются и не льются в чужой разговор. */
@@ -1407,8 +1527,8 @@
   style:grid-template-columns={sidebarCollapsed ? '0px 0px 1fr' : `${sidebarWidth}px 5px 1fr`}
 >
   <aside class="sidebar" aria-hidden={sidebarCollapsed}>
-    <div class="sidebar-header">
-      <div class="brand">
+    <div class="sidebar-header" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
         <div class="eye" aria-hidden="true">
           <!-- Чёрный фон кадра вырезаем luminance-маской, а не blend-mode:
                blend ломается от filter/zoom на предках, маска — нет.
@@ -1420,6 +1540,12 @@
           ></span>
         </div>
         <span class="name">SwagCod</span>
+        <button
+          class="brand-collapse"
+          onclick={() => (sidebarCollapsed = true)}
+          title={t('collapseSidebar')}
+          aria-label={t('collapseSidebar')}
+        ><Icon name="panel" size={14} /></button>
       </div>
       <button class="new-session-btn" onclick={() => void createNewSession()} disabled={creatingSession} title={t('newSession')}>
         {#if creatingSession}
@@ -1436,10 +1562,17 @@
         <span>{t('workspaces')}</span>
         <div class="section-actions">
           <button
-            title={t('chat')}
-            aria-label={t('chat')}
-            onclick={() => { showSearch = !showSearch; activeTab = 'chat' }}
+            title={t('filterSessions')}
+            aria-label={t('filterSessions')}
+            aria-pressed={sessionFilterOpen}
+            onclick={() => (sessionFilterOpen = !sessionFilterOpen)}
           ><Icon name="search" size={13} /></button>
+          <button
+            title={t('groupOrder')}
+            aria-label={t('groupOrder')}
+            aria-expanded={groupPop}
+            onclick={() => (groupPop = !groupPop)}
+          ><Icon name="sliders" size={13} /></button>
           <button
             title={t('wsTitle')}
             aria-label={t('wsTitle')}
@@ -1449,8 +1582,56 @@
               if (showWorkspaces) void loadWorkspaces()
             }}
           ><Icon name="folder" size={13} /></button>
+          <button
+            title={t('openFolder')}
+            aria-label={t('openFolder')}
+            onclick={() => void openActiveFolder()}
+          ><Icon name="external" size={13} /></button>
         </div>
       </div>
+      {#if groupPop}
+        <!-- Наполнение второго значка из референса: группировка и порядок. -->
+        <div class="group-pop" role="dialog" aria-label={t('groupOrder')}>
+          <div class="gp-cap">{t('groupBy')}</div>
+          <button
+            class="gp-row"
+            class:on={groupMode === 'workspace'}
+            onclick={() => setGroupMode('workspace')}
+          >
+            <span>{t('groupWs')}</span>
+            {#if groupMode === 'workspace'}<Icon name="check" size={12} />{/if}
+          </button>
+          <button class="gp-row" class:on={groupMode === 'list'} onclick={() => setGroupMode('list')}>
+            <span>{t('groupList')}</span>
+            {#if groupMode === 'list'}<Icon name="check" size={12} />{/if}
+          </button>
+          <div class="gp-cap">{t('orderBy')}</div>
+          <button class="gp-row" class:on={orderMode === 'manual'} onclick={() => setOrderMode('manual')}>
+            <span>{t('orderManual')}</span>
+            {#if orderMode === 'manual'}<Icon name="check" size={12} />{/if}
+          </button>
+          <button class="gp-row" class:on={orderMode === 'updated'} onclick={() => setOrderMode('updated')}>
+            <span>{t('orderUpdated')}</span>
+            {#if orderMode === 'updated'}<Icon name="check" size={12} />{/if}
+          </button>
+        </div>
+      {/if}
+      {#if sessionFilterOpen}
+        <div class="session-filter">
+          <input
+            type="text"
+            class="search-input"
+            placeholder={t('filterPlaceholder')}
+            bind:value={sessionFilter}
+            onkeydown={(e) => {
+              if (e.key === 'Escape') {
+                sessionFilterOpen = false
+                sessionFilter = ''
+              }
+            }}
+          />
+        </div>
+      {/if}
       {#if showWorkspaces}
         <div class="ws-popover" role="dialog" aria-label={t('wsTitle')}>
           <div class="ws-title">{t('wsTitle')}</div>
@@ -1489,9 +1670,12 @@
       <SessionList
         activeId={currentSession}
         onSelect={switchSession}
-        onCreate={() => void createNewSession()}
         refreshTick={sessionRefreshTick}
         liveStates={liveStates}
+        groupMode={groupMode}
+        orderMode={orderMode}
+        filter={sessionFilter}
+        onCreateIn={(cwd) => void createNewSession(cwd)}
       />
     </div>
 
@@ -1521,6 +1705,9 @@
         <span class:ok={connected} class:warn={!connected}>
           {connected ? '●' : '○'} {connected ? t('connected') : tauriAvailable ? t('connecting') : t('browser')}
         </span>
+        {#if logNote}
+          <span class="log-note" title={logNote}>{logNote}</span>
+        {/if}
       </div>
       <button class="settings-btn" onclick={() => (showSettings = !showSettings)}>
         <Icon name="gear" size={13} /> {t('settings')}
@@ -1547,7 +1734,13 @@
   ></button>
 
   <div class="content" class:fx-matrix={effectsEnabled && bgMode === 'matrix'} class:fx-media={bgMediaUrl !== ''}>
-    <div class="content-header">
+    <div
+      class="content-header"
+      class:files-open={filesOpen}
+      role="banner"
+      data-tauri-drag-region
+      ondblclick={() => void winToggleMax()}
+    >
       <div class="session-title">
         {#if sidebarCollapsed}
           <button
@@ -1570,6 +1763,83 @@
         <div class="tabs">
           <button class="tab" class:active={activeTab === 'chat'} onclick={() => (activeTab = 'chat')} role="tab" aria-selected={activeTab === 'chat'}>{t('chat')}</button>
           <button class="tab" class:active={activeTab === 'trajectory'} onclick={() => (activeTab = 'trajectory')} role="tab" aria-selected={activeTab === 'trajectory'}>{t('trajectory')}</button>
+        </div>
+        <div class="header-tools-right">
+          <button
+            class="header-icon-btn"
+            title={t('searchTranscript')}
+            aria-label={t('searchTranscript')}
+            aria-pressed={showSearch}
+            onclick={() => {
+              showSearch = !showSearch
+              activeTab = 'chat'
+            }}
+          ><Icon name="search" size={13} /></button>
+          <div class="hmenu-wrap">
+            <button
+              class="header-icon-btn"
+              title={t('sessionFolder')}
+              aria-label={t('sessionFolder')}
+              aria-expanded={folderMenu}
+              onclick={() => {
+                folderMenu = !folderMenu
+                dotsMenu = false
+              }}
+            ><Icon name="folder" size={13} /><Icon name="chevron-down" size={9} /></button>
+            {#if folderMenu}
+              <div class="hmenu" role="menu">
+                <button role="menuitem" onclick={() => { folderMenu = false; void openActiveFolder() }}>
+                  <Icon name="external" size={12} /> {t('openFolder')}
+                </button>
+                <button role="menuitem" onclick={() => void downloadSessionLog()}>
+                  <Icon name="download" size={12} /> {t('downloadLog')}
+                </button>
+              </div>
+            {/if}
+          </div>
+          <div class="hmenu-wrap">
+            <button
+              class="header-icon-btn"
+              title={t('more')}
+              aria-label={t('more')}
+              aria-expanded={dotsMenu}
+              onclick={() => {
+                dotsMenu = !dotsMenu
+                folderMenu = false
+              }}
+            ><Icon name="dots" size={14} /></button>
+            {#if dotsMenu}
+              <div class="hmenu" role="menu">
+                <button role="menuitem" onclick={() => void downloadSessionLog()}>
+                  <Icon name="download" size={12} /> {t('downloadLog')}
+                </button>
+                <button role="menuitem" onclick={() => void copySessionId()}>
+                  <Icon name="clipboard" size={12} /> {t('copyId')}
+                </button>
+              </div>
+            {/if}
+          </div>
+          <button
+            class="header-icon-btn"
+            class:on={filesOpen}
+            title={t('filesPanel')}
+            aria-label={t('filesPanel')}
+            aria-pressed={filesOpen}
+            onclick={() => (filesOpen = !filesOpen)}
+          ><Icon name="panel" size={14} /></button>
+          <!-- Своё окно без системной рамки: кнопки управления окном
+               нарисованы в стиле интерфейса, как в референсе. -->
+          <div class="win-controls">
+            <button class="win-btn" title={t('minimize')} aria-label={t('minimize')} onclick={winMinimize}>
+              <Icon name="minimize" size={12} />
+            </button>
+            <button class="win-btn" title={t('maximize')} aria-label={t('maximize')} onclick={() => void winToggleMax()}>
+              <Icon name={maximized ? 'restore' : 'maximize'} size={11} />
+            </button>
+            <button class="win-btn win-close" title={t('closeWin')} aria-label={t('closeWin')} onclick={winClose}>
+              <Icon name="close" size={12} />
+            </button>
+          </div>
         </div>
         <!-- Зум и сворачивание панели уехали в настройки: в шапке они
              дублировали их и съедали место. Горячие клавиши остались:
@@ -1815,8 +2085,62 @@
         </div>
       {/if}
     </div>
+
+    <!-- Панель Files: дерево папки, в которой живёт чат. Открывается
+         последней кнопкой шапки, как в референсе. -->
+    {#if filesOpen}
+      <aside class="files-panel" aria-label={t('filesPanel')}>
+        <div class="files-head">
+          <Icon name="folder-open" size={13} />
+          <span class="files-path" title={filesRoot}>{filesRoot}</span>
+          <button
+            class="header-icon-btn"
+            title={t('closeFiles')}
+            aria-label={t('closeFiles')}
+            onclick={() => (filesOpen = false)}
+          ><Icon name="close" size={12} /></button>
+        </div>
+        {#if currentSession && filesRoot}
+          <FileTree
+            root={filesRoot}
+            sessionId={currentSession}
+            onFileSelect={(p, n) => void openFileFromTree(p, n)}
+          />
+        {:else}
+          <div class="files-empty">{t('noSession')}</div>
+        {/if}
+      </aside>
+    {/if}
   </div>
 </main>
+
+{#if fileReader}
+  <div
+    class="file-overlay"
+    role="dialog"
+    aria-label={fileReader.name}
+    tabindex="-1"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) fileReader = null
+    }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') fileReader = null
+    }}
+  >
+    <div class="file-card" role="document">
+      <div class="file-card-head">
+        <span class="file-card-name">{fileReader.name}</span>
+        <button
+          class="header-icon-btn"
+          title={t('closeFiles')}
+          aria-label={t('closeFiles')}
+          onclick={() => (fileReader = null)}
+        ><Icon name="close" size={14} /></button>
+      </div>
+      <pre class="file-card-body">{fileReader.text}</pre>
+    </div>
+  </div>
+{/if}
 
 <style>
   main.dsh-layout {
@@ -5245,5 +5569,263 @@
 
   .ws-act:hover {
     color: var(--accent);
+  }
+
+  /* ── Ревизия 12: сайдбар и шапка как в референсе ─────────────────── */
+
+  .brand-collapse {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--text-faint);
+    cursor: pointer;
+    padding: 3px;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    transition: all 0.15s;
+  }
+
+  .brand-collapse:hover {
+    color: var(--accent);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+  }
+
+  .session-filter {
+    padding: 4px 10px 6px;
+  }
+
+  .group-pop {
+    margin: 2px 10px 8px;
+    padding: 6px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    z-index: 30;
+  }
+
+  .gp-cap {
+    color: var(--text-faint);
+    font-size: 9px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 4px 6px 2px;
+  }
+
+  .gp-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: var(--mono);
+    padding: 5px 6px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .gp-row:hover {
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    color: var(--text);
+  }
+
+  .gp-row.on {
+    color: var(--accent);
+  }
+
+  .header-tools-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .hmenu-wrap {
+    position: relative;
+    display: flex;
+  }
+
+  .hmenu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    min-width: 210px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .hmenu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: var(--mono);
+    padding: 7px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.15s;
+  }
+
+  .hmenu button:hover {
+    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
+    color: var(--text);
+  }
+
+  /* Свои кнопки окна: системную рамку выключили в tauri.conf.json. */
+  .win-controls {
+    display: flex;
+    align-items: center;
+    margin-left: 10px;
+    border-left: 1px solid var(--border);
+    padding-left: 8px;
+    gap: 2px;
+  }
+
+  .win-btn {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 5px 8px;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    transition: all 0.12s;
+  }
+
+  .win-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+  }
+
+  .win-close:hover {
+    background: var(--err);
+    color: #fff;
+  }
+
+  /* Панель Files поверх контента справа, контент ужимается padding'ом. */
+  .content {
+    position: relative;
+  }
+
+  .files-panel {
+    position: absolute;
+    top: 44px;
+    right: 0;
+    bottom: 0;
+    width: 300px;
+    background: var(--panel-glass-bg, var(--bg-panel));
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    z-index: 40;
+    box-shadow: -12px 0 30px rgba(0, 0, 0, 0.35);
+  }
+
+  .files-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+
+  .files-path {
+    flex: 1;
+    min-width: 0;
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--text-faint);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .files-empty {
+    padding: 16px 12px;
+    color: var(--text-faint);
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+
+  .content:has(.files-panel) .transcript-area,
+  .content:has(.files-panel) .input-area {
+    margin-right: 300px;
+  }
+
+  .file-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(6px);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .file-card {
+    width: min(860px, 92vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 0 40px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
+  }
+
+  .file-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .file-card-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+  }
+
+  .file-card-body {
+    margin: 0;
+    padding: 12px;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .log-note {
+    margin-left: auto;
+    color: var(--text-faint);
+    font-size: 9px;
+    font-family: var(--mono);
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>
