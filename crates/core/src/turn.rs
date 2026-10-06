@@ -56,16 +56,36 @@ impl ApprovalPolicy {
     /// Имена тулзов, которые всегда требуют подтверждения при
     /// [`ApprovalPolicy::OnDangerous`].
     pub const DANGEROUS: &'static [&'static str] =
-        &["bash", "pwsh", "shell", "write", "edit", "delete", "remove"];
+        &["bash", "pwsh", "shell", "write", "edit", "delete", "remove", "patch"];
+
+    /// Встроенные имена тулзов (B-5). Всё, что не здесь, — плагин:
+    /// внешняя команда не должна исполняться молча, поэтому при
+    /// [`ApprovalPolicy::OnDangerous`] неизвестное имя считается опасным.
+    pub const BUILTIN: &'static [&'static str] = &[
+        "read",
+        "list",
+        "write",
+        "bash",
+        "memory_append",
+        "grep",
+        "glob",
+        "patch",
+        "fetch_url",
+    ];
 
     /// Нужно ли подтверждение для этого вызова.
     pub fn requires_approval(&self, tool_name: &str) -> bool {
         match self {
             Self::Always => true,
             Self::Never => false,
-            Self::OnDangerous => Self::DANGEROUS
-                .iter()
-                .any(|d| tool_name.eq_ignore_ascii_case(d)),
+            Self::OnDangerous => {
+                Self::DANGEROUS
+                    .iter()
+                    .any(|d| tool_name.eq_ignore_ascii_case(d))
+                    || !Self::BUILTIN
+                        .iter()
+                        .any(|b| tool_name.eq_ignore_ascii_case(b))
+            }
         }
     }
 }
@@ -478,6 +498,55 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": { "text": { "type": "string", "description": "Note text, markdown" } },
                 "required": ["text"]
+            }),
+        },
+        /* B-5: grep/glob/patch/fetch_url. */
+        ToolSpec {
+            name: "grep".into(),
+            description: "Search file contents in the session working directory with a regex (Rust syntax). Returns matching lines with numbers and surrounding context. Respects .gitignore.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Regular expression" },
+                    "path": { "type": "string", "description": "Optional subdirectory to search in" },
+                    "context": { "type": "integer", "description": "Context lines around a match, 0..10, default 2" }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "glob".into(),
+            description: "Find files in the session working directory by glob pattern (e.g. \"src/**/*.rs\", \"*.toml\"). A pattern without \"/\" matches basenames at any depth. Respects .gitignore.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob pattern" },
+                    "path": { "type": "string", "description": "Optional subdirectory to search in" }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "patch".into(),
+            description: "Replace an exact literal block in a text file inside the session working directory. old_string must appear exactly once unless replace_all is true. Whitespace-only drift in old_string is tolerated.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string", "description": "Literal text to replace" },
+                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "replace_all": { "type": "boolean", "description": "Replace every occurrence, default false" }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        },
+        ToolSpec {
+            name: "fetch_url".into(),
+            description: "Fetch an http(s) URL and return its content as text. HTML is reduced to readable text (scripts and styles removed). Response body capped at 2 MB.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "url": { "type": "string", "description": "http(s) URL" } },
+                "required": ["url"]
             }),
         },
     ]
@@ -939,7 +1008,7 @@ mod tests {
     fn builtin_specs_match_approval_dangerous_list() {
         let p = ApprovalPolicy::OnDangerous;
         for spec in builtin_tool_specs() {
-            let expected = matches!(spec.name.as_str(), "write" | "bash");
+            let expected = matches!(spec.name.as_str(), "write" | "bash" | "patch");
             assert_eq!(
                 p.requires_approval(&spec.name),
                 expected,
@@ -948,5 +1017,14 @@ mod tests {
             );
             assert!(spec.parameters.get("properties").is_some());
         }
+    }
+
+    #[test]
+    fn unknown_tool_is_dangerous_by_default() {
+        // B-5: плагин — внешняя команда, молча исполняться не должен.
+        let p = ApprovalPolicy::OnDangerous;
+        assert!(p.requires_approval("my_plugin_tool"));
+        assert!(!p.requires_approval("fetch_url"));
+        assert!(!p.requires_approval("MEMORY_APPEND"));
     }
 }

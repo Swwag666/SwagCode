@@ -17,3 +17,11 @@ similar = "2"
 ignore = "0.4"
 # B-4: fuzzy-матчер из экосистемы helix/nucleo — быстрый и без зависимостей.
 nucleo-matcher = "0.3"
+# B-5: grep (regex), glob-матчер и fetch_url (HTML→текст через scraper).
+regex = "1"
+globset = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+scraper = "0.20"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

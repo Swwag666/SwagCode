@@ -6,6 +6,7 @@ nucleo-fuzzy-поиск (модуль `index`), watch с debounce 200 мс (мо
 */
 
 pub mod index;
+pub mod tools;
 pub mod watch;
 
 pub use index::FileIndex;
@@ -22,6 +23,8 @@ pub enum FsxError {
     Notify(#[from] notify::Error),
     #[error("путь не существует: {}", .0.display())]
     NotFound(std::path::PathBuf),
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Одна изменённая строка в diff.

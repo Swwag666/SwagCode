@@ -17,7 +17,7 @@ use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
 };
-use swagcod_provider::types::{ChatMessage, ToolCall};
+use swagcod_provider::types::{ChatMessage, ToolCall, ToolSpec};
 use swagcod_provider::{ChatRequest, Provider, StreamEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
@@ -53,6 +53,23 @@ pub struct AppState {
     /// на каждое нажатие клавиши.
     pub indexes:
         std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<swagcod_fsx::FileIndex>)>>,
+    /// B-5: зарегистрированные внешние инструменты (плагины). Модель видит
+    /// их в одном списке со встроенными; исполнение — через shell команду,
+    /// аргументы JSON-ом в stdin. Не-встроенное имя при OnDangerous всегда
+    /// уходит на подтверждение (ApprovalPolicy::BUILTIN).
+    pub plugins: std::sync::Mutex<Vec<PluginTool>>,
+}
+
+/// Внешний инструмент: spec для модели + команда для исполнения.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginTool {
+    pub name: String,
+    pub description: String,
+    /// JSON-Schema параметров (объект).
+    pub parameters: serde_json::Value,
+    /// Командная строка: исполняется через cmd /C (windows) или sh -c,
+    /// cwd — рабочая директория сессии, аргументы приходят JSON-ом в stdin.
+    pub command: String,
 }
 
 impl Default for AppState {
@@ -70,6 +87,7 @@ impl Default for AppState {
             ptys: std::sync::Arc::new(swagcod_pty::PtyManager::new()),
             watches: Mutex::new(std::collections::HashMap::new()),
             indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            plugins: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -723,8 +741,20 @@ async fn start_turn(
     // W-6 фикс: используем переданную модель если есть, иначе из сессии.
     let effective_model = model.unwrap_or(session_model);
     // Тулзы уходят в каждом запросе: без определений модель не может их вызвать.
+    // B-5: встроенные плюс зарегистрированные плагины — модель видит один список.
+    let plugins: Vec<PluginTool> = state
+        .plugins
+        .lock()
+        .map(|p| p.clone())
+        .unwrap_or_default();
+    let mut specs = builtin_tool_specs();
+    specs.extend(plugins.iter().map(|p| ToolSpec {
+        name: p.name.clone(),
+        description: p.description.clone(),
+        parameters: p.parameters.clone(),
+    }));
     let tool_wire: Vec<serde_json::Value> =
-        ChatRequest::new(&effective_model, Vec::new()).with_tools(&builtin_tool_specs()).tools;
+        ChatRequest::new(&effective_model, Vec::new()).with_tools(&specs).tools;
     let temperature = temperature.map(|t| t as f32);
 
     let bus = state.bus.clone();
@@ -953,7 +983,7 @@ async fn start_turn(
                 }
                 TurnStep::ExecuteTool { call } => {
                     let started = std::time::Instant::now();
-                    let tool_outcome = execute_tool(&call, &cwd, tool_timeout).await;
+                    let tool_outcome = execute_tool(&call, &cwd, tool_timeout, &plugins).await;
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     bus.publish(EventKind::ToolResult {
                         turn: tid.clone(),
@@ -1290,6 +1320,55 @@ async fn diff_against_head(
     })
 }
 
+/* B-5: слой плагинов. Регистрация внешнего инструмента: spec для модели
+   плюс команда для исполнения. Имя не должно пересекаться со встроенными:
+   иначе плагин смог бы затенить read/write и обойти их семантику. */
+
+#[tauri::command]
+fn register_plugin_tool(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    description: String,
+    parameters_json: String,
+    command: String,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || command.trim().is_empty() {
+        return Err("имя и команда обязательны".into());
+    }
+    if ApprovalPolicy::BUILTIN
+        .iter()
+        .any(|b| name.eq_ignore_ascii_case(b))
+    {
+        return Err(format!("имя {name} занято встроенным инструментом"));
+    }
+    let parameters: serde_json::Value = if parameters_json.trim().is_empty() {
+        serde_json::json!({ "type": "object", "properties": {} })
+    } else {
+        serde_json::from_str(&parameters_json).map_err(|e| format!("parameters: {e}"))?
+    };
+    if !parameters.is_object() {
+        return Err("parameters должны быть JSON-объектом".into());
+    }
+    let tool = PluginTool {
+        name: name.clone(),
+        description,
+        parameters,
+        command,
+    };
+    let mut plugins = state.plugins.lock().map_err(|e| e.to_string())?;
+    match plugins.iter_mut().find(|p| p.name == name) {
+        Some(slot) => *slot = tool,
+        None => plugins.push(tool),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_plugin_tools(state: State<'_, Arc<AppState>>) -> Result<Vec<PluginTool>, String> {
+    Ok(state.plugins.lock().map_err(|e| e.to_string())?.clone())
+}
+
 /* ── Исполнитель тулзов агента ────────────────────────────────────────────
  * Песочница — cwd сессии: модель не читает и не пишет вне рабочей
  * директории, даже если человек подтвердил вызов. Оболочка достигается
@@ -1322,10 +1401,13 @@ fn arg_str(call: &ToolCall, key: &str) -> String {
 
 /// Выполнить один вызов. Не паникует и не возвращает Err: любой отказ
 /// становится результатом ok=false, и модель видит его как ответ тулза.
+/// `plugins` — зарегистрированные внешние инструменты (B-5): неизвестное
+/// встроенное имя ищется там и исполняется отдельной командой.
 async fn execute_tool(
     call: &ToolCall,
     cwd: &std::path::Path,
     timeout: std::time::Duration,
+    plugins: &[PluginTool],
 ) -> ToolOutcome {
     let fail = |output: String| ToolOutcome { ok: false, output };
     match call.name.as_str() {
@@ -1458,7 +1540,168 @@ async fn execute_tool(
                 }
             }
         }
-        other => fail(format!("неизвестный инструмент: {other}")),
+        /* B-5: grep/glob/patch/fetch_url. Чистая логика живёт в fsx::tools,
+           здесь только песочница cwd и оформление результата. */
+        "grep" => {
+            let pattern = arg_str(call, "pattern");
+            if pattern.is_empty() {
+                return fail("пустой pattern".into());
+            }
+            let sub = arg_str(call, "path");
+            let context = call
+                .arguments
+                .get("context")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as usize;
+            match swagcod_fsx::tools::grep_files(
+                cwd,
+                if sub.is_empty() { None } else { Some(sub.as_str()) },
+                &pattern,
+                context,
+            ) {
+                Ok(hits) if hits.is_empty() => ToolOutcome {
+                    ok: true,
+                    output: "совпадений нет".into(),
+                },
+                Ok(hits) => ToolOutcome {
+                    ok: true,
+                    output: swagcod_fsx::tools::format_hits(&hits),
+                },
+                Err(e) => fail(format!("grep: {e}")),
+            }
+        }
+        "glob" => {
+            let pattern = arg_str(call, "pattern");
+            if pattern.is_empty() {
+                return fail("пустой pattern".into());
+            }
+            let sub = arg_str(call, "path");
+            match swagcod_fsx::tools::glob_files(
+                cwd,
+                if sub.is_empty() { None } else { Some(sub.as_str()) },
+                &pattern,
+            ) {
+                Ok(files) if files.is_empty() => ToolOutcome {
+                    ok: true,
+                    output: "совпадений нет".into(),
+                },
+                Ok(files) => ToolOutcome {
+                    ok: true,
+                    output: files.join("\n"),
+                },
+                Err(e) => fail(format!("glob: {e}")),
+            }
+        }
+        "patch" => {
+            let path = match sandbox_path(cwd, &arg_str(call, "path")) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let old = arg_str(call, "old_string");
+            let new = arg_str(call, "new_string");
+            let replace_all = call
+                .arguments
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => return fail(format!("patch: {e}")),
+            };
+            match swagcod_fsx::tools::patch_text(&content, &old, &new, replace_all) {
+                Ok((patched, n)) => match std::fs::write(&path, patched.as_bytes()) {
+                    Ok(()) => ToolOutcome {
+                        ok: true,
+                        output: format!("замен: {n}"),
+                    },
+                    Err(e) => fail(format!("patch write: {e}")),
+                },
+                Err(e) => fail(format!("patch: {e}")),
+            }
+        }
+        "fetch_url" => {
+            let url = arg_str(call, "url");
+            if url.trim().is_empty() {
+                return fail("пустой url".into());
+            }
+            let fetch_timeout = timeout.min(std::time::Duration::from_secs(30));
+            match swagcod_fsx::tools::fetch_url(&url, fetch_timeout).await {
+                Ok(text) => ToolOutcome { ok: true, output: text },
+                Err(e) => fail(format!("fetch_url: {e}")),
+            }
+        }
+        other => {
+            /* B-5: слой плагинов. Не-встроенное имя ищется в реестре;
+               подтверждение уже пройдено (политика считает неизвестные
+               имена опасными), здесь только исполнение. */
+            match plugins.iter().find(|p| p.name == other) {
+                None => fail(format!("неизвестный инструмент: {other}")),
+                Some(plugin) => run_plugin(plugin, call, cwd, timeout).await,
+            }
+        }
+    }
+}
+
+/// Исполнить внешний инструмент: команда через shell, аргументы JSON-ом
+/// в stdin, cwd — рабочая директория сессии, таймаут как у bash.
+async fn run_plugin(
+    plugin: &PluginTool,
+    call: &ToolCall,
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> ToolOutcome {
+    use tokio::io::AsyncWriteExt;
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    let args = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let mut child = match tokio::process::Command::new(shell)
+        .arg(flag)
+        .arg(&plugin.command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("плагин {}: запуск: {e}", plugin.name)),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // Ошибка записи не фатальна: плагин мог не читать stdin.
+        let _ = stdin.write_all(args.as_bytes()).await;
+    }
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => ToolOutcome {
+            ok: output.status.success(),
+            output: format!(
+                "stdout:\n{}\nstderr:\n{}\nexit: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                output.status.code().unwrap_or(-1)
+            ),
+        },
+        Ok(Err(e)) => fail(format!("плагин {}: {e}", plugin.name)),
+        Err(_) => {
+            if let Some(pid) = pid {
+                if cfg!(windows) {
+                    let _ = tokio::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output()
+                        .await;
+                } else {
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .output()
+                        .await;
+                }
+            }
+            fail(format!(
+                "плагин {} не завершился за {} с и остановлен",
+                plugin.name,
+                timeout.as_secs()
+            ))
+        }
     }
 }
 
@@ -1618,6 +1861,8 @@ pub fn run() {
             stop_watch,
             search_files,
             diff_against_head,
+            register_plugin_tool,
+            list_plugin_tools,
             set_approval_policy,
             bus_seq,
             start_turn,
@@ -1788,6 +2033,7 @@ mod tests {
             &call("read", serde_json::json!({"path": "../outside.txt"})),
             &dir,
             timeout,
+            &[],
         )
         .await;
         assert!(!out.ok, "выход за cwd обязан отклоняться: {out:?}");
@@ -1796,6 +2042,7 @@ mod tests {
             &call("read", serde_json::json!({"path": "inside.txt"})),
             &dir,
             timeout,
+            &[],
         )
         .await;
         assert!(out.ok && out.output == "ok", "относительный путь внутри cwd: {out:?}");
@@ -1804,6 +2051,7 @@ mod tests {
             &call("write", serde_json::json!({"path": "../../evil.txt", "content": "x"})),
             &dir,
             timeout,
+            &[],
         )
         .await;
         assert!(!out.ok, "запись вне cwd обязана отклоняться: {out:?}");
@@ -1817,6 +2065,7 @@ mod tests {
             &call("fly", serde_json::json!({})),
             std::path::Path::new("."),
             std::time::Duration::from_secs(1),
+            &[],
         )
         .await;
         assert!(!out.ok);
@@ -1825,5 +2074,101 @@ mod tests {
             "модель должна понять отказ: {}",
             out.output
         );
+    }
+
+    // ---- B-5: grep/glob/patch через исполнитель ----
+
+    #[tokio::test]
+    async fn execute_tool_grep_glob_patch_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("swagcod-b5-{}", short_id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "needle here\n").unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+
+        let out = execute_tool(
+            &call("grep", serde_json::json!({"pattern": "needle"})),
+            &dir,
+            timeout,
+            &[],
+        )
+        .await;
+        assert!(out.ok && out.output.contains("b.txt:1") || out.output.contains("b.txt"), "{out:?}");
+        assert!(out.output.contains("needle here"), "{out:?}");
+
+        let out = execute_tool(
+            &call("glob", serde_json::json!({"pattern": "*.rs"})),
+            &dir,
+            timeout,
+            &[],
+        )
+        .await;
+        assert!(out.ok && out.output.contains("src/a.rs"), "{out:?}");
+
+        let out = execute_tool(
+            &call(
+                "patch",
+                serde_json::json!({"path": "src/a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"}),
+            ),
+            &dir,
+            timeout,
+            &[],
+        )
+        .await;
+        assert!(out.ok && out.output.contains("замен: 1"), "{out:?}");
+        let patched = std::fs::read_to_string(dir.join("src").join("a.rs")).unwrap();
+        assert!(patched.contains("let x = 2;"));
+
+        // patch вне cwd отклоняется песочницей.
+        let out = execute_tool(
+            &call(
+                "patch",
+                serde_json::json!({"path": "../evil.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            &dir,
+            timeout,
+            &[],
+        )
+        .await;
+        assert!(!out.ok);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_fetch_url_rejects_non_http() {
+        let out = execute_tool(
+            &call("fetch_url", serde_json::json!({"url": "file:///etc/passwd"})),
+            std::path::Path::new("."),
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("http"), "{out:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn plugin_tool_executes_registered_command() {
+        let dir = std::env::temp_dir().join(format!("swagcod-plugin-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plugin = PluginTool {
+            name: "echo_args".into(),
+            description: "test plugin".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            // findstr читает stdin; просто отдадим текст через cmd /C echo.
+            command: "echo plugin-out".into(),
+        };
+        let out = execute_tool(
+            &call("echo_args", serde_json::json!({"a": 1})),
+            &dir,
+            std::time::Duration::from_secs(10),
+            std::slice::from_ref(&plugin),
+        )
+        .await;
+        assert!(out.ok, "{out:?}");
+        assert!(out.output.contains("plugin-out"), "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
