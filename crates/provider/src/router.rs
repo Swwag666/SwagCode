@@ -85,7 +85,33 @@ impl Router {
     /// плюс `SWAGCOD_FALLBACKS` = `url|key|model;url|key` (key и model необязательны,
     /// пустой key разрешён — локальные Ollama/llama.cpp).
     pub fn from_env() -> Result<Self, ProviderError> {
-        let primary = OpenAiProvider::from_env()?;
+        Self::from_env_with_key(None)
+    }
+
+    /// То же, что [`Router::from_env`], но ключ основного эндпоинта можно
+    /// передать извне (B-7: расшифрованный DPAPI-ключ из защищённого хранилища
+    /// приоритетнее голого env). Пустой ключ основного эндпоинта допустим
+    /// только для локальных баз — тогда создается open-провайдер.
+    pub fn from_env_with_key(key_override: Option<String>) -> Result<Self, ProviderError> {
+        let base =
+            std::env::var("SWAGCOD_BASE_URL").unwrap_or_else(|_| "https://rustvy.xyz/v1".into());
+        let env_key = std::env::var("SWAGCOD_API_KEY").unwrap_or_default();
+        let key = key_override
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or(env_key);
+        let primary = if key.trim().is_empty() {
+            let lower = base.to_lowercase();
+            if lower.contains("localhost") || lower.contains("127.0.0.1") {
+                OpenAiProvider::new_open(&base)?
+            } else {
+                // Облако без ключа — ошибка конфигурации (D-009).
+                return Err(ProviderError::Config(
+                    "пустой api_key (D-009: ключ читается из .env или DPAPI-хранилища)".into(),
+                ));
+            }
+        } else {
+            OpenAiProvider::new(&base, &key)?
+        };
         let mut endpoints = vec![RouterEndpoint { provider: primary, model: None }];
         if let Ok(spec) = std::env::var("SWAGCOD_FALLBACKS") {
             for (base, key, model) in parse_fallbacks(&spec) {

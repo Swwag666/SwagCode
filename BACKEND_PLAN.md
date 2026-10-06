@@ -185,7 +185,23 @@ Trait `Provider` (stream, list_models, usage) с реализациями: OpenA
 Стабильность префикса промпта ради prompt-cache провайдера: system prompt не
 пересобирается между ходами без причины.
 
-## Этап B-7. Укрепление безопасности
+## Этап B-7. Укрепление безопасности — ЗАКРЫТ (ревизия 22)
+
+Журнал подтверждений: таблица `approvals` в store (сессия, ход, вызов,
+инструмент, решение, actor user|system, время), запись в момент
+разрешения oneshot-канала; аудит переживает удаление сессии. Per-session
+политика: Session.approval_policy (NULL = глобальная), IPC
+set_session_approval_policy. Ключ провайдера опционально под DPAPI
+(CryptProtectData, UI_FORBIDDEN, hex-blob в prefs api_key_dpapi;
+приоритет env → DPAPI → ошибка для облака). cargo deny в CI: deny.toml
+с allowlist лицензий, sources только crates.io, advisories с тремя
+осознанными ignore (serial из portable-pty; gtk-rs — Linux-only
+транзитивы tauri). Fuzz SSE-парсера: cargo-fuzz харнесс
+fuzz/fuzz_targets/sse_parser.rs (целый кусок, дробление, кадр в шуме) +
+seeded fuzz-lite тест на stable в каждом CI-прогоне. Отклонение:
+полноценный прогон libfuzzer требует DLL из LLVM — на машине без clang
+цель компилируется, но не стартует; stable-тест покрывает CI.
+Подробности: DECISIONS.md D-090…D-094. Текст плана ниже — исторический.
 
 Журнал подтверждений (кто, что, когда одобрил) в store; политики approval
 per-session; ключ провайдера опционально под DPAPI Windows; `cargo deny` в CI

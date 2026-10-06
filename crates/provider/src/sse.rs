@@ -764,4 +764,65 @@ mod tests {
             "после [DONE] ничего не принимаем: {late:?}"
         );
     }
+
+    // ---- B-7: бедняцкий fuzz на stable ----
+
+    /// Псевдослучайные байты из LCG с фиксированным сидом: парсер обязан
+    /// пережить любой мусор и любое дробление на чанки без паники. Сид
+    /// фиксирован — падение воспроизводимо. Настоящий fuzz живёт в
+    /// `fuzz/fuzz_targets/sse_parser.rs` (cargo fuzz, nightly), а этот тест
+    /// гоняет ту же идею на stable в каждом CI-прогоне.
+    #[test]
+    fn random_bytes_never_panic_seeded() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u8 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) as u8
+            }
+        }
+        let mut rng = Lcg(0x005E_EDB7_A5E1);
+        for _ in 0..3000 {
+            let len = (rng.next() as usize % 220) + 1;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.next()).collect();
+
+            // Целым куском.
+            let mut p = SseParser::new();
+            p.feed(&bytes);
+            p.finish();
+
+            // Дроблением: разрывы посреди UTF-8, "data:" и JSON.
+            let mut p2 = SseParser::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                let step = (rng.next() as usize % 9).max(1);
+                let end = (i + step).min(bytes.len());
+                p2.feed(&bytes[i..end]);
+                i = end;
+            }
+            p2.finish();
+        }
+
+        // Валидные кадры вперемешку с мусором: структура кадра выживает.
+        let mut rng2 = Lcg(0xC0FF_EE11);
+        for _ in 0..500 {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n");
+            for _ in 0..(rng2.next() % 24) {
+                bytes.push(rng2.next());
+            }
+            bytes.extend_from_slice(b"\ndata: [DONE]\n\n");
+            let mut p = SseParser::new();
+            let evs = p.feed(&bytes);
+            let _ = p.finish();
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, StreamEvent::Content(t) if t == "ok")),
+                "валидный кадр обязан распознаваться даже рядом с мусором"
+            );
+        }
+    }
 }

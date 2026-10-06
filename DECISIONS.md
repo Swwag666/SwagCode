@@ -2742,3 +2742,59 @@ warnings чистый. Сборка и деплой SwagCod.exe — тем же 
   следующий; все мертвы → одна ошибка. Стабильность промпт-префикса
   (prompt-cache) обеспечена B-3: system пересобирается только при
   изменении сводки/MEMORY.md, секции в фиксированном порядке.
+
+## Ревизия 22: этап B-7 — укрепление безопасности (02:40)
+
+Подтверждения становятся аудируемым фактом, а не мгновенным решением;
+ключ можно не хранить текстом; зависимости проверяет машина, а не глаз.
+
+- D-090: журнал подтверждений — таблица `approvals` в store: session,
+  turn, call_id, tool, summary, decision (approved|denied), actor,
+  decided_ms. Автономная таблица БЕЗ FK на turns/sessions намеренно:
+  аудит обязан переживать удаление сессии из списка (тест
+  approval_journal_survives_session_delete). actor=system означает
+  решение без человека — потеря канала при остановленном ходе по
+  существующей политике трактуется как отказ и теперь видна в журнале.
+  Запись — в момент разрешения oneshot-канала внутри задачи хода: все
+  данные уже в скоупе, отдельный поход через respond_approval
+  потерялся бы при гонке (ход остановлен между кликом и доставкой).
+- D-091: политика подтверждений per-session — Session.approval_policy
+  (Option, wire snake_case), колонка sessions.approval_policy
+  (NULL = наследовать глобальную), IPC set_session_approval_policy
+  (пустая строка или "global" = сброс к глобальной). Override
+  применяется в start_turn до клонирования конфига в задачу хода.
+  Мусорная строка из базы политикой не становится
+  (policy_from_str_opt → None, тест). По умолчанию ничего не меняется:
+  per-session сужает или расширяет политику осознанно.
+- D-092: ключ провайдера опционально под DPAPI (Windows) —
+  CryptProtectData с CRYPTPROTECT_UI_FORBIDDEN (фоновый процесс не
+  может показать диалог; невидимый промпт = зависший ход). В prefs
+  лежит hex-blob под ключом api_key_dpapi, plaintext на диск не
+  попадает. Приоритет: env SWAGCOD_API_KEY → DPAPI-blob → ошибка
+  конфигурации для облачного base (D-009 жив). Router::from_env_with_key
+  принимает расшифрованный ключ извне; env-ключ не переопределяется
+  blob'ом — .env остаётся главным путём для dev. На не-Windows модуль
+  честно отказывает: кроссплатформенный keyring в B-7 не входит.
+  Тесты: hex-кодек чистый на всех платформах, DPAPI roundtrip +
+  порча blob на живой Windows.
+- D-093: cargo deny в CI (deny.toml в корне): licenses allowlist
+  (MIT/Apache-2.0/LLVM-exception/MPL-2.0/BSD/ISC/Zlib/Unlicense/CC0/
+  CDLA-Permissive-2.0/Unicode), sources — только crates.io,
+  advisories с осознанным ignore: RUSTSEC-2017-0008 (serial —
+  транзитив portable-pty 0.8, безопасного апгрейда нет, ConPTY-путь
+  Windows его не использует) и RUSTSEC-2024-0370/2025-0057 (gtk-rs
+  0.18 — транзитивы tauri только для Linux-сборки, которой у нас
+  нет). bans: multiple-versions=warn — дубли syn/windows-sys в
+  большом дереве неизбежны, а красный CI на каждом чихе экосистемы
+  приучил бы игнорировать CI вовсе.
+- D-094: fuzz SSE-парсера — cargo-fuzz харнесс fuzz/fuzz_targets/
+  sse_parser.rs: три прохода (целым куском; дроблением с точками
+  разреза из самих данных — ловит разрывы посреди UTF-8/"data:"/JSON;
+  валидный кадр в шуме с assert на распознавание). Плюс «бедняцкий
+  fuzz» на stable: random_bytes_never_panic_seeded — LCG с
+  фиксированным сидом, 3000 мусорных входов × два режима дробления и
+  500 валидных кадров в мусоре; падение воспроизводимо по сиду,
+  гоняется в каждом CI-прогоне без nightly. Харнесс компилируется и
+  запускается через cargo +nightly fuzz; для исполнения нужен
+  libFuzzer-DLL из LLVM (на машине без clang цель соберётся, но не
+  запустится — STATUS_DLL_NOT_FOUND).

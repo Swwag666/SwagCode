@@ -42,6 +42,12 @@ jobs:
         # Бенчи и проверки производительности имеют смысл только в release.
         run: cargo test --workspace --release
 
+      # B-7: лицензии и известные CVE зависимостей (deny.toml в корне).
+      - name: cargo-deny (advisories, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
+
   frontend:
     name: Frontend · test + check + build
     runs-on: ubuntu-latest

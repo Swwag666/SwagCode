@@ -26,3 +26,8 @@ swagcod-pty.workspace = true
 swagcod-fsx.workspace = true
 dotenvy = "0.15"
 tauri-plugin-dialog = "2.0.0-rc.8"
+
+# B-7: DPAPI (CryptProtectData) — ключ провайдера опционально хранится
+# зашифрованным под учётной записью Windows. Только на Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

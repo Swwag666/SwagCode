@@ -119,6 +119,10 @@ pub struct Session {
     /// драйвер подставляет её в system-промпт каждого запроса свежей.
     #[serde(default)]
     pub summary: String,
+    /// B-7: политика подтверждений этой сессии. None — наследуется от
+    /// глобальной настройки приложения.
+    #[serde(default)]
+    pub approval_policy: Option<crate::turn::ApprovalPolicy>,
     /// Завершённые ходы — журнал.
     pub turns: Vec<TurnRecord>,
     pub created_ms: u64,
@@ -135,6 +139,7 @@ impl Session {
             current_turn: None,
             history: Vec::new(),
             summary: String::new(),
+            approval_policy: None,
             turns: Vec::new(),
             created_ms: crate::bus::now_ms(),
         }

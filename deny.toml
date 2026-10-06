@@ -1,0 +1,53 @@
+# cargo-deny (этап B-7): лицензии и известные CVE зависимостей.
+# Проверка в CI шагом cargo-deny-action; локально: `cargo deny check`.
+
+[graph]
+# fuzz-крейт на libfuzzer — не часть основного workspace, проверяем только его.
+exclude = ["swagcod-fuzz"]
+
+[advisories]
+# yanked-крейты — предупреждение: мгновенный deny ломал бы сборку из-за
+# чужого отзыва версии без пути отката.
+yanked = "warn"
+ignore = [
+    # `serial` не поддерживается, но это транзитив portable-pty 0.8 (D-060:
+    # осознанный выбор PTY-слоя). Безопасного апгрейда нет, портативный
+    # терминал на Windows работает через ConPTY, а не через serial.
+    # Пересмотреть при переходе portable-pty на 0.9+.
+    "RUSTSEC-2017-0008",
+    # gtk-rs 0.18 (glib, gtk): транзитивы tauri только для Linux-сборки.
+    # Мы собираем и ставим Windows-бинарник (WebView2), gtk-код в него не
+    # компилируется вовсе; безопасного апгрейда нет. Пересмотреть при выходе
+    # tauri на gtk-rs 0.20+ или при старте Linux-сборки.
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2025-0057",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Дубли версий в большом дереве зависимостей неизбежны (syn, windows-sys):
+# warn даёт сигнал без красно-зелёных качелей CI на каждом чихе экосистемы.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

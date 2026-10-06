@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+pub mod dpapi;
+
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId};
@@ -705,7 +707,9 @@ async fn start_turn(
     }
 
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
-    let provider = Router::from_env().map_err(|e| format!("провайдер: {e}"))?;
+    // B-7: ключ — сначала .env, затем DPAPI-защищённый blob в store.
+    let provider = Router::from_env_with_key(dpapi_key(&state))
+        .map_err(|e| format!("провайдер: {e}"))?;
 
     let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
@@ -727,7 +731,11 @@ async fn start_turn(
         session.current_turn = Some(turn_id.clone());
         session.status = swagcod_core::session::SessionStatus::Running;
 
-        let cfg = state.config.lock().await.clone();
+        let mut cfg = state.config.lock().await.clone();
+        // B-7: per-session политика подтверждений перекрывает глобальную.
+        if let Some(p) = session.approval_policy {
+            cfg.approval_policy = p;
+        }
         (
             turn_id.to_string(),
             session.history.clone(),
@@ -977,7 +985,27 @@ async fn start_turn(
                     }
                     // Потеря канала (ход остановлен) считаем отказом: молчаливое
                     // «одобрено» было бы дырой в политике подтверждений.
-                    let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
+                    let res = rx.await;
+                    let actor = if res.is_ok() { "user" } else { "system" };
+                    let decision = res.unwrap_or(ApprovalDecision::Denied);
+                    /* B-7: журнал подтверждений — кто, что, когда. actor=system
+                       означает решение без человека (канал потерян). */
+                    if let Ok(store) = app_state.store.lock() {
+                        let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
+                            session_id: sid.clone(),
+                            turn_id: tid.to_string(),
+                            call_id: call_id.clone(),
+                            tool: call.name.clone(),
+                            summary: describe_call(&call),
+                            decision: match decision {
+                                ApprovalDecision::Approved => "approved",
+                                ApprovalDecision::Denied => "denied",
+                            }
+                            .into(),
+                            actor: actor.into(),
+                            decided_ms: swagcod_core::bus::now_ms(),
+                        });
+                    }
                     app_state.approvals.lock().await.remove(&call_id);
                     step = machine.on_approval(decision);
                 }
@@ -1722,6 +1750,96 @@ async fn respond_approval(
         .map_err(|_| "ход уже завершился".to_string())
 }
 
+/* ── B-7: укрепление безопасности ─────────────────────────────────────────
+ * Per-session политика подтверждений, журнал подтверждений из store и
+ * DPAPI-хранилище ключа провайдера (опция: .env продолжает работать). */
+
+/// Ключ провайдера из DPAPI-blob в store. Env имеет приоритет: если
+/// SWAGCOD_API_KEY задан, blob даже не расшифровывается.
+fn dpapi_key(state: &AppState) -> Option<String> {
+    if !std::env::var("SWAGCOD_API_KEY").unwrap_or_default().trim().is_empty() {
+        return None;
+    }
+    let blob = state
+        .store
+        .lock()
+        .ok()?
+        .get_pref("api_key_dpapi")
+        .ok()
+        .flatten()?;
+    if blob.trim().is_empty() {
+        return None;
+    }
+    dpapi::unprotect_hex(&blob).ok()
+}
+
+/// Политика подтверждений конкретной сессии. None/пустая строка — сброс
+/// к глобальной политике приложения.
+#[tauri::command]
+async fn set_session_approval_policy(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    policy: Option<String>,
+) -> Result<(), String> {
+    let parsed: Option<ApprovalPolicy> = match policy.as_deref().map(str::trim) {
+        None | Some("") | Some("global") => None,
+        Some(s) => Some(
+            serde_json::from_value::<ApprovalPolicy>(serde_json::Value::String(s.to_lowercase()))
+                .map_err(|_| format!("неизвестная политика: {s} (always|never|on_dangerous)"))?,
+        ),
+    };
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .iter_mut()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
+        session.approval_policy = parsed;
+    }
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_session_policy(
+            &session_id,
+            parsed.map(|p| match p {
+                ApprovalPolicy::Always => "always",
+                ApprovalPolicy::Never => "never",
+                ApprovalPolicy::OnDangerous => "on_dangerous",
+            }),
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Журнал подтверждений: кто, что, когда одобрил. Свежайшие первыми.
+#[tauri::command]
+fn approval_log(
+    state: State<'_, Arc<AppState>>,
+    session_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<swagcod_core::store::ApprovalEntry>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .approval_log(session_id.as_deref(), limit.unwrap_or(200))
+        .map_err(|e| e.to_string())
+}
+
+/// Положить ключ провайдера под DPAPI: в store уходит только шифроблоб.
+#[tauri::command]
+fn save_protected_key(state: State<'_, Arc<AppState>>, key: String) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("пустой ключ".into());
+    }
+    let blob = dpapi::protect_hex(key.trim())?;
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.set_pref("api_key_dpapi", &blob).map_err(|e| e.to_string())
+}
+
+/// Забыть DPAPI-ключ (env-ключ продолжает работать).
+#[tauri::command]
+fn clear_protected_key(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.set_pref("api_key_dpapi", "").map_err(|e| e.to_string())
+}
+
 /// Чтение файла (для просмотра содержимого и diff).
 #[tauri::command]
 async fn read_file(
@@ -1750,8 +1868,9 @@ async fn read_file(
 
 /// Список моделей провайдера.
 #[tauri::command]
-async fn list_models() -> Result<serde_json::Value, String> {
-    let provider = Router::from_env().map_err(|e| format!("провайдер: {e}"))?;
+async fn list_models(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let provider = Router::from_env_with_key(dpapi_key(&state))
+        .map_err(|e| format!("провайдер: {e}"))?;
     provider
         .list_models()
         .await
@@ -1864,6 +1983,10 @@ pub fn run() {
             register_plugin_tool,
             list_plugin_tools,
             set_approval_policy,
+            set_session_approval_policy,
+            approval_log,
+            save_protected_key,
+            clear_protected_key,
             bus_seq,
             start_turn,
             stop_turn,

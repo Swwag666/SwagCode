@@ -1,0 +1,23 @@
+[package]
+name = "swagcod-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# SSE-парсер без HTTP-транспорта: фаззим только чистую логику разбора байтов.
+swagcod-provider = { path = "../crates/provider", default-features = false }
+
+[[bin]]
+name = "sse_parser"
+path = "fuzz_targets/sse_parser.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz требует отдельного workspace: крейт не входит в основной.
+[workspace]
