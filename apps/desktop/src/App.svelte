@@ -603,8 +603,17 @@
   let folderMenu = $state(false)
   let dotsMenu = $state(false)
   let filesOpen = $state(false)
+  /* Панель Files как в референсе: вкладка «файлы» с деревом плюс вкладки
+     открытых файлов; плюс добавляет файл нативным диалогом. */
+  interface FileTab {
+    id: string
+    name: string
+    path: string
+    text: string
+  }
+  let filesTabs = $state<FileTab[]>([])
+  let filesActive = $state<string>('files')
   let maximized = $state(false)
-  let fileReader = $state<{ name: string; text: string } | null>(null)
   let logNote = $state('')
 
   function readLocal(key: string, def: string): string {
@@ -681,15 +690,46 @@
     }
   }
 
-  /** Файл из панели Files: текст через песочницу ядра (cwd сессии). */
+  /** Файл из дерева панели Files: открывается вкладкой внутри панели,
+      текст читается через песочницу ядра (cwd сессии). */
   async function openFileFromTree(path: string, name: string): Promise<void> {
     if (!currentSession) return
+    const existing = filesTabs.find((tb) => tb.path === path)
+    if (existing) {
+      filesActive = existing.id
+      return
+    }
     try {
       const text = await invoke<string>('read_file', { sessionId: currentSession, path })
-      fileReader = { name, text }
+      const tab: FileTab = { id: `ft-${filesTabs.length + 1}-${name}`, name, path, text }
+      filesTabs = [...filesTabs, tab]
+      filesActive = tab.id
     } catch (e) {
       logNote = String(e)
     }
+  }
+
+  /** Плюс на таб-баре: добавить файл вкладкой через нативный диалог. */
+  async function addFileTab(): Promise<void> {
+    if (!currentSession) return
+    try {
+      const sel = await openDialog({
+        directory: false,
+        multiple: false,
+        defaultPath: filesRoot || undefined,
+      })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return
+      const name = path.split(/[\\/]/).pop() ?? path
+      await openFileFromTree(path, name)
+    } catch (e) {
+      logNote = String(e)
+    }
+  }
+
+  function closeFileTab(id: string): void {
+    filesTabs = filesTabs.filter((tb) => tb.id !== id)
+    if (filesActive === id) filesActive = 'files'
   }
 
   /* Окно без системной рамки: свои кнопки свернуть/развернуть/закрыть. */
@@ -2094,61 +2134,89 @@
            контент уезжает влево, панель выезжает справа. -->
       {#if filesOpen}
         <aside class="files-panel" aria-label={t('filesPanel')}>
-          <div class="files-head">
-            <div class="files-head-row">
-              <Icon name="folder-open" size={13} />
-              <span class="files-cap">{t('filesPanel')}</span>
-              <button
-                class="header-icon-btn"
+          <!-- Таб-бар как в референсе: вкладка дерева с крестиком, вкладки
+               открытых файлов, плюс добавляет файл нативным диалогом. -->
+          <div class="files-tabs" role="tablist" aria-label={t('filesPanel')}>
+            <button
+              class="ftab"
+              class:active={filesActive === 'files'}
+              role="tab"
+              aria-selected={filesActive === 'files'}
+              onclick={() => (filesActive = 'files')}
+            >
+              <Icon name="folder-open" size={12} />
+              <span>{t('filesPanel')}</span>
+              <span
+                class="ftab-x"
+                role="button"
+                tabindex="0"
                 title={t('closeFiles')}
-                aria-label={t('closeFiles')}
-                onclick={() => (filesOpen = false)}
-              ><Icon name="close" size={12} /></button>
-            </div>
-            <span class="files-path" title={filesRoot}>{filesRoot}</span>
+                onclick={(e) => {
+                  e.stopPropagation()
+                  filesOpen = false
+                }}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.stopPropagation()
+                    filesOpen = false
+                  }
+                }}
+              ><Icon name="close" size={10} /></span>
+            </button>
+            {#each filesTabs as tb (tb.id)}
+              <button
+                class="ftab"
+                class:active={filesActive === tb.id}
+                role="tab"
+                aria-selected={filesActive === tb.id}
+                title={tb.path}
+                onclick={() => (filesActive = tb.id)}
+              >
+                <span>{tb.name}</span>
+                <span
+                  class="ftab-x"
+                  role="button"
+                  tabindex="0"
+                  title={t('closeFiles')}
+                  onclick={(e) => {
+                    e.stopPropagation()
+                    closeFileTab(tb.id)
+                  }}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.stopPropagation()
+                      closeFileTab(tb.id)
+                    }
+                  }}
+                ><Icon name="close" size={10} /></span>
+              </button>
+            {/each}
+            <button class="ftab-add" title={t('tabAdd')} aria-label={t('tabAdd')} onclick={() => void addFileTab()}>
+              <Icon name="plus" size={12} />
+            </button>
           </div>
-          {#if currentSession && filesRoot}
-            <FileTree
-              root={filesRoot}
-              sessionId={currentSession}
-              onFileSelect={(p, n) => void openFileFromTree(p, n)}
-            />
+          <div class="files-path" title={filesRoot}>{filesRoot}</div>
+          {#if filesActive === 'files'}
+            {#if currentSession && filesRoot}
+              <FileTree
+                root={filesRoot}
+                sessionId={currentSession}
+                onFileSelect={(p, n) => void openFileFromTree(p, n)}
+              />
+            {:else}
+              <div class="files-empty">{t('noSession')}</div>
+            {/if}
           {:else}
-            <div class="files-empty">{t('noSession')}</div>
+            {@const tab = filesTabs.find((tb) => tb.id === filesActive)}
+            {#if tab}
+              <pre class="file-tab-body">{tab.text}</pre>
+            {/if}
           {/if}
         </aside>
       {/if}
     </div>
   </div>
 </main>
-
-{#if fileReader}
-  <div
-    class="file-overlay"
-    role="dialog"
-    aria-label={fileReader.name}
-    tabindex="-1"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) fileReader = null
-    }}
-    onkeydown={(e) => {
-      if (e.key === 'Escape') fileReader = null
-    }}
-  >
-    <div class="file-card" role="document">
-      <div class="file-card-head">
-        <span class="file-card-name">{fileReader.name}</span>
-        <button
-          class="header-icon-btn"
-          title={t('closeFiles')}
-          aria-label={t('closeFiles')}
-          onclick={() => (fileReader = null)}
-        ><Icon name="close" size={14} /></button>
-      </div>
-      <pre class="file-card-body">{fileReader.text}</pre>
-    </div>
-  </div>
-{/if}
 
 <style>
   main.dsh-layout {
@@ -5747,7 +5815,8 @@
   }
 
   .files-panel {
-    width: 320px;
+    /* Широкая, как в референсе: почти половина окна, но с пределами. */
+    width: clamp(360px, 44%, 720px);
     flex-shrink: 0;
     background: var(--bg-panel);
     border-left: 1px solid var(--border);
@@ -5776,29 +5845,84 @@
     backdrop-filter: blur(14px);
   }
 
-  .files-head {
+  /* Таб-бар панели: чипы вкладок как в референсе. */
+  .files-tabs {
     display: flex;
-    flex-direction: column;
+    align-items: flex-end;
     gap: 4px;
-    padding: 10px 12px 8px;
+    padding: 6px 8px 0;
     border-bottom: 1px solid var(--border);
     background: var(--surface-inset);
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
-  .files-head-row {
+  .ftab {
     display: flex;
     align-items: center;
-    gap: 7px;
-    color: var(--text-dim);
+    gap: 6px;
+    max-width: 180px;
+    padding: 6px 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 7px 7px 0 0;
+    color: var(--text-faint);
+    font-family: var(--mono);
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
   }
 
-  .files-cap {
-    flex: 1;
+  .ftab span:not(.ftab-x) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ftab:hover {
     color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    font-size: 10px;
-    font-family: var(--mono);
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .ftab.active {
+    background: var(--bg-panel);
+    border-color: var(--border);
+    color: var(--accent);
+    box-shadow: 0 -4px 14px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
+  }
+
+  .ftab-x {
+    display: flex;
+    align-items: center;
+    color: var(--text-faint);
+    border-radius: 4px;
+    padding: 1px;
+    transition: all 0.12s;
+  }
+
+  .ftab-x:hover {
+    color: var(--err);
+    background: rgba(var(--err-rgb), 0.12);
+  }
+
+  .ftab-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--text-faint);
+    cursor: pointer;
+    padding: 6px;
+    margin-bottom: 3px;
+    border-radius: 5px;
+    transition: all 0.15s;
+  }
+
+  .ftab-add:hover {
+    color: var(--accent);
+    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .files-path {
@@ -5809,7 +5933,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    padding-left: 20px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
   }
 
   .files-empty {
@@ -5819,46 +5944,12 @@
     font-family: var(--mono);
   }
 
-  .file-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(6px);
-    z-index: 200;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .file-card {
-    width: min(860px, 92vw);
-    max-height: 86vh;
-    display: flex;
-    flex-direction: column;
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    box-shadow: 0 0 40px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .file-card-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .file-card-name {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--accent);
-  }
-
-  .file-card-body {
+  .file-tab-body {
     margin: 0;
     padding: 12px;
     overflow: auto;
+    flex: 1;
+    min-height: 0;
     font-family: var(--mono);
     font-size: 11px;
     line-height: 1.55;
