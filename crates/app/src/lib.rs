@@ -10,12 +10,16 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use swagcod_core::bus::{Bus, Event};
+use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId};
-use swagcod_core::turn::{ApprovalPolicy, TurnConfig};
+use swagcod_core::turn::{
+    builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
+    ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
+};
+use swagcod_provider::types::ToolCall;
 use swagcod_provider::{ChatRequest, Provider, StreamEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 /// Ручка живого хода: нужна кнопке «стоп» в UI.
 pub struct TurnHandle {
@@ -31,6 +35,10 @@ pub struct AppState {
     pub config: Mutex<TurnConfig>,
     /// Живые ходы по turn_id: остановка ставит флаг и абортит задачу стрима.
     pub turns: Mutex<std::collections::HashMap<String, TurnHandle>>,
+    /// Каналы подтверждений по call_id: драйвер хода ждёт receiver,
+    /// команда `respond_approval` стреляет в sender. Решение человека
+    /// приходит в ядро, а не исполняется в UI (DECISIONS.md §2).
+    pub approvals: Mutex<std::collections::HashMap<String, oneshot::Sender<ApprovalDecision>>>,
 }
 
 impl Default for AppState {
@@ -40,6 +48,7 @@ impl Default for AppState {
             sessions: Mutex::new(Vec::new()),
             config: Mutex::new(TurnConfig::default()),
             turns: Mutex::new(std::collections::HashMap::new()),
+            approvals: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -442,10 +451,12 @@ async fn bus_seq(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
     Ok(state.bus.seq())
 }
 
-/// Запустить ход: сообщение пользователя → провайдер → стрим в шину.
+/// Запустить ход: сообщение пользователя → агентский цикл → журнал сессии.
 ///
-/// Это живой стрим с реального эндпоинта (Этап 1). События публикуются
-/// в шину по мере поступления, UI батчит их по кадрам.
+/// Цикл ведёт [`TurnMachine`] из swagcod-core: эта задача лишь выполняет
+/// шаги, которые машина просит (стрим модели, подтверждение человеком,
+/// тулз), и публикует всё в шину. Поэтому лимит итераций и approval
+/// невозможно обойти из UI: решений в фронтенде нет.
 #[tauri::command]
 async fn start_turn(
     state: State<'_, Arc<AppState>>,
@@ -460,11 +471,9 @@ async fn start_turn(
     }
 
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
-    // Если ключ не задан — сессия остаётся Idle, пользователь видит ошибку.
     let provider = Provider::from_env().map_err(|e| format!("провайдер: {e}"))?;
 
-    // Находим сессию
-    let (turn_id, history, session_model) = {
+    let (turn_id, history, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .iter_mut()
@@ -480,28 +489,26 @@ async fn start_turn(
             return Err("не удалось начать ход".into());
         }
 
-        // Устанавливаем текущий ход и статус
         let turn_id = swagcod_core::TurnId::new(format!("t-{}", short_id()));
         session.current_turn = Some(turn_id.clone());
         session.status = swagcod_core::session::SessionStatus::Running;
 
-        // История уже в wire-формате провайдера
-        let history = session.history.clone();
-        let session_model = session.model.clone();
-        let turn_id = turn_id.to_string();
-        (turn_id, history, session_model)
+        let cfg = state.config.lock().await.clone();
+        (
+            turn_id.to_string(),
+            session.history.clone(),
+            session.model.clone(),
+            session.cwd.clone(),
+            cfg,
+        )
     };
 
-    // W-6 фикс: используем переданную модель если есть, иначе из сессии
+    // W-6 фикс: используем переданную модель если есть, иначе из сессии.
     let effective_model = model.unwrap_or(session_model);
-    let request = ChatRequest {
-        model: effective_model,
-        messages: history,
-        stream: true,
-        temperature: temperature.map(|t| t as f32),
-        max_tokens: None,
-        tools: Vec::new(),
-    };
+    // Тулзы уходят в каждом запросе: без определений модель не может их вызвать.
+    let tool_wire: Vec<serde_json::Value> =
+        ChatRequest::new(&effective_model, Vec::new()).with_tools(&builtin_tool_specs()).tools;
+    let temperature = temperature.map(|t| t as f32);
 
     let bus = state.bus.clone();
     let turn = turn_id.clone();
@@ -509,154 +516,185 @@ async fn start_turn(
     let app_state = state.inner().clone();
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancelled_in_task = cancelled.clone();
-    let started_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
 
-    // Запускаем стрим в фоне
     let task = tauri::async_runtime::spawn(async move {
-        // C2-фикс: накапливаем ответ модели для сохранения в историю
-        let mut content_buf = String::new();
-        let mut reasoning_buf = String::new();
-        let mut turn_ok = false;
-        let mut stopped = false;
+        let tid = swagcod_core::TurnId::new(&turn);
+        let cwd = std::path::PathBuf::from(&cwd);
+        let tool_timeout = cfg.tool_timeout;
+        let (mut machine, mut step) = TurnMachine::new(cfg, history);
+        let mut fail_reason: Option<String> = None;
 
-        match provider.stream(request) {
-            Ok((mut rx, handle)) => {
-                while let Some(event) = rx.recv().await {
-                    // Кнопка «стоп» в UI: выходим из цикла и гасим HTTP-задачу.
-                    if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
-                        stopped = true;
-                        handle.abort();
-                        break;
-                    }
-                    let kind = match &event {
-                        StreamEvent::Reasoning(text) => {
-                            reasoning_buf.push_str(text);
-                            swagcod_core::bus::EventKind::Reasoning {
-                                turn: swagcod_core::TurnId::new(&turn),
-                                text: text.clone(),
-                            }
-                        }
-                        StreamEvent::Content(text) => {
-                            content_buf.push_str(text);
-                            swagcod_core::bus::EventKind::Content {
-                                turn: swagcod_core::TurnId::new(&turn),
-                                text: text.clone(),
-                            }
-                        }
-                        StreamEvent::ToolCallStart { index, id, name } => {
-                            swagcod_core::bus::EventKind::ToolCall {
-                                turn: swagcod_core::TurnId::new(&turn),
-                                call_id: id.clone(),
-                                name: name.clone(),
-                                arguments: serde_json::json!({ "index": index }),
-                            }
-                        }
-                        StreamEvent::ToolCallComplete(tc) => {
-                            swagcod_core::bus::EventKind::ToolCall {
-                                turn: swagcod_core::TurnId::new(&turn),
-                                call_id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                arguments: serde_json::Value::Object(tc.arguments.clone()),
-                            }
-                        }
-                        StreamEvent::Done { finish } => {
-                            turn_ok = true;
-                            swagcod_core::bus::EventKind::TurnEnded {
-                                turn: swagcod_core::TurnId::new(&turn),
-                                session: swagcod_core::SessionId::new(&sid),
-                                ok: true,
-                                reason: Some(format!("{finish:?}")),
-                            }
-                        }
-                        StreamEvent::Error(msg) => swagcod_core::bus::EventKind::TurnEnded {
-                            turn: swagcod_core::TurnId::new(&turn),
-                            session: swagcod_core::SessionId::new(&sid),
-                            ok: false,
-                            reason: Some(msg.clone()),
-                        },
+        let outcome = loop {
+            if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
+                step = machine.cancel();
+            }
+            match step {
+                TurnStep::RequestModel { history } => {
+                    let request = ChatRequest {
+                        model: effective_model.clone(),
+                        messages: history,
+                        stream: true,
+                        temperature,
+                        max_tokens: None,
+                        tools: tool_wire.clone(),
                     };
-                    bus.publish(kind);
+                    let (mut rx, handle) = match provider.stream(request) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            fail_reason = Some(format!("ошибка стрима: {e}"));
+                            bus.publish(EventKind::Error {
+                                turn: Some(tid.clone()),
+                                message: format!("ошибка стрима: {e}"),
+                            });
+                            step = TurnStep::Finish {
+                                outcome: TurnOutcome::Failed,
+                            };
+                            continue;
+                        }
+                    };
+                    let mut acc = swagcod_core::turn::StreamAccumulator::default();
+                    let mut stopped = false;
+                    let mut stream_error: Option<String> = None;
+                    while let Some(event) = rx.recv().await {
+                        if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
+                            stopped = true;
+                            handle.abort();
+                            break;
+                        }
+                        match &event {
+                            StreamEvent::Reasoning(text) => {
+                                acc.reasoning.push_str(text);
+                                bus.publish(EventKind::Reasoning {
+                                    turn: tid.clone(),
+                                    text: text.clone(),
+                                });
+                            }
+                            StreamEvent::Content(text) => {
+                                acc.content.push_str(text);
+                                bus.publish(EventKind::Content {
+                                    turn: tid.clone(),
+                                    text: text.clone(),
+                                });
+                            }
+                            StreamEvent::ToolCallStart { id, name, .. } => {
+                                bus.publish(EventKind::ToolCallStart {
+                                    turn: tid.clone(),
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                });
+                            }
+                            StreamEvent::ToolCallComplete(tc) => {
+                                acc.tool_calls.push(tc.clone());
+                                bus.publish(EventKind::ToolCall {
+                                    turn: tid.clone(),
+                                    call_id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: serde_json::Value::Object(tc.arguments.clone()),
+                                });
+                            }
+                            StreamEvent::Done { .. } => {}
+                            StreamEvent::Error(msg) => stream_error = Some(msg.clone()),
+                        }
+                    }
+                    if stopped {
+                        step = machine.cancel();
+                    } else if let Some(msg) = stream_error {
+                        fail_reason = Some(msg.clone());
+                        bus.publish(EventKind::Error {
+                            turn: Some(tid.clone()),
+                            message: msg,
+                        });
+                        step = TurnStep::Finish {
+                            outcome: TurnOutcome::Failed,
+                        };
+                    } else {
+                        step = machine.on_stream(acc);
+                    }
                 }
+                TurnStep::AwaitApproval { call } => {
+                    let call_id = call.id.clone();
+                    bus.publish(EventKind::ApprovalRequired {
+                        turn: tid.clone(),
+                        call_id: call_id.clone(),
+                        tool: call.name.clone(),
+                        summary: describe_call(&call),
+                    });
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let mut approvals = app_state.approvals.lock().await;
+                        // Каналы завершившихся ходов выметаем, чтобы карта не росла.
+                        approvals.retain(|_, sender| !sender.is_closed());
+                        approvals.insert(call_id.clone(), tx);
+                    }
+                    // Потеря канала (ход остановлен) считаем отказом: молчаливое
+                    // «одобрено» было бы дырой в политике подтверждений.
+                    let decision = rx.await.unwrap_or(ApprovalDecision::Denied);
+                    app_state.approvals.lock().await.remove(&call_id);
+                    step = machine.on_approval(decision);
+                }
+                TurnStep::ExecuteTool { call } => {
+                    let started = std::time::Instant::now();
+                    let tool_outcome = execute_tool(&call, &cwd, tool_timeout).await;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    bus.publish(EventKind::ToolResult {
+                        turn: tid.clone(),
+                        call_id: call.id.clone(),
+                        ok: tool_outcome.ok,
+                        output: truncate_output(&tool_outcome.output),
+                        elapsed_ms,
+                    });
+                    step = machine.on_tool_result(tool_outcome);
+                }
+                TurnStep::Finish { outcome: o } => break o,
             }
-            Err(e) => {
-                bus.publish(swagcod_core::bus::EventKind::TurnEnded {
-                    turn: swagcod_core::TurnId::new(&turn),
-                    session: swagcod_core::SessionId::new(&sid),
-                    ok: false,
-                    reason: Some(format!("ошибка стрима: {e}")),
-                });
-            }
-        }
+        };
 
-        // Остановка пользователем — это отдельный исход хода, не ошибка сети.
-        if stopped {
-            bus.publish(swagcod_core::bus::EventKind::TurnEnded {
-                turn: swagcod_core::TurnId::new(&turn),
-                session: swagcod_core::SessionId::new(&sid),
-                ok: false,
-                reason: Some("остановлено пользователем".to_string()),
-            });
-        }
+        // TurnEnded публикуется ровно один раз и только из исхода цикла:
+        // UI закрывает строки хода по нему и не дедуплирует несколько финалов.
+        let reason = match outcome {
+            TurnOutcome::Completed => None,
+            TurnOutcome::IterationLimit => Some("превышен лимит итераций".to_string()),
+            TurnOutcome::Cancelled => Some(
+                fail_reason
+                    .clone()
+                    .unwrap_or_else(|| "остановлено пользователем".to_string()),
+            ),
+            TurnOutcome::Failed => Some(
+                fail_reason
+                    .clone()
+                    .unwrap_or_else(|| "ошибка хода".to_string()),
+            ),
+        };
+        bus.publish(EventKind::TurnEnded {
+            turn: tid.clone(),
+            session: swagcod_core::SessionId::new(&sid),
+            ok: outcome == TurnOutcome::Completed,
+            reason,
+        });
 
-        // C2-фикс: сохраняем ответ модели в историю сессии
-        if (turn_ok || stopped) && !content_buf.is_empty() {
-            let mut sessions = app_state.sessions.lock().await;
-            if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
-                let msg = swagcod_provider::ChatMessage {
-                    role: swagcod_provider::Role::Assistant,
-                    content: content_buf.clone(),
-                    reasoning: reasoning_buf.clone(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                };
-                session.push_assistant_message(msg);
-            }
-        }
-
-        // Журнал хода: список сессий показывает счётчик ходов и исход
-        // последнего («успех/промах») именно из этого вектора.
-        let ended_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ended_ms = swagcod_core::bus::now_ms();
+        let report = machine.report(outcome, ended_ms);
+        let calls: Vec<ToolCall> = machine
+            .history()
+            .iter()
+            .flat_map(|m| m.tool_calls.clone())
+            .collect();
+        let record = report.into_record(tid.clone(), calls, 0, 0);
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
-                session.turns.push(swagcod_core::session::TurnRecord {
-                    id: swagcod_core::TurnId::new(&turn),
-                    started_ms,
-                    ended_ms: Some(ended_ms),
-                    content: content_buf.clone(),
-                    reasoning: reasoning_buf.clone(),
-                    tool_calls: Vec::new(),
-                    est_input_tokens: 0,
-                    est_output_tokens: 0,
-                    ok: turn_ok,
-                    failure: if stopped {
-                        Some("остановлено пользователем".to_string())
-                    } else if turn_ok {
-                        None
-                    } else {
-                        Some("ход не завершился успешно".to_string())
-                    },
-                });
+                // История сессии — это история машины: assistant с tool_calls
+                // всегда закрыт ответами tool, следующий запрос валиден.
+                session.history = machine.history().to_vec();
+                session.turns.push(record);
+                session.status = match outcome {
+                    TurnOutcome::Cancelled => swagcod_core::session::SessionStatus::Cancelled,
+                    TurnOutcome::Failed => swagcod_core::session::SessionStatus::Failed,
+                    _ => swagcod_core::session::SessionStatus::Idle,
+                };
+                session.current_turn = None;
             }
         }
-
-        // Сбрасываем статус сессии после завершения
-        let mut sessions = app_state.sessions.lock().await;
-        if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
-            session.status = if stopped {
-                swagcod_core::session::SessionStatus::Cancelled
-            } else {
-                swagcod_core::session::SessionStatus::Idle
-            };
-            session.current_turn = None;
-        }
-        drop(sessions);
 
         // Ход закончился — убираем ручку, чтобы «стоп» не бил по прошлому.
         let mut turns = app_state.turns.lock().await;
@@ -711,18 +749,36 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
+/// cwd сессии — корень песочницы файловых команд.
+///
+/// Хардкода пути разработки здесь больше нет: сессия может быть открыта в
+/// любом каталоге, и граница песочницы ездит вместе с ней.
+async fn session_cwd(
+    state: &State<'_, Arc<AppState>>,
+    session_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let sessions = state.sessions.lock().await;
+    sessions
+        .iter()
+        .find(|s| s.id.to_string() == session_id)
+        .map(|s| std::path::PathBuf::from(&s.cwd))
+        .ok_or_else(|| format!("сессия не найдена: {session_id}"))
+}
+
 #[tauri::command]
-async fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
+async fn list_dir(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<FileEntry>, String> {
     // C4-фикс: песочница — только внутри cwd сессии
+    let root = session_cwd(&state, &session_id).await?;
     let dir = std::path::Path::new(&path);
     if !dir.is_dir() {
         return Err(format!("не директория: {path}"));
     }
-
-    // Проверяем что путь внутри разрешённой зоны (D:\SwagCod)
-    let root = std::path::Path::new("D:\\SwagCod");
-    if !swagcod_fsx::is_within(root, dir) {
-        return Err("доступ запрещён: путь вне рабочей директории".into());
+    if !swagcod_fsx::is_within(&root, dir) {
+        return Err("доступ запрещён: путь вне рабочей директории сессии".into());
     }
 
     let mut entries: Vec<FileEntry> = Vec::new();
@@ -755,49 +811,185 @@ async fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
     Ok(entries)
 }
 
-/// Запуск команды в рабочей директории (для терминала UI).
-#[derive(Debug, Clone, Serialize)]
-pub struct CommandResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub code: i32,
+/* ── Исполнитель тулзов агента ────────────────────────────────────────────
+ * Песочница — cwd сессии: модель не читает и не пишет вне рабочей
+ * директории, даже если человек подтвердил вызов. Оболочка достигается
+ * только тулзом `bash`, который при on_dangerous всегда уходит на
+ * подтверждение (имя в списке ApprovalPolicy::DANGEROUS).
+ * Команды `run_command` в IPC больше нет: шелл из WebView был дырой,
+ * а агентскому циклу хватает этого исполнителя. */
+
+/// Резолвить путь внутри cwd сессии; всё снаружи отклоняется.
+fn sandbox_path(cwd: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(raw);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    if !swagcod_fsx::is_within(cwd, &abs) {
+        return Err(format!("путь вне рабочей директории сессии: {raw}"));
+    }
+    Ok(abs)
 }
 
-#[tauri::command]
-async fn run_command(command: String, cwd: String) -> Result<CommandResult, String> {
-    let command = command.trim().to_string();
-    if command.is_empty() {
-        return Err("пустая команда".into());
+fn arg_str(call: &ToolCall, key: &str) -> String {
+    call.arguments
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Выполнить один вызов. Не паникует и не возвращает Err: любой отказ
+/// становится результатом ok=false, и модель видит его как ответ тулза.
+async fn execute_tool(
+    call: &ToolCall,
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> ToolOutcome {
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    match call.name.as_str() {
+        "read" => {
+            let path = match sandbox_path(cwd, &arg_str(call, "path")) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => return fail(format!("read: {e}")),
+            };
+            if meta.len() > 1_048_576 {
+                return fail("файл больше 1 МБ, читайте частями".into());
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(s) => ToolOutcome { ok: true, output: s },
+                Err(e) => fail(format!("read: {e}")),
+            }
+        }
+        "list" => {
+            let path = match sandbox_path(cwd, &arg_str(call, "path")) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let rd = match std::fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) => return fail(format!("list: {e}")),
+            };
+            let mut lines: Vec<String> = Vec::new();
+            for entry in rd.flatten() {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                lines.push(format!(
+                    "{}{}",
+                    if is_dir { "d " } else { "  " },
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+            lines.sort();
+            ToolOutcome {
+                ok: true,
+                output: lines.join("\n"),
+            }
+        }
+        "write" => {
+            let path = match sandbox_path(cwd, &arg_str(call, "path")) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let content = arg_str(call, "content");
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return fail(format!("mkdir: {e}"));
+                }
+            }
+            match std::fs::write(&path, content.as_bytes()) {
+                Ok(()) => ToolOutcome {
+                    ok: true,
+                    output: format!("записано {} байт", content.len()),
+                },
+                Err(e) => fail(format!("write: {e}")),
+            }
+        }
+        "bash" => {
+            let command = arg_str(call, "command");
+            if command.trim().is_empty() {
+                return fail("пустая команда".into());
+            }
+            let child = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg(&command)
+                .current_dir(cwd)
+                .spawn();
+            let child = match child {
+                Ok(c) => c,
+                Err(e) => return fail(format!("запуск: {e}")),
+            };
+            // Таймаут обязателен: зависшая команда не должна вешать ход.
+            // wait_with_output уносит child в future, поэтому pid берём заранее
+            // и по таймауту убиваем дерево процессов через taskkill /T.
+            let pid = child.id();
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                Ok(Ok(output)) => ToolOutcome {
+                    ok: output.status.success(),
+                    output: format!(
+                        "stdout:\n{}\nstderr:\n{}\nexit: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                        output.status.code().unwrap_or(-1)
+                    ),
+                },
+                Ok(Err(e)) => fail(format!("запуск: {e}")),
+                Err(_) => {
+                    if let Some(pid) = pid {
+                        let _ = tokio::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/T", "/F"])
+                            .output()
+                            .await;
+                    }
+                    fail(format!(
+                        "команда не завершилась за {} с и остановлена",
+                        timeout.as_secs()
+                    ))
+                }
+            }
+        }
+        other => fail(format!("неизвестный инструмент: {other}")),
     }
+}
 
-    // Безопасность: запускаем через cmd /c на Windows
-    let output = tokio::process::Command::new("cmd")
-        .arg("/C")
-        .arg(&command)
-        .current_dir(&cwd)
-        .output()
+/// Решение человека по вызову: диалог подтверждения в UI стреляет этой командой.
+#[tauri::command]
+async fn respond_approval(
+    state: State<'_, Arc<AppState>>,
+    call_id: String,
+    decision: ApprovalDecision,
+) -> Result<(), String> {
+    let tx = state
+        .approvals
+        .lock()
         .await
-        .map_err(|e| format!("запуск: {e}"))?;
-
-    Ok(CommandResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        code: output.status.code().unwrap_or(-1),
-    })
+        .remove(&call_id)
+        .ok_or_else(|| format!("нет ожидающего подтверждения: {call_id}"))?;
+    tx.send(decision)
+        .map_err(|_| "ход уже завершился".to_string())
 }
 
 /// Чтение файла (для просмотра содержимого и diff).
 #[tauri::command]
-async fn read_file(path: String) -> Result<String, String> {
+async fn read_file(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let root = session_cwd(&state, &session_id).await?;
     let path = std::path::Path::new(&path);
     if !path.is_file() {
         return Err(format!("не файл: {path:?}"));
     }
 
     // C4-фикс: песочница
-    let root = std::path::Path::new("D:\\SwagCod");
-    if !swagcod_fsx::is_within(root, path) {
-        return Err("доступ запрещён: путь вне рабочей директории".into());
+    if !swagcod_fsx::is_within(&root, path) {
+        return Err("доступ запрещён: путь вне рабочей директории сессии".into());
     }
 
     // Ограничение: не читаем файлы больше 1 МБ
@@ -820,11 +1012,15 @@ async fn list_models() -> Result<serde_json::Value, String> {
 
 /// Открыть файл в проводнике (безопасно: путь отдельным аргументом).
 #[tauri::command]
-async fn open_in_explorer(path: String) -> Result<(), String> {
+async fn open_in_explorer(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
     // C-1 фикс: песочница + путь как аргумент, не склейка
+    let root = session_cwd(&state, &session_id).await?;
     let p = std::path::Path::new(&path);
-    let root = std::path::Path::new("D:\\SwagCod");
-    if !swagcod_fsx::is_within(root, p) {
+    if !swagcod_fsx::is_within(&root, p) {
         return Err("доступ запрещён".into());
     }
     tokio::process::Command::new("explorer")
@@ -889,8 +1085,8 @@ pub fn run() {
             bus_seq,
             start_turn,
             stop_turn,
+            respond_approval,
             list_dir,
-            run_command,
             read_file,
             list_models,
             open_in_explorer
@@ -1013,6 +1209,66 @@ mod tests {
         assert_eq!(
             st.config.lock().await.approval_policy,
             ApprovalPolicy::OnDangerous
+        );
+    }
+
+    // ---- исполнитель тулзов: песочница по cwd сессии ----
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args.as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_rejects_paths_outside_session_cwd() {
+        let dir = std::env::temp_dir().join(format!("swagcod-sandbox-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inside.txt"), "ok").unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+
+        let out = execute_tool(
+            &call("read", serde_json::json!({"path": "../outside.txt"})),
+            &dir,
+            timeout,
+        )
+        .await;
+        assert!(!out.ok, "выход за cwd обязан отклоняться: {out:?}");
+
+        let out = execute_tool(
+            &call("read", serde_json::json!({"path": "inside.txt"})),
+            &dir,
+            timeout,
+        )
+        .await;
+        assert!(out.ok && out.output == "ok", "относительный путь внутри cwd: {out:?}");
+
+        let out = execute_tool(
+            &call("write", serde_json::json!({"path": "../../evil.txt", "content": "x"})),
+            &dir,
+            timeout,
+        )
+        .await;
+        assert!(!out.ok, "запись вне cwd обязана отклоняться: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_unknown_tool_is_a_result_not_a_panic() {
+        let out = execute_tool(
+            &call("fly", serde_json::json!({})),
+            std::path::Path::new("."),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(
+            out.output.contains("неизвестный инструмент"),
+            "модель должна понять отказ: {}",
+            out.output
         );
     }
 }
