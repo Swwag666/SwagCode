@@ -811,17 +811,13 @@
   }
 
   /* cwd новых сессий: папка текущей сессии (пользователь жмёт «+», сидя
-     в проекте — получает вторую сессию там же), затем последняя область
-     из localStorage. Пустая строка — ядро подставит домашний каталог
-     активного пользователя Windows. Хардкода пути автора нет. */
+     в проекте — получает вторую сессию там же). Сессии нет — пустая
+     строка, и ядро подставляет домашний каталог активного пользователя
+     Windows (C:\Users\<юзер>): «пустой плюс» всегда означает дом, а не
+     забытую в localStorage папку позавчерашней сессии. */
   function preferredCwd(): string {
     const cur = currentSession ? sessionCwds[currentSession] : undefined
-    if (cur) return cur
-    try {
-      return localStorage.getItem('swagcod-cwd') ?? ''
-    } catch {
-      return ''
-    }
+    return cur ?? ''
   }
 
   function rememberCwd(cwd: string): void {

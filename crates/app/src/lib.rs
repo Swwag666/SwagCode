@@ -527,6 +527,13 @@ async fn start_turn(
         let tid = swagcod_core::TurnId::new(&turn);
         let cwd = std::path::PathBuf::from(&cwd);
         let tool_timeout = cfg.tool_timeout;
+        /* TurnStarted обязан уходить в шину ПЕРВЫМ: фронт строит по нему
+           карту turn→session, и без неё стрим либо терялся, либо (раньше)
+           сваливался в активный чат — отсюда росли «слияния» чатов. */
+        bus.publish(EventKind::TurnStarted {
+            turn: tid.clone(),
+            session: swagcod_core::SessionId::new(&sid),
+        });
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
         let mut fail_reason: Option<String> = None;
 
