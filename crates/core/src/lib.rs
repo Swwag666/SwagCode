@@ -12,6 +12,7 @@
 */
 
 pub mod bus;
+pub mod context;
 pub mod session;
 pub mod store;
 pub mod turn;

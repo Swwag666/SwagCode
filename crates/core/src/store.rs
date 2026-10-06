@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   cwd TEXT NOT NULL,
   model TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
   created_ms INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS turns(
@@ -80,6 +81,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 pub trait Store {
     fn create_session(&self, s: &Session) -> StoreResult<()>;
     fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()>;
+    /// B-3: свёртка старых ходов живёт рядом с сессией.
+    fn set_session_summary(&self, id: &str, summary: &str) -> StoreResult<()>;
     fn delete_session(&self, id: &str) -> StoreResult<()>;
     /// Все сессии с историей и ходами, в порядке создания.
     fn load_all(&self) -> StoreResult<Vec<Session>>;
@@ -105,6 +108,12 @@ impl SqliteStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Миграция B-3: колонка свёртки для баз, созданных до ревизии 18.
+        // «duplicate column» — нормальный повторный запуск, игнорируем.
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(Self { conn })
     }
 
@@ -155,6 +164,14 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn set_session_summary(&self, id: &str, summary: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE sessions SET summary = ?2 WHERE id = ?1",
+            params![id, summary],
+        )?;
+        Ok(())
+    }
+
     fn delete_session(&self, id: &str) -> StoreResult<()> {
         // Каскад удаляет ходы и сообщения следом за сессией.
         self.conn
@@ -164,23 +181,25 @@ impl Store for SqliteStore {
 
     fn load_all(&self) -> StoreResult<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, created_ms FROM sessions ORDER BY created_ms, id",
+            "SELECT id, cwd, model, title, summary, created_ms FROM sessions ORDER BY created_ms, id",
         )?;
-        let ids: Vec<(String, String, String, String, u64)> = stmt
+        let ids: Vec<(String, String, String, String, String, u64)> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
                     r.get(2)?,
                     r.get(3)?,
-                    r.get::<_, i64>(4)? as u64,
+                    r.get(4)?,
+                    r.get::<_, i64>(5)? as u64,
                 ))
             })?
             .collect::<Result<_, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
-        for (id, cwd, model, title, created_ms) in ids {
+        for (id, cwd, model, title, summary, created_ms) in ids {
             let mut ses = Session::new(SessionId::new(&id), cwd, model);
             ses.title = title;
+            ses.summary = summary;
             ses.created_ms = created_ms;
             ses.status = SessionStatus::Idle;
             fill_session(&self.conn, &mut ses)?;
@@ -191,24 +210,26 @@ impl Store for SqliteStore {
 
     fn load_session(&self, id: &str) -> StoreResult<Option<Session>> {
         let row = self.conn.query_row(
-            "SELECT cwd, model, title, created_ms FROM sessions WHERE id = ?1",
+            "SELECT cwd, model, title, summary, created_ms FROM sessions WHERE id = ?1",
             params![id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)? as u64,
                 ))
             },
         );
-        let (cwd, model, title, created_ms) = match row {
+        let (cwd, model, title, summary, created_ms) = match row {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         let mut ses = Session::new(SessionId::new(id), cwd, model);
         ses.title = title;
+        ses.summary = summary;
         ses.created_ms = created_ms;
         ses.status = SessionStatus::Idle;
         fill_session(&self.conn, &mut ses)?;

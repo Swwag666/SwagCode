@@ -471,6 +471,15 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["command"]
             }),
         },
+        ToolSpec {
+            name: "memory_append".into(),
+            description: "Append a durable note to the project memory file .swagcod/MEMORY.md inside the session working directory. Use it for facts that must survive context compaction: project conventions, decided approaches, important file locations.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string", "description": "Note text, markdown" } },
+                "required": ["text"]
+            }),
+        },
     ]
 }
 

@@ -32,6 +32,13 @@ pub enum StreamEvent {
     Done { finish: FinishReason },
     /// Провайдер сообщил об ошибке внутри HTTP 200-ответа.
     Error(String),
+    /// B-3: провайдер отдал точный счёт токенов (`usage` в чанке).
+    /// Наш живой эндпоинт шлёт `usage: null` — тогда события просто нет,
+    /// и ядро считает токены калиброванной оценкой.
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +71,18 @@ struct Chunk {
     choices: Vec<Choice>,
     #[serde(default)]
     error: Option<ErrorBody>,
+    #[serde(default)]
+    usage: Option<UsageBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageBody {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +132,21 @@ struct FnDelta {
 struct ErrorBody {
     #[serde(default)]
     message: Option<String>,
+}
+
+/// Превратить wire-usage в событие. Нули и null событием не становятся:
+/// вызывающий отличает «нет данных» от «ноль токенов».
+fn usage_events(u: Option<&UsageBody>) -> Vec<StreamEvent> {
+    let Some(u) = u else { return Vec::new() };
+    let input = u.prompt_tokens.unwrap_or(0);
+    let output = u.completion_tokens.unwrap_or(u.total_tokens.unwrap_or(0));
+    if input == 0 && output == 0 {
+        return Vec::new();
+    }
+    vec![StreamEvent::Usage {
+        input_tokens: input.min(u32::MAX as u64) as u32,
+        output_tokens: output.min(u32::MAX as u64) as u32,
+    }]
 }
 
 /// Черновик вызова инструмента, пока аргументы доходят кусками.
@@ -201,11 +235,23 @@ impl SseParser {
     }
 
     fn handle_line(&mut self, line: &str) -> Vec<StreamEvent> {
-        // Поток завершён: ничего после [DONE] не принимаем. Без этой проверки
-        // поздние кадры (дубли, мусор от прокси) породили бы призрачные
-        // события и второй ответ в уже закрытом ходе.
+        // Поток завершён: контент после [DONE]/finish не принимаем — без этой
+        // проверки поздние кадры (дубли, мусор от прокси) породили бы призрачные
+        // события и второй ответ в уже закрытом ходе. Исключение — счёт токенов:
+        // провайдеры с include_usage шлют usage последним кадром, и терять
+        // точные числа из-за порядка кадров обидно (B-3).
         if self.finished {
-            return Vec::new();
+            let data = match line.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => return Vec::new(),
+            };
+            if data.is_empty() || data == "[DONE]" {
+                return Vec::new();
+            }
+            return match serde_json::from_str::<Chunk>(data) {
+                Ok(chunk) => usage_events(chunk.usage.as_ref()),
+                Err(_) => Vec::new(),
+            };
         }
         // SSE-комментарии и пустые строки-разделители — не данные.
         let data = match line.strip_prefix("data:") {
@@ -247,6 +293,9 @@ impl SseParser {
                 self.finished = true;
             }
         }
+        // B-3: точный счёт токенов, если провайдер его прислал. Нули и null
+        // событием не становятся: вызывающий отличает «нет данных» от «ноль».
+        out.extend(usage_events(chunk.usage.as_ref()));
         out
     }
 
@@ -657,6 +706,32 @@ mod tests {
             "data: [DONE]\n\n",
         ]);
         assert_eq!(texts(&evs, false), vec!["a"]);
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Usage { .. })));
+    }
+
+    #[test]
+    fn real_usage_becomes_event() {
+        // B-3: провайдер, который честно шлёт usage, даёт ядру точный счёт.
+        let evs = parse_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":34,\"total_tokens\":154}}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert!(evs.contains(&StreamEvent::Usage {
+            input_tokens: 120,
+            output_tokens: 34,
+        }));
+    }
+
+    #[test]
+    fn total_tokens_used_when_completion_missing() {
+        let evs = parse_chunks(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"total_tokens\":17}}\n\n",
+        ]);
+        assert!(evs.contains(&StreamEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 17,
+        }));
     }
 
     #[test]

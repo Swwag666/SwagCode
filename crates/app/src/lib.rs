@@ -17,7 +17,7 @@ use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
 };
-use swagcod_provider::types::ToolCall;
+use swagcod_provider::types::{ChatMessage, ToolCall};
 use swagcod_provider::{ChatRequest, Provider, StreamEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
@@ -676,7 +676,7 @@ async fn start_turn(
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
     let provider = Provider::from_env().map_err(|e| format!("провайдер: {e}"))?;
 
-    let (turn_id, history, session_model, cwd, cfg) = {
+    let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .iter_mut()
@@ -700,6 +700,7 @@ async fn start_turn(
         (
             turn_id.to_string(),
             session.history.clone(),
+            session.summary.clone(),
             session.model.clone(),
             session.cwd.clone(),
             cfg,
@@ -731,8 +732,92 @@ async fn start_turn(
             turn: tid.clone(),
             session: swagcod_core::SessionId::new(&sid),
         });
+
+        /* B-3: контекст — калиброванный счёт, компакция сайд-запросом и
+           память проекта. Всё до старта машины: машина получает уже
+           подготовленную историю. */
+        use swagcod_core::context;
+        let calib = app_state
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.get_pref("token_calibration").ok().flatten());
+        let cpt = context::chars_per_token(&effective_model, calib.as_deref());
+        let mut summary = session_summary;
+        let mut history = history;
+        let ctx_window = context::model_context_tokens(&effective_model);
+        let est = context::estimate_history_tokens(&history, cpt)
+            + context::estimate_tokens(&summary, cpt);
+        if context::should_compact(est, ctx_window) {
+            let (old, recent) = context::split_history(&history, context::KEEP_RECENT_TURNS);
+            if !old.is_empty() {
+                bus.publish(EventKind::Status {
+                    message: "сжимаю контекст: сворачиваю старые ходы".into(),
+                });
+                let sum_model = app_state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get_pref("summarizer_model").ok().flatten())
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| effective_model.clone());
+                let prompt = context::summarizer_prompt(&summary, &old);
+                let sum_req =
+                    ChatRequest::new(&sum_model, vec![ChatMessage::user(prompt)]);
+                match provider.stream(sum_req) {
+                    Ok((mut srx, shandle)) => {
+                        let mut text = String::new();
+                        let mut sum_err: Option<String> = None;
+                        while let Some(ev) = srx.recv().await {
+                            match ev {
+                                StreamEvent::Content(t) => text.push_str(&t),
+                                StreamEvent::Error(m) => sum_err = Some(m),
+                                _ => {}
+                            }
+                        }
+                        shandle.abort();
+                        if sum_err.is_none() && !text.trim().is_empty() {
+                            summary = text.trim().to_string();
+                            history = recent;
+                            {
+                                let mut sessions = app_state.sessions.lock().await;
+                                if let Some(s) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
+                                    s.summary = summary.clone();
+                                    s.history = history.clone();
+                                }
+                            }
+                            if let Ok(store) = app_state.store.lock() {
+                                let _ = store.set_session_summary(&sid, &summary);
+                            }
+                            bus.publish(EventKind::Status {
+                                message: format!(
+                                    "контекст сжат: {} старых сообщений свёрнуто в сводку",
+                                    old.len()
+                                ),
+                            });
+                        } else {
+                            bus.publish(EventKind::Status {
+                                message: "сжатие не удалось, продолжаю с полным контекстом".into(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        bus.publish(EventKind::Status {
+                            message: format!("сжатие не удалось: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+        // Память проекта инжектится в system-промпт каждого запроса хода.
+        let memory_md = std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md"))
+            .unwrap_or_default();
+        let system_msg = context::system_prompt(&summary, &memory_md);
+
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
         let mut fail_reason: Option<String> = None;
+        // B-3: точный счёт от провайдера, если он отдаёт usage в стриме.
+        let mut last_usage: Option<(u32, u32)> = None;
 
         let outcome = loop {
             if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
@@ -740,9 +825,17 @@ async fn start_turn(
             }
             match step {
                 TurnStep::RequestModel { history } => {
+                    // System не хранится в истории сессии: подставляется
+                    // свежим в каждый запрос, иначе сообщения множились бы.
+                    let messages = {
+                        let mut v = Vec::with_capacity(history.len() + 1);
+                        v.push(system_msg.clone());
+                        v.extend(history);
+                        v
+                    };
                     let request = ChatRequest {
                         model: effective_model.clone(),
-                        messages: history,
+                        messages,
                         stream: true,
                         temperature,
                         max_tokens: None,
@@ -804,6 +897,9 @@ async fn start_turn(
                             }
                             StreamEvent::Done { .. } => {}
                             StreamEvent::Error(msg) => stream_error = Some(msg.clone()),
+                            StreamEvent::Usage { input_tokens, output_tokens } => {
+                                last_usage = Some((*input_tokens, *output_tokens));
+                            }
                         }
                     }
                     if stopped {
@@ -889,7 +985,18 @@ async fn start_turn(
             .iter()
             .flat_map(|m| m.tool_calls.clone())
             .collect();
-        let record = report.into_record(tid.clone(), calls, 0, 0);
+        /* B-3: счёт токенов — точный usage от провайдера, когда он его
+           отдаёт, иначе калиброванная оценка. Честный ноль в журнале больше
+           не живёт. */
+        let (est_in, est_out) = match last_usage {
+            Some((i, o)) => (i, o),
+            None => (
+                swagcod_core::context::estimate_history_tokens(machine.history(), cpt),
+                swagcod_core::context::estimate_tokens(&report.content, cpt)
+                    + swagcod_core::context::estimate_tokens(&report.reasoning, cpt),
+            ),
+        };
+        let record = report.into_record(tid.clone(), calls, est_in, est_out);
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
@@ -1125,6 +1232,32 @@ async fn execute_tool(
                     output: format!("записано {} байт", content.len()),
                 },
                 Err(e) => fail(format!("write: {e}")),
+            }
+        }
+        /* B-3: память проекта. Заметка дописывается в .swagcod/MEMORY.md
+           внутри cwd сессии — песочница та же, подтверждение не требуется:
+           это блокнот агента, а не изменение кода пользователя. */
+        "memory_append" => {
+            let text = arg_str(call, "text");
+            if text.trim().is_empty() {
+                return fail("пустая заметка".into());
+            }
+            let dir = cwd.join(".swagcod");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return fail(format!("memory_append: mkdir: {e}"));
+            }
+            let path = dir.join("MEMORY.md");
+            use std::io::Write as _;
+            let entry = format!("\n## {}\n{}\n", swagcod_core::bus::now_ms(), text.trim());
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut f) => match f.write_all(entry.as_bytes()) {
+                    Ok(()) => ToolOutcome {
+                        ok: true,
+                        output: "заметка добавлена в .swagcod/MEMORY.md".into(),
+                    },
+                    Err(e) => fail(format!("memory_append: {e}")),
+                },
+                Err(e) => fail(format!("memory_append: {e}")),
             }
         }
         "bash" => {

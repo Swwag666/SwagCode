@@ -115,6 +115,10 @@ pub struct Session {
     pub current_turn: Option<TurnId>,
     /// История в wire-формате провайдера: именно её отправляем на следующий ход.
     pub history: Vec<ChatMessage>,
+    /// B-3: свёртка старых ходов суммаризатором. Не хранится в history:
+    /// драйвер подставляет её в system-промпт каждого запроса свежей.
+    #[serde(default)]
+    pub summary: String,
     /// Завершённые ходы — журнал.
     pub turns: Vec<TurnRecord>,
     pub created_ms: u64,
@@ -130,6 +134,7 @@ impl Session {
             status: SessionStatus::Idle,
             current_turn: None,
             history: Vec::new(),
+            summary: String::new(),
             turns: Vec::new(),
             created_ms: crate::bus::now_ms(),
         }
