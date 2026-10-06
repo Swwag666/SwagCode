@@ -13,6 +13,7 @@
   import BackgroundFX from './components/BackgroundFX.svelte'
   import Splash from './components/Splash.svelte'
   import SessionList from './components/SessionList.svelte'
+  import Terminal from './components/Terminal.svelte'
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
@@ -38,7 +39,7 @@
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
   let settingsTab = $state<'general' | 'models' | 'plugins'>('general')
-  let activeTab = $state<'chat' | 'trajectory'>('chat')
+  let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
    * Внешний вид и права. Всё это реально применяется к DOM и
@@ -1832,6 +1833,8 @@
         <div class="tabs">
           <button class="tab" class:active={activeTab === 'chat'} onclick={() => (activeTab = 'chat')} role="tab" aria-selected={activeTab === 'chat'}>{t('chat')}</button>
           <button class="tab" class:active={activeTab === 'trajectory'} onclick={() => (activeTab = 'trajectory')} role="tab" aria-selected={activeTab === 'trajectory'}>{t('trajectory')}</button>
+          <!-- B-2: терминал вернулся — вкладка поверх настоящих PTY-событий -->
+          <button class="tab" class:active={activeTab === 'terminal'} onclick={() => (activeTab = 'terminal')} role="tab" aria-selected={activeTab === 'terminal'}>{t('terminal')}</button>
         </div>
         <div class="header-tools-right">
           <button
@@ -1948,7 +1951,7 @@
           {/if}
           <Transcript items={filteredItems} {revision} {bookmarks} onToggleBookmark={toggleBookmark} />
         </div>
-      {:else}
+      {:else if activeTab === 'trajectory'}
         {@const trajectoryItems = items.filter(i => i.kind === 'tool_call' || i.kind === 'status')}
         {@const groupedByTurn = trajectoryItems.reduce((acc, item) => {
           const turn = item.turn || 'unknown'
@@ -1988,9 +1991,14 @@
             {/each}
           </div>
         </div>
+      {:else}
+        <!-- B-2: вкладка терминала: PTY живёт в ядре, компонент рисует
+             операции ANSI-парсера из событий pty_output. -->
+        <Terminal sessionId={currentSession} lang={uiLang} />
       {/if}
     </div>
 
+    {#if activeTab !== 'terminal'}
     <div class="input-area">
       {#if thinking}
         <div class="stream-progress" aria-hidden="true">
@@ -2156,6 +2164,7 @@
         </div>
       {/if}
     </div>
+    {/if}
       </div>
 
       <!-- Панель Files: дерево папки, в которой живёт чат. Открывается

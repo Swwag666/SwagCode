@@ -44,6 +44,9 @@ pub struct AppState {
     /// std-мьютексом: операции миллисекундные, async над ними дал бы
     /// только сложность (философия better-sqlite из плана B-1).
     pub store: std::sync::Mutex<swagcod_core::store::SqliteStore>,
+    /// B-2: реестр PTY-сессий. Arc: сливной поток вывода живёт дольше
+    /// команды, которая его подняла.
+    pub ptys: std::sync::Arc<swagcod_pty::PtyManager>,
 }
 
 impl Default for AppState {
@@ -58,6 +61,7 @@ impl Default for AppState {
                 swagcod_core::store::SqliteStore::in_memory()
                     .expect("in-memory SQLite не может не открыться"),
             ),
+            ptys: std::sync::Arc::new(swagcod_pty::PtyManager::new()),
         }
     }
 }
@@ -552,6 +556,102 @@ fn get_pref(state: State<'_, Arc<AppState>>, key: String) -> Result<Option<Strin
 fn set_pref(state: State<'_, Arc<AppState>>, key: String, value: String) -> Result<(), String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.set_pref(&key, &value).map_err(|e| e.to_string())
+}
+
+/* B-2: терминал на настоящем PTY (plan B-2). Команды тонкие: spawn, write,
+   resize, kill. Вывод уходит не через них, а через шину событиями
+   pty_output с уже разобранными ANSI-операциями: разборка живёт в Rust,
+   WebView только рисует. */
+
+/// Поднять PTY в cwd сессии. Shell — по желанию, иначе COMSPEC/SHELL.
+#[tauri::command]
+async fn pty_spawn(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    shell: Option<String>,
+) -> Result<String, String> {
+    let cwd = {
+        let sessions = state.sessions.lock().await;
+        let ses = sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия {session_id} не найдена"))?;
+        ses.cwd.clone()
+    };
+    let shell = shell
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(swagcod_pty::default_shell);
+    let id = format!("pty-{}", short_id());
+    let handle = state
+        .ptys
+        .spawn(&id, &shell, &cwd, 120, 30)
+        .map_err(|e| e.to_string())?;
+    let rx = handle.take_rx().ok_or("приёмник вывода уже занят")?;
+
+    // Слив вывода — отдельный поток, не tokio-воркер: recv блокирующий,
+    // парсинг и батчинг синхронные, а publish дешёвый.
+    let bus = state.bus.clone();
+    let did = id.clone();
+    std::thread::Builder::new()
+        .name(format!("pty-drain-{id}"))
+        .spawn(move || {
+            let mut parser = swagcod_pty::AnsiParser::new();
+            let mut sink = swagcod_pty::VecSink::default();
+            let flush = |parser: &mut swagcod_pty::AnsiParser, sink: &mut swagcod_pty::VecSink, bus: &Bus, did: &str| {
+                let ops: Vec<serde_json::Value> =
+                    sink.0.iter().filter_map(|o| serde_json::to_value(o).ok()).collect();
+                if !ops.is_empty() {
+                    bus.publish(EventKind::PtyOutput {
+                        pty: did.to_string(),
+                        ops,
+                    });
+                }
+                sink.0.clear();
+                let _ = parser;
+            };
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    swagcod_pty::PtyMsg::Output(bytes) => {
+                        parser.feed(&bytes, &mut sink);
+                        flush(&mut parser, &mut sink, &bus, &did);
+                    }
+                    swagcod_pty::PtyMsg::Exit(code) => {
+                        parser.finish(&mut sink);
+                        flush(&mut parser, &mut sink, &bus, &did);
+                        bus.publish(EventKind::PtyExit { pty: did.clone(), code });
+                        break;
+                    }
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn pty_write(state: State<'_, Arc<AppState>>, pty_id: String, text: String) -> Result<(), String> {
+    let h = state
+        .ptys
+        .get(&pty_id)
+        .ok_or_else(|| format!("pty {pty_id} не найден"))?;
+    h.write(text.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn pty_resize(state: State<'_, Arc<AppState>>, pty_id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let h = state
+        .ptys
+        .get(&pty_id)
+        .ok_or_else(|| format!("pty {pty_id} не найден"))?;
+    h.resize(cols.max(8), rows.max(4)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn pty_kill(state: State<'_, Arc<AppState>>, pty_id: String) -> Result<(), String> {
+    if let Some(h) = state.ptys.remove(&pty_id) {
+        h.kill();
+    }
+    Ok(())
 }
 
 /// Запустить ход: сообщение пользователя → агентский цикл → журнал сессии.
@@ -1222,6 +1322,10 @@ pub fn run() {
             delete_session,
             get_pref,
             set_pref,
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_kill,
             set_approval_policy,
             bus_seq,
             start_turn,

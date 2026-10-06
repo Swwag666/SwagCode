@@ -29,6 +29,9 @@ thiserror = "2"
 # B-1: синхронный SQLite, вмурованный в бинарник (философия better-sqlite:
 # sync API, никаких внешних зависимостей и системных библиотек).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# B-2: проверенный кроссплатформенный PTY поверх ConPTY/forkpty: меньше
+# своего кода — выше стабильность (plan B-2).
+portable-pty = "0.8"
 
 [profile.release]
 codegen-units = 1

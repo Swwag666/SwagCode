@@ -1,12 +1,15 @@
-/*! PTY-подсистема: ConPTY на Windows, forkpty на Unix.
+/*! PTY-подсистема: ConPTY на Windows, forkpty на Unix (этап B-2).
 
-Этап 2. Здесь будет то, что даёт главный выигрыш в скорости против
-Electron + node-pty + xterm.js: собственный ANSI-парсер, кольцевой буфер
-вывода и flow control, чтобы вывод 50 МБ/с не дропал кадры UI.
-
-Сейчас — заготовка модуля и контракт, чтобы `core` и UI могли
-компилироваться против него.
+Настоящий PTY через `portable-pty`, собственный ANSI-парсер state-machine,
+кольцевой буфер скроллбека и flow control ограниченным каналом: вывод
+50 МБ/с не роняет кадры UI, медленный потребитель дропает пачки и считает их.
 */
+
+pub mod ansi;
+pub mod pty;
+
+pub use ansi::{AnsiParser, AnsiSink, Op, VecSink};
+pub use pty::{default_shell, PtyError, PtyHandle, PtyManager, PtyMsg, PtyResult};
 
 /// Требуемая пропускная способность вывода без дропа фреймов (DECISIONS.md §2).
 pub const TARGET_THROUGHPUT_BYTES_PER_SEC: usize = 50 * 1024 * 1024;

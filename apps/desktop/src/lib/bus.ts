@@ -36,6 +36,15 @@ export type EventKind =
     }
   | { kind: 'error'; data: { turn: string | null; message: string } }
   | { kind: 'status'; data: { message: string } }
+  | { kind: 'pty_output'; data: { pty: string; ops: PtyOp[] } }
+  | { kind: 'pty_exit'; data: { pty: string; code: number } }
+
+/** Операция ANSI-парсера из Rust (crates/pty/src/ansi.rs, serde tag "t"). */
+export type PtyOp =
+  | { t: 'text'; s: string }
+  | { t: 'sgr'; fg: number | null; bg: number | null; bold: boolean | null; dim: boolean | null; reset: boolean }
+  | { t: 'csi'; kind: string; params: number[] }
+  | { t: 'osc'; payload: string }
 
 export interface WireEvent {
   seq: number
