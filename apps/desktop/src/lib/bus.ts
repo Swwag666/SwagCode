@@ -25,7 +25,7 @@ export type EventKind =
       kind: 'tool_result'
       data: { turn: string; call_id: string; ok: boolean; output: string; elapsed_ms: number }
     }
-  | { kind: 'turn_started'; data: { turn: string; session: string } }
+  | { kind: 'turn_started'; data: { turn: string; session: string; parent?: string } }
   | {
       kind: 'turn_ended'
       data: { turn: string; session: string; ok: boolean; reason: string | null }

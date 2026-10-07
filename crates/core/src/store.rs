@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS turns(
   reasoning TEXT NOT NULL,
   tool_calls_json TEXT NOT NULL DEFAULT '[]',
   est_in INTEGER NOT NULL DEFAULT 0,
-  est_out INTEGER NOT NULL DEFAULT 0
+  est_out INTEGER NOT NULL DEFAULT 0,
+  parent_turn_id TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +196,8 @@ impl SqliteStore {
         );
         // Миграция B-7: per-session политика подтверждений.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN approval_policy TEXT", []);
+        // Миграция E-6: дерево суб-агентов — родительский ход.
+        let _ = conn.execute("ALTER TABLE turns ADD COLUMN parent_turn_id TEXT", []);
         Ok(Self { conn })
     }
 
@@ -393,8 +396,8 @@ impl Store for SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         let tools_json = serde_json::to_string(&turn.tool_calls)?;
         tx.execute(
-            "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 turn.id.as_str(),
                 session_id,
@@ -407,6 +410,7 @@ impl Store for SqliteStore {
                 tools_json,
                 turn.est_input_tokens as i64,
                 turn.est_output_tokens as i64,
+                turn.parent_turn_id.as_ref().map(|p| p.as_str()),
             ],
         )?;
         // Снимок истории целиком: порядок и содержимое восстанавливаются
@@ -637,7 +641,7 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tasks::Task> 
 /// Ходы и сообщения сессии из базы в живую структуру.
 fn fill_session(conn: &Connection, ses: &mut Session) -> StoreResult<()> {
     let mut tstmt = conn.prepare(
-        "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out
+        "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id
          FROM turns WHERE session_id = ?1 ORDER BY started_ms, id",
     )?;
     let turns = tstmt
@@ -654,6 +658,9 @@ fn fill_session(conn: &Connection, ses: &mut Session) -> StoreResult<()> {
                 tool_calls: serde_json::from_str(&tools_json).unwrap_or_default(),
                 est_input_tokens: r.get::<_, i64>(8)? as u32,
                 est_output_tokens: r.get::<_, i64>(9)? as u32,
+                parent_turn_id: r
+                    .get::<_, Option<String>>(10)?
+                    .map(crate::session::TurnId::new),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -725,6 +732,7 @@ mod tests {
             est_output_tokens: 20,
             ok: true,
             failure: None,
+            parent_turn_id: None,
         }
     }
 
@@ -742,6 +750,28 @@ mod tests {
         assert_eq!(loaded.turns[0], turn);
         assert_eq!(loaded.title, "проба");
         assert_eq!(loaded.cwd, "D:/proj");
+    }
+
+    #[test]
+    fn turn_parent_roundtrip_sqlite() {
+        // E-6: дерево ходов — parent_turn_id живёт в базе и читается назад.
+        let store = SqliteStore::in_memory().unwrap();
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        store.save_turn("s-1", &sample_turn(1), &[]).unwrap();
+        let mut child = sample_turn(2);
+        child.id = TurnId::new("t-1-sub-xyz");
+        child.parent_turn_id = Some(TurnId::new("t-1"));
+        store.save_turn("s-1", &child, &[]).unwrap();
+
+        let loaded = store.load_session("s-1").unwrap().unwrap();
+        assert_eq!(loaded.turns.len(), 2);
+        assert_eq!(loaded.turns[0].parent_turn_id, None);
+        assert_eq!(loaded.turns[1], child);
+        assert_eq!(
+            loaded.turns[1].parent_turn_id.as_ref().map(|p| p.as_str()),
+            Some("t-1")
+        );
     }
 
     #[test]

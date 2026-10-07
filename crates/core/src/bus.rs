@@ -49,8 +49,14 @@ pub enum EventKind {
         /// Сколько длилось выполнение, мс. Нужно для метрик, не только для UI.
         elapsed_ms: u64,
     },
-    /// Ход начался.
-    TurnStarted { turn: TurnId, session: SessionId },
+    /// Ход начался. E-6: `parent` — у дочерних ходов суб-агентов (ветка
+    /// дерева); wire обратно совместим: поле отсутствует у обычных ходов.
+    TurnStarted {
+        turn: TurnId,
+        session: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<TurnId>,
+    },
     /// Ход завершён.
     TurnEnded {
         turn: TurnId,
@@ -337,6 +343,7 @@ mod tests {
             EventKind::TurnStarted {
                 turn: tid(),
                 session: sid(),
+                parent: None,
             },
             EventKind::TurnEnded {
                 turn: tid(),

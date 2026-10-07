@@ -100,6 +100,10 @@ pub struct TurnRecord {
     pub est_output_tokens: u32,
     pub ok: bool,
     pub failure: Option<String>,
+    /// E-6: дерево суб-агентов — родительский ход (None у ходов верхнего
+    /// уровня). serde-default: старые журналы без поля читаются как раньше.
+    #[serde(default)]
+    pub parent_turn_id: Option<TurnId>,
 }
 
 /// Сессия: рабочее пространство, история, текущее состояние.
@@ -315,10 +319,28 @@ mod tests {
                 est_output_tokens: 0,
                 ok: true,
                 failure: None,
+                parent_turn_id: None,
             });
         }
         let ids: Vec<_> = ses.turns_desc().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["t2", "t1", "t0"]);
+    }
+
+    #[test]
+    fn turn_record_parent_wire_compat() {
+        /* E-6: старые журналы без parent_turn_id читаются как ходы верхнего
+           уровня (serde-default), а дочерние сериализуются с полем. */
+        let old = r#"{"id":"t1","started_ms":1,"ended_ms":null,"content":"","reasoning":"","tool_calls":[],"est_input_tokens":0,"est_output_tokens":0,"ok":true,"failure":null}"#;
+        let rec: TurnRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.parent_turn_id, None);
+
+        let mut child = rec.clone();
+        child.parent_turn_id = Some(TurnId::new("t0"));
+        let json = serde_json::to_string(&child).unwrap();
+        assert!(json.contains("parent_turn_id"));
+        let back: TurnRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, child);
+        assert_eq!(back.parent_turn_id.as_ref().map(|p| p.as_str()), Some("t0"));
     }
 
     #[test]

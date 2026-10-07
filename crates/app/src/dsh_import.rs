@@ -189,6 +189,7 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
                         est_output_tokens: 0,
                         ok: false,
                         failure: None,
+                        parent_turn_id: None,
                     },
                     msgs: Vec::new(),
                 });

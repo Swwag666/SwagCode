@@ -342,8 +342,8 @@ impl Store for NodeStore {
            оборванный процесс не оставляет полупустой ход. */
         let mut steps = Vec::with_capacity(2 + history.len());
         steps.push(json!({
-            "sql": "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "sql": "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             "params": [
                 json!(turn.id.as_str()),
                 json!(session_id),
@@ -355,7 +355,8 @@ impl Store for NodeStore {
                 json!(turn.reasoning),
                 json!(tools_json),
                 json!(turn.est_input_tokens as i64),
-                json!(turn.est_output_tokens as i64)
+                json!(turn.est_output_tokens as i64),
+                turn.parent_turn_id.as_ref().map(|p| json!(p.as_str())).unwrap_or(Value::Null)
             ]
         }));
         steps.push(json!({
@@ -568,7 +569,7 @@ impl NodeStore {
     /// Ходы и сообщения сессии — аналог fill_session для rusqlite.
     fn fill_session(&self, ses: &mut Session) -> StoreResult<()> {
         let trows = self.query(
-            "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out
+            "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id
              FROM turns WHERE session_id = ?1 ORDER BY started_ms, id",
             vec![json!(ses.id.as_str())],
         )?;
@@ -585,6 +586,7 @@ impl NodeStore {
                 tool_calls: serde_json::from_str(&v_text(col(r, 7))).unwrap_or_default(),
                 est_input_tokens: v_int(col(r, 8)) as u32,
                 est_output_tokens: v_int(col(r, 9)) as u32,
+                parent_turn_id: v_opt_text(col(r, 10)).map(crate::session::TurnId::new),
             })
             .collect();
 
@@ -657,6 +659,7 @@ mod tests {
             est_output_tokens: 20,
             ok: true,
             failure: None,
+            parent_turn_id: None,
         }
     }
 
@@ -679,6 +682,25 @@ mod tests {
         assert_eq!(loaded.history.len(), ses.history.len());
         // Инструментальный хвост восстановился байт-в-байт.
         assert_eq!(loaded.history, ses.history);
+
+        /* E-6: дочерний ход суб-агента — parent_turn_id переживает
+           roundtrip через sidecar (паритет с rusqlite-бэкендом). */
+        let mut child = sample_turn(2);
+        child.id = crate::session::TurnId::new("t-1-sub-abc");
+        child.parent_turn_id = Some(crate::session::TurnId::new("t-1"));
+        store.save_turn("s-1", &child, &ses.history).unwrap();
+        let with_child = store.load_session("s-1").unwrap().unwrap();
+        assert_eq!(with_child.turns.len(), 2);
+        let loaded_child = with_child
+            .turns
+            .iter()
+            .find(|t| t.id.as_str() == "t-1-sub-abc")
+            .expect("дочерний ход на месте");
+        assert_eq!(
+            loaded_child.parent_turn_id.as_ref().map(|p| p.as_str()),
+            Some("t-1")
+        );
+        assert_eq!(with_child.turns[0].parent_turn_id, None);
 
         // Политика снимается обратно в «как глобальная».
         store.set_session_policy("s-1", None).unwrap();

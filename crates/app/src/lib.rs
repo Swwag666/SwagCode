@@ -18,7 +18,7 @@ pub mod stdio_rpc;
 
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
-use swagcod_core::session::{Session, SessionId};
+use swagcod_core::session::{Session, SessionId, TurnRecord};
 use swagcod_core::tasks::{task_backoff_ms, Task, TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_QUEUED};
 use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
@@ -538,9 +538,14 @@ async fn transcript_events(
     for turn in &session.turns {
         let tid = turn.id.as_str().to_string();
         let ts = turn.started_ms;
+        /* E-6: parent в turn_started — ветки суб-агентов видны и в истории,
+           а не только в живом стриме (wire-формат тот же, поле опционально). */
         out.push(json!({
             "seq": 0, "ts_ms": ts,
-            "kind": { "kind": "turn_started", "data": { "turn": tid, "session": session_id } }
+            "kind": { "kind": "turn_started", "data": {
+                "turn": tid, "session": session_id,
+                "parent": turn.parent_turn_id.as_ref().map(|p| p.as_str())
+            } }
         }));
         if let Some(text) = user_texts.pop_front() {
             out.push(json!({
@@ -1035,6 +1040,7 @@ async fn start_turn(
         bus.publish(EventKind::TurnStarted {
             turn: tid.clone(),
             session: swagcod_core::SessionId::new(&sid),
+            parent: None,
         });
         /* E-2: в начале каждого хода фоном освежаем семантический индекс.
            Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
@@ -1308,6 +1314,24 @@ async fn start_turn(
                         run_mcp_call(&app_state, &call).await
                     } else if call.name.starts_with(jsplugins::JS_PREFIX) {
                         run_js_call(&app_state, &call).await
+                    } else if call.name == "subagent" {
+                        /* E-6: ветка суб-агента — собственный стрим и история;
+                           снимок истории сессии нужен её save_turn (messages
+                           заменяются целиком). */
+                        run_subagent(
+                            &app_state,
+                            &provider,
+                            &call,
+                            &sid,
+                            &turn,
+                            &effective_model,
+                            temperature,
+                            &cwd,
+                            &summary,
+                            tool_timeout,
+                            machine.history(),
+                        )
+                        .await
                     } else {
                         execute_tool(&call, &cwd, tool_timeout, &plugins).await
                     };
@@ -2099,6 +2123,316 @@ async fn run_semantic_search(
         }
     }
     ToolOutcome { ok: true, output: out }
+}
+
+/* ── E-6: суб-агент — изолированная ветка дерева ходов ─────────────────────
+ * Модель вызывает `subagent` как обычный инструмент, но за ним —
+ * миниатюрная машина хода: собственный стрим провайдера, собственная
+ * история (НЕ история сессии), только read-only инструменты, бюджет
+ * оценочных токенов и предел раундов. Прогон записывается дочерним ходом
+ * с `parent_turn_id` — ветки видны в траектории, чате и транскрипте.
+ * Суб-агент не рекурсивен: в его списке спеков нет `subagent`, а вызовы
+ * исполняются напрямую через execute_tool без диспетчера вложенности. */
+
+/// Инструменты внутри суб-агента: только read-only. write/bash/patch не
+/// входят, поэтому ветка физически не способна на опасные операции —
+/// подтверждений из суб-агента не бывает ни при какой политике.
+pub const SUBAGENT_SAFE_TOOLS: &[&str] = &["read", "list", "grep", "glob", "fetch_url", "semantic_search"];
+
+/// Предел раундов (запросов модели) ветки по умолчанию.
+pub const SUBAGENT_MAX_ROUNDS: u32 = 6;
+
+/// Бюджет оценочных токенов ветки (вход+выход всех раундов) по умолчанию.
+pub const SUBAGENT_BUDGET_TOKENS: u64 = 100_000;
+
+/// Лимиты ветки: аргументы вызова (max_rounds/budget_tokens), затем env,
+/// затем дефолты. Клампы защищают и от нуля, и от абсурдных значений.
+pub fn subagent_limits(args: &serde_json::Map<String, serde_json::Value>) -> (u32, u64) {
+    let env_rounds = std::env::var("SWAGCOD_SUBAGENT_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let env_budget = std::env::var("SWAGCOD_SUBAGENT_BUDGET_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let rounds = args
+        .get("max_rounds")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .or(env_rounds)
+        .unwrap_or(SUBAGENT_MAX_ROUNDS)
+        .clamp(1, 12);
+    let budget = args
+        .get("budget_tokens")
+        .and_then(|v| v.as_u64())
+        .or(env_budget)
+        .unwrap_or(SUBAGENT_BUDGET_TOKENS)
+        .clamp(1_000, 10_000_000);
+    (rounds, budget)
+}
+
+/// Прогнать ветку суб-агента: изолированный диалог с моделью, read-only
+/// инструменты, дочерняя запись хода. `session_history` — снимок истории
+/// СЕССИИ для save_turn: messages заменяются целиком, поэтому изолированную
+/// историю ветки туда писать нельзя (затрёт wire-историю родителя).
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
+    state: &Arc<AppState>,
+    provider: &Router,
+    call: &ToolCall,
+    sid: &str,
+    parent_tid: &str,
+    model: &str,
+    temperature: Option<f32>,
+    cwd: &std::path::Path,
+    summary: &str,
+    tool_timeout: std::time::Duration,
+    session_history: &[ChatMessage],
+) -> ToolOutcome {
+    use swagcod_core::turn::{build_assistant_message, StreamAccumulator};
+    use swagcod_provider::types::Role;
+
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return ToolOutcome {
+            ok: false,
+            output: "subagent: пустой prompt в аргументах".into(),
+        };
+    }
+    let with_context = call
+        .arguments
+        .get("context")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (max_rounds, budget) = subagent_limits(&call.arguments);
+    // turns.id — глобальный ключ: id ветки = id родителя + уникальный хвост.
+    let child_id = format!("{parent_tid}-sub-{}", short_id());
+    let child_tid = swagcod_core::TurnId::new(&child_id);
+    let parent_turn = swagcod_core::TurnId::new(parent_tid);
+    let started = swagcod_core::bus::now_ms();
+    let bus = state.bus.clone();
+
+    /* TurnStarted ветки уходит в шину первым — фронт строит карту
+       turn→session и для дочерних ходов, иначе стрим ветки потерялся бы. */
+    bus.publish(EventKind::TurnStarted {
+        turn: child_tid.clone(),
+        session: swagcod_core::SessionId::new(sid),
+        parent: Some(parent_turn.clone()),
+    });
+
+    // Изолированная история: свежий контекст, сводка B-3 — по желанию.
+    let mut history: Vec<ChatMessage> = Vec::new();
+    if with_context && !summary.trim().is_empty() {
+        history.push(ChatMessage::user(format!(
+            "Контекст сессии (сводка):\n{}\n\nЗадача: {prompt}",
+            summary.trim()
+        )));
+    } else {
+        history.push(ChatMessage::user(prompt));
+    }
+    let system = ChatMessage {
+        role: Role::System,
+        content: "Ты — суб-агент внутри SwagCod: решаешь одну самодостаточную исследовательскую задачу. \
+                  У тебя только read-only инструменты (read, list, grep, glob, fetch_url, semantic_search). \
+                  Ты не можешь изменять файлы, выполнять команды и плодить собственных суб-агентов. \
+                  Когда задача решена — ответь итоговым отчётом обычным текстом, без вызовов инструментов."
+            .into(),
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    };
+    let specs: Vec<ToolSpec> = builtin_tool_specs()
+        .into_iter()
+        .filter(|s| SUBAGENT_SAFE_TOOLS.contains(&s.name.as_str()))
+        .collect();
+    let tool_wire: Vec<serde_json::Value> =
+        ChatRequest::new(model, Vec::new()).with_tools(&specs).tools;
+    let cpt = swagcod_core::context::chars_per_token(model, None);
+
+    let mut est_in: u64 = 0;
+    let mut est_out: u64 = 0;
+    let mut final_content = String::new();
+    let mut all_reasoning = String::new();
+    let mut all_tools: Vec<ToolCall> = Vec::new();
+    let mut ok = true;
+    let mut failure: Option<String> = None;
+    let mut clean_finish = false;
+    let mut rounds_used: u32 = 0;
+
+    for round in 0..max_rounds {
+        rounds_used = round + 1;
+        // B-8: ветка живёт внутри родительского хода — кормим watchdog.
+        touch_turn(state, parent_tid, None);
+        let mut messages = Vec::with_capacity(history.len() + 1);
+        messages.push(system.clone());
+        messages.extend(history.iter().cloned());
+        est_in += swagcod_core::context::estimate_history_tokens(&messages, cpt) as u64;
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            temperature,
+            max_tokens: None,
+            tools: tool_wire.clone(),
+        };
+        let (mut rx, handle) = match provider.stream(request) {
+            Ok(pair) => pair,
+            Err(e) => {
+                ok = false;
+                failure = Some(format!("subagent: ошибка стрима: {e}"));
+                break;
+            }
+        };
+        let mut acc = StreamAccumulator::default();
+        let mut stream_error: Option<String> = None;
+        while let Some(event) = rx.recv().await {
+            touch_turn(state, parent_tid, None);
+            match &event {
+                StreamEvent::Reasoning(t) => {
+                    acc.reasoning.push_str(t);
+                    bus.publish(EventKind::Reasoning {
+                        turn: child_tid.clone(),
+                        text: t.clone(),
+                    });
+                }
+                StreamEvent::Content(t) => {
+                    acc.content.push_str(t);
+                    bus.publish(EventKind::Content {
+                        turn: child_tid.clone(),
+                        text: t.clone(),
+                    });
+                }
+                StreamEvent::ToolCallComplete(tc) => {
+                    acc.tool_calls.push(tc.clone());
+                    bus.publish(EventKind::ToolCall {
+                        turn: child_tid.clone(),
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: serde_json::Value::Object(tc.arguments.clone()),
+                    });
+                }
+                StreamEvent::Error(m) => stream_error = Some(m.clone()),
+                _ => {}
+            }
+        }
+        handle.abort();
+        if let Some(m) = stream_error {
+            ok = false;
+            failure = Some(format!("subagent: {m}"));
+            final_content = acc.content;
+            break;
+        }
+        est_out += swagcod_core::context::estimate_tokens(&acc.content, cpt) as u64
+            + swagcod_core::context::estimate_tokens(&acc.reasoning, cpt) as u64;
+        all_reasoning.push_str(&acc.reasoning);
+        history.push(build_assistant_message(&acc));
+        if acc.tool_calls.is_empty() {
+            final_content = acc.content;
+            clean_finish = true;
+            break;
+        }
+        final_content = acc.content.clone();
+        for tc in &acc.tool_calls {
+            all_tools.push(tc.clone());
+            /* Защита в глубину: даже если модель «выдумала» опасный инструмент,
+               ветка его не исполнит — честный отказ вместо исполнения. */
+            let out = if tc.name == "semantic_search" {
+                run_semantic_search(state, tc, cwd).await
+            } else if SUBAGENT_SAFE_TOOLS.contains(&tc.name.as_str()) {
+                execute_tool(tc, cwd, tool_timeout, &[]).await
+            } else {
+                ToolOutcome {
+                    ok: false,
+                    output: format!("subagent: инструмент недоступен в суб-агенте: {}", tc.name),
+                }
+            };
+            bus.publish(EventKind::ToolResult {
+                turn: child_tid.clone(),
+                call_id: tc.id.clone(),
+                ok: out.ok,
+                output: truncate_output(&out.output),
+                elapsed_ms: 0,
+            });
+            history.push(ChatMessage {
+                role: Role::Tool,
+                content: truncate_output(&out.output),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tc.id.clone()),
+            });
+        }
+        if est_in + est_out >= budget {
+            ok = false;
+            failure = Some(format!(
+                "subagent: бюджет токенов ветки исчерпан ({} ≥ {})",
+                est_in + est_out,
+                budget
+            ));
+            break;
+        }
+        bus.publish(EventKind::Status {
+            message: format!(
+                "суб-агент {child_id}: раунд {rounds_used}/{max_rounds}, инструментов {}",
+                all_tools.len()
+            ),
+        });
+    }
+    if !clean_finish && failure.is_none() {
+        ok = false;
+        failure = Some(format!("subagent: достигнут предел раундов ({max_rounds})"));
+    }
+
+    let ended = swagcod_core::bus::now_ms();
+    let child = TurnRecord {
+        id: child_tid.clone(),
+        started_ms: started,
+        ended_ms: Some(ended),
+        content: final_content.clone(),
+        reasoning: all_reasoning,
+        tool_calls: all_tools.clone(),
+        est_input_tokens: est_in.min(u32::MAX as u64) as u32,
+        est_output_tokens: est_out.min(u32::MAX as u64) as u32,
+        ok,
+        failure: failure.clone(),
+        parent_turn_id: Some(parent_turn),
+    };
+    /* Дочерний ход — в стор и в живую сессию: ветка видна в траектории
+       сразу, не дожидаясь конца родительского хода. */
+    if let Ok(store) = state.store.lock() {
+        let _ = store.save_turn(sid, &child, session_history);
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.iter_mut().find(|s| s.id.as_str() == sid) {
+            s.turns.push(child);
+        }
+    }
+    bus.publish(EventKind::TurnEnded {
+        turn: child_tid,
+        session: swagcod_core::SessionId::new(sid),
+        ok,
+        reason: failure.clone(),
+    });
+
+    // Отчёт родительскому ходу: текст ветки + честная статистика.
+    let mut output = format!(
+        "[суб-агент {child_id}] раундов: {rounds_used}, инструментов: {}, токенов (оценка): {est_in} in / {est_out} out\n",
+        all_tools.len()
+    );
+    if final_content.trim().is_empty() {
+        output.push_str("(пустой ответ)");
+    } else {
+        output.push_str(final_content.trim());
+    }
+    if let Some(f) = &failure {
+        output.push_str(&format!("\n[ветка не завершена: {f}]"));
+    }
+    ToolOutcome { ok, output }
 }
 
 /// Выполнить один вызов. Не паникует и не возвращает Err: любой отказ
@@ -3898,6 +4232,7 @@ mod tests {
                 est_output_tokens: 0,
                 ok: true,
                 failure: None,
+                parent_turn_id: None,
             };
             store
                 .save_turn(sid, &rec, &[ChatMessage::user("ау"), ChatMessage::assistant("привет")])
@@ -4024,6 +4359,7 @@ rl.on('line', (l) => {
             est_output_tokens: 2,
             ok: true,
             failure: None,
+            parent_turn_id: None,
         });
         let out_path = dir.join("journal.jsonl");
         {
@@ -4099,6 +4435,202 @@ rl.on('line', (l) => {
             assert!(t.attempts >= TASKS_MAX_ATTEMPTS);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_limits_args_env_defaults() {
+        // E-6: приоритет — аргументы вызова, затем env, затем дефолты;
+        // клампы не пускают ни нули, ни абсурд.
+        std::env::remove_var("SWAGCOD_SUBAGENT_MAX_ROUNDS");
+        std::env::remove_var("SWAGCOD_SUBAGENT_BUDGET_TOKENS");
+        let empty = serde_json::Map::new();
+        assert_eq!(
+            subagent_limits(&empty),
+            (SUBAGENT_MAX_ROUNDS, SUBAGENT_BUDGET_TOKENS)
+        );
+        let wild = serde_json::json!({"max_rounds": 99, "budget_tokens": 1})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(subagent_limits(&wild), (12, 1_000));
+        std::env::set_var("SWAGCOD_SUBAGENT_MAX_ROUNDS", "4");
+        assert_eq!(subagent_limits(&empty).0, 4);
+        // Аргументы сильнее env.
+        assert_eq!(subagent_limits(&wild).0, 12);
+        std::env::remove_var("SWAGCOD_SUBAGENT_MAX_ROUNDS");
+    }
+
+    #[test]
+    fn subagent_safe_tools_exclude_dangerous() {
+        // E-6: whitelist ветки не пересекается с опасными инструментами —
+        // подтверждений из суб-агента не бывает ни при какой политике.
+        for name in SUBAGENT_SAFE_TOOLS {
+            assert!(
+                !swagcod_core::turn::ApprovalPolicy::OnDangerous.requires_approval(name),
+                "{name} не должен требовать подтверждения"
+            );
+        }
+        for bad in ["write", "bash", "patch", "edit"] {
+            assert!(!SUBAGENT_SAFE_TOOLS.contains(&bad), "{bad} просочился в whitelist");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_runs_readonly_branch_and_records_child_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        /* Фейк OpenAI-совместимого SSE-провайдера. Ответы по номеру
+           запроса: 1 → tool_call read, 2 → финальный текст,
+           3 → tool_call read (фаза предела раундов), 4 → tool_call bash
+           (фаза отказа опасного инструмента), 5 → финальный текст. */
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let srv_hits = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let n = srv_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    let _ = sock.read(&mut buf).await;
+                    let body = match n {
+                        2 => "data: {\"choices\":[{\"delta\":{\"content\":\"ОТЧЁТ ВЕТКИ\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                        5 => "data: {\"choices\":[{\"delta\":{\"content\":\"ГОТОВО\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                        4 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"cb\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"pwnt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                        _ => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"probe.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        std::env::set_var("SWAGCOD_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        std::env::set_var("SWAGCOD_API_KEY", "test-key");
+        let provider = Router::from_env_with_key(None).expect("роутер из env");
+
+        let state = Arc::new(AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        });
+        let dir = std::env::temp_dir().join(format!("swagcod-sub-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe.txt"), "СЕКРЕТ ВЕТКИ 42").unwrap();
+        let sid = "sub-sess";
+        let s = Session::new(
+            SessionId::new(sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+        }
+        state.sessions.lock().await.push(s);
+
+        // Фаза A: чистый финиш — tool-раунд (read реально исполняется) + отчёт.
+        let call = ToolCall {
+            id: "call-a".into(),
+            name: "subagent".into(),
+            arguments: serde_json::json!({
+                "prompt": "прочитай probe.txt и отчитайся",
+                "max_rounds": 3
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let out = run_subagent(
+            &state, &provider, &call, sid, "parent-1", "test-model", None,
+            &dir, "", std::time::Duration::from_secs(5), &[],
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("ОТЧЁТ ВЕТКИ"), "{}", out.output);
+        assert!(out.output.contains("[суб-агент parent-1-sub-"), "{}", out.output);
+
+        {
+            let g = state.store.lock().unwrap();
+            let loaded = g.load_session(sid).unwrap().expect("сессия есть");
+            assert_eq!(loaded.turns.len(), 1);
+            let child = &loaded.turns[0];
+            assert!(child.id.as_str().starts_with("parent-1-sub-"));
+            assert_eq!(
+                child.parent_turn_id.as_ref().map(|p| p.as_str()),
+                Some("parent-1")
+            );
+            assert!(child.ok);
+            assert_eq!(child.content, "ОТЧЁТ ВЕТКИ");
+            assert_eq!(child.tool_calls.len(), 1);
+            assert_eq!(child.tool_calls[0].name, "read");
+            assert!(child.est_input_tokens > 0, "честный счёт токенов");
+        }
+        {
+            let live = state.sessions.lock().await;
+            let ls = live.iter().find(|s| s.id.as_str() == sid).unwrap();
+            assert_eq!(ls.turns.len(), 1, "ветка видна в живой сессии сразу");
+        }
+
+        // Фаза B: предел раундов — честный провал с частичным отчётом.
+        let call_b = ToolCall {
+            id: "call-b".into(),
+            name: "subagent".into(),
+            arguments: serde_json::json!({"prompt": "читай вечно", "max_rounds": 1})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let out_b = run_subagent(
+            &state, &provider, &call_b, sid, "parent-2", "test-model", None,
+            &dir, "", std::time::Duration::from_secs(5), &[],
+        )
+        .await;
+        assert!(!out_b.ok);
+        assert!(out_b.output.contains("предел раундов"), "{}", out_b.output);
+
+        // Фаза C: опасный инструмент модель «выдумала» — ветка отказывает,
+        // а не исполняет, и дочитывает до чистого финиша.
+        let call_c = ToolCall {
+            id: "call-c".into(),
+            name: "subagent".into(),
+            arguments: serde_json::json!({"prompt": "сломай всё", "max_rounds": 3})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let out_c = run_subagent(
+            &state, &provider, &call_c, sid, "parent-3", "test-model", None,
+            &dir, "", std::time::Duration::from_secs(5), &[],
+        )
+        .await;
+        assert!(out_c.ok, "{}", out_c.output);
+        assert!(out_c.output.contains("ГОТОВО"), "{}", out_c.output);
+
+        {
+            let g = state.store.lock().unwrap();
+            let loaded = g.load_session(sid).unwrap().unwrap();
+            assert_eq!(loaded.turns.len(), 3);
+            let c = loaded.turns.iter().find(|t| t.id.as_str().starts_with("parent-3-sub-")).unwrap();
+            assert_eq!(c.tool_calls.len(), 1);
+            assert_eq!(c.tool_calls[0].name, "bash");
+            assert_eq!(c.content, "ГОТОВО");
+            let b = loaded.turns.iter().find(|t| t.id.as_str().starts_with("parent-2-sub-")).unwrap();
+            assert!(!b.ok);
+            assert!(b.failure.as_deref().unwrap().contains("предел раундов"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 5, "ровно пять запросов к провайдеру");
+
+        std::env::remove_var("SWAGCOD_BASE_URL");
+        std::env::remove_var("SWAGCOD_API_KEY");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

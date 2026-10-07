@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS turns(
   reasoning TEXT NOT NULL,
   tool_calls_json TEXT NOT NULL DEFAULT '[]',
   est_in INTEGER NOT NULL DEFAULT 0,
-  est_out INTEGER NOT NULL DEFAULT 0
+  est_out INTEGER NOT NULL DEFAULT 0,
+  parent_turn_id TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +130,8 @@ function openDb(path) {
   // Миграции для баз, созданных до B-3/B-7: «duplicate column» — норма.
   try { db.exec("ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''"); } catch { /* уже есть */ }
   try { db.exec('ALTER TABLE sessions ADD COLUMN approval_policy TEXT'); } catch { /* уже есть */ }
+  /* E-6: дерево суб-агентов — родительский ход. */
+  try { db.exec('ALTER TABLE turns ADD COLUMN parent_turn_id TEXT'); } catch { /* уже есть */ }
 }
 
 function handle(req) {

@@ -225,6 +225,19 @@ export class Transcript {
       }
 
       case 'turn_started': {
+        /* E-6: старт ветки суб-агента — видимый разделитель в чате.
+           Обычные ходы разделителя не имеют: их строка начинается
+           репликой человека. */
+        if (k.data.parent) {
+          this.push({
+            key: this.key('st'),
+            kind: 'status',
+            text: `↳ суб-агент: ветка ${String(k.data.turn).slice(-6)}`,
+            turn: k.data.turn,
+            done: true,
+            ts: ev.ts_ms,
+          })
+        }
         return true
       }
 

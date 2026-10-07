@@ -259,6 +259,8 @@
   let turnsCount = $state(0)
   /** turn -> session: события стрима не несут session, несёт только turn_started. */
   const turnSession = new Map<string, string>()
+  /** E-6: дочерние ходы суб-агентов — их turn_ended не трогает статус сессии. */
+  const subTurns = new Set<string>()
   let sessionRefreshTick = $state(0)
 
   function transcriptFor(sessionId: string): TranscriptModel {
@@ -305,7 +307,7 @@
       const evs = await invoke<WireEvent[]>('session_transcript', { sessionId: id })
       if (evs.length === 0) return
       for (const ev of evs) {
-        const k = ev.kind as { kind: string; data?: { turn?: string; session?: string } }
+        const k = ev.kind as { kind: string; data?: { turn?: string; session?: string; parent?: string } }
         if (k.kind === 'turn_started' && k.data?.turn && k.data?.session) {
           turnSession.set(k.data.turn, k.data.session)
         }
@@ -1228,23 +1230,34 @@
         hasTurnEvent = true
       }
       if (e.kind.kind === 'turn_started') {
-        const d = e.kind.data as { turn: string; session: string }
+        const d = e.kind.data as { turn: string; session: string; parent?: string }
         turnSession.set(d.turn, d.session)
-        liveStates[d.session] = 'running'
+        /* E-6: ветка суб-агента стартует ВНУТРИ родительского хода:
+           статус сессии не переключаем (иначе «ok» мигнуло бы посреди хода),
+           но карту turn→session регистрируем — стрим ветки routится в чат. */
+        if (d.parent) subTurns.add(d.turn)
+        else liveStates[d.session] = 'running'
         // B-8: новый ход — часы тишины обнуляются.
         lastLiveEventMs = Date.now()
       }
       if (e.kind.kind === 'turn_ended') {
         const d = e.kind.data as { turn: string; session: string; ok: boolean }
-        liveStates[d.session] = d.ok ? 'ok' : 'fail'
-        /* Строки хода переводим в готовый вид: волна «думает» гаснет. */
-        transcriptFor(d.session).closeTurn(d.turn)
-        /* Ход кончился — висячий запрос подтверждения не имеет смысла. */
-        approvalReq = null
-        if (sendingSession === d.session) sendingSession = null
-        if (d.session === currentSession) turnsCount++
-        /* Ход закончился — очередь ЭТОЙ сессии продолжает её разговор сама. */
-        void drainQueue(d.session)
+        if (subTurns.has(d.turn)) {
+          /* E-6: финиш ветки — закрываем только её строки; статус сессии,
+             счётчик ходов и очередь принадлежат родительскому ходу. */
+          subTurns.delete(d.turn)
+          transcriptFor(d.session).closeTurn(d.turn)
+        } else {
+          liveStates[d.session] = d.ok ? 'ok' : 'fail'
+          /* Строки хода переводим в готовый вид: волна «думает» гаснет. */
+          transcriptFor(d.session).closeTurn(d.turn)
+          /* Ход кончился — висячий запрос подтверждения не имеет смысла. */
+          approvalReq = null
+          if (sendingSession === d.session) sendingSession = null
+          if (d.session === currentSession) turnsCount++
+          /* Ход закончился — очередь ЭТОЙ сессии продолжает её разговор сама. */
+          void drainQueue(d.session)
+        }
       }
       if (e.kind.kind === 'approval_required') {
         const d = e.kind.data as { turn: string; call_id: string; tool: string; summary: string }
@@ -2496,10 +2509,11 @@
           </div>
           <div class="trajectory-list">
             {#each Object.entries(groupedByTurn) as [turn, turnItems] (turn)}
-              <div class="turn-group">
+              {@const isSub = turn.includes('-sub-')}
+              <div class="turn-group" class:turn-sub={isSub}>
                 <div class="turn-header">
-                  <span class="turn-icon">▶</span>
-                  <span class="turn-name">{t('turn')} {turn.slice(0, 8)}</span>
+                  <span class="turn-icon">{isSub ? '↳' : '▶'}</span>
+                  <span class="turn-name">{isSub ? `${t('subagentTurn')} ${turn.slice(-6)}` : `${t('turn')} ${turn.slice(0, 8)}`}</span>
                   <span class="turn-count">{turnItems.length} {t('events')}</span>
                 </div>
                 <div class="turn-items">
@@ -4270,6 +4284,13 @@
     border-radius: 8px;
     overflow: hidden;
     transition: all 0.2s;
+  }
+
+  /* E-6: ветка суб-агента — с отступом и чертой слева, читается как
+     вложенность под родительским ходом. */
+  .turn-sub {
+    margin-left: 20px;
+    border-left: 2px solid var(--accent-dim);
   }
 
   .turn-group:nth-child(odd):hover {

@@ -62,6 +62,8 @@ impl ApprovalPolicy {
     /// внешняя команда не должна исполняться молча, поэтому при
     /// [`ApprovalPolicy::OnDangerous`] неизвестное имя считается опасным.
     /// E-2: `semantic_search` — встроенный и read-only, в опасные не входит.
+    /// E-6: `subagent` — встроенный: внутри суб-агента только read-only
+    /// инструменты, опасных операций ветка не выполняет.
     pub const BUILTIN: &'static [&'static str] = &[
         "read",
         "list",
@@ -73,6 +75,7 @@ impl ApprovalPolicy {
         "patch",
         "fetch_url",
         "semantic_search",
+        "subagent",
     ];
 
     /// Нужно ли подтверждение для этого вызова.
@@ -227,6 +230,9 @@ impl TurnReport {
                 TurnOutcome::Cancelled => Some("отменён пользователем".into()),
                 TurnOutcome::Failed => Some("ошибка хода".into()),
             },
+            // E-6: машина ведёт ходы верхнего уровня; дочерние записи
+            // суб-агентов драйвер строит сам с parent_turn_id.
+            parent_turn_id: None,
         }
     }
 }
@@ -563,6 +569,23 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                     "top_k": { "type": "integer", "description": "Max fragments to return, 1..50, default 8" }
                 },
                 "required": ["query"]
+            }),
+        },
+        /* E-6: суб-агент — изолированная ветка с собственным контекстом,
+           read-only инструментами и бюджетом токенов. Полный прогон
+           записывается дочерним ходом (parent_turn_id) и виден в
+           траектории сессии. Не рекурсивен: суб-агент не плодит своих. */
+        ToolSpec {
+            name: "subagent".into(),
+            description: "Run an isolated sub-agent for a self-contained research or analysis task. The sub-agent gets a fresh context (optionally seeded with the session summary), read-only tools only (read, list, grep, glob, fetch_url, semantic_search), its own token budget and round cap. Its full run is recorded as a child turn of the current turn, and its final report is returned here. Use for focused independent investigation that should not pollute the main context. It cannot modify files or spawn sub-agents of its own.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Self-contained task for the sub-agent (it sees no other context by default)" },
+                    "context": { "type": "boolean", "description": "Seed the sub-agent with the session summary (B-3), default false" },
+                    "max_rounds": { "type": "integer", "description": "Tool-round cap 1..12, default 6" }
+                },
+                "required": ["prompt"]
             }),
         },
     ]
@@ -1055,5 +1078,19 @@ mod tests {
         assert!(p.requires_approval("my_plugin_tool"));
         assert!(!p.requires_approval("fetch_url"));
         assert!(!p.requires_approval("MEMORY_APPEND"));
+    }
+
+    #[test]
+    fn subagent_is_builtin_and_safe() {
+        /* E-6: внутри ветки только read-only инструменты, поэтому сам
+           `subagent` не опасен и подтверждений не требует. */
+        assert!(!ApprovalPolicy::OnDangerous.requires_approval("subagent"));
+        let spec = builtin_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "subagent")
+            .expect("subagent есть в спеках");
+        assert!(spec.parameters.get("properties").is_some());
+        let required = spec.parameters["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "prompt"));
     }
 }
