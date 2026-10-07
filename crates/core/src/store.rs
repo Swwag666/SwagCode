@@ -117,10 +117,19 @@ CREATE TABLE IF NOT EXISTS tasks(
   created_ms INTEGER NOT NULL,
   updated_ms INTEGER NOT NULL
 );
+/* E-8: история телеметрии — точки (ts, имя, значение) минутного
+   сэмплера и латентности провайдеров. Автономная таблица без FK:
+   телеметрия обязана пережить удаление любой сессии. */
+CREATE TABLE IF NOT EXISTS metrics(
+  ts_ms INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  value REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(state, next_try_ms);
+CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts_ms);
 "#;
 
 /// Хранилище: синхронный контракт домена над персистентностью.
@@ -171,6 +180,16 @@ pub trait Store: Send {
     fn tasks_recover_running(&self) -> StoreResult<()>;
     /// E-5: гигиена — удалить старые done.
     fn tasks_prune(&self, before_ms: u64) -> StoreResult<()>;
+    /// E-8: точка телеметрии (сэмплер раз в минуту, латентность
+    /// провайдеров). Один INSERT — телеметрия не должна быть дорогой.
+    fn metrics_insert(&self, ts_ms: u64, name: &str, value: f64) -> StoreResult<()>;
+    /// E-8: выборка по имени с ts_ms, старее-к-новее, с пределом.
+    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>>;
+    /// E-8: гигиена — удалить точки старше срока.
+    fn metrics_prune(&self, before_ms: u64) -> StoreResult<()>;
+    /// E-8: токены/день — агрегация оценочных токенов ходов, день UTC:
+    /// (day_ms, tokens, turns). Ходы с нулевой оценкой не попадают.
+    fn tokens_by_day(&self, since_ms: u64) -> StoreResult<Vec<(u64, u64, u64)>>;
 }
 
 /// SQLite-реализация контракта [`Store`].
@@ -615,6 +634,50 @@ impl Store for SqliteStore {
         )?;
         Ok(())
     }
+
+    fn metrics_insert(&self, ts_ms: u64, name: &str, value: f64) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO metrics(ts_ms, name, value) VALUES(?1, ?2, ?3)",
+            params![ts_ms.min(i64::MAX as u64) as i64, name, value],
+        )?;
+        Ok(())
+    }
+
+    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, value FROM metrics WHERE name = ?1 AND ts_ms >= ?2 ORDER BY ts_ms LIMIT ?3",
+        )?;
+        let mapped = stmt.query_map(
+            params![name, since_ms.min(i64::MAX as u64) as i64, limit],
+            |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get::<_, f64>(1)?)),
+        )?;
+        Ok(mapped.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn metrics_prune(&self, before_ms: u64) -> StoreResult<()> {
+        let before = before_ms.min(i64::MAX as u64) as i64;
+        self.conn
+            .execute("DELETE FROM metrics WHERE ts_ms < ?1", params![before])?;
+        Ok(())
+    }
+
+    fn tokens_by_day(&self, since_ms: u64) -> StoreResult<Vec<(u64, u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT (started_ms / 86400000) * 86400000 AS day,
+                    SUM(est_in + est_out) AS tokens, COUNT(*) AS turns
+             FROM turns WHERE started_ms >= ?1 AND (est_in + est_out) > 0
+             GROUP BY day ORDER BY day",
+        )?;
+        let mapped = stmt.query_map(params![since_ms.min(i64::MAX as u64) as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?.max(0) as u64,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
+        Ok(mapped.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 /// E-5: колонки tasks — порядок общий для rusqlite и NodeStore.
@@ -771,6 +834,61 @@ mod tests {
         assert_eq!(
             loaded.turns[1].parent_turn_id.as_ref().map(|p| p.as_str()),
             Some("t-1")
+        );
+    }
+
+    #[test]
+    fn metrics_roundtrip_and_prune() {
+        // E-8: точки телеметрии — вставка, выборка по имени/периоду, prune.
+        let store = SqliteStore::in_memory().unwrap();
+        store.metrics_insert(1000, "lagging_events", 3.0).unwrap();
+        store.metrics_insert(60_000, "lagging_events", 5.0).unwrap();
+        store.metrics_insert(60_000, "sessions", 2.0).unwrap();
+        let q = store.metrics_query("lagging_events", 0, 100).unwrap();
+        assert_eq!(q, vec![(1000, 3.0), (60_000, 5.0)]);
+        let q = store.metrics_query("lagging_events", 59_000, 100).unwrap();
+        assert_eq!(q, vec![(60_000, 5.0)]);
+        // limit честно режет выборку.
+        let q = store.metrics_query("lagging_events", 0, 1).unwrap();
+        assert_eq!(q, vec![(1000, 3.0)]);
+        // prune удаляет старое и не трогает другие имена.
+        store.metrics_prune(59_000).unwrap();
+        assert_eq!(
+            store.metrics_query("lagging_events", 0, 100).unwrap(),
+            vec![(60_000, 5.0)]
+        );
+        assert_eq!(
+            store.metrics_query("sessions", 0, 100).unwrap(),
+            vec![(60_000, 2.0)]
+        );
+    }
+
+    #[test]
+    fn tokens_by_day_aggregates_utc_days() {
+        // E-8: токены/день из существующих колонок turns (est_in/est_out).
+        let store = SqliteStore::in_memory().unwrap();
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        // День 0 (UTC): два хода по 30 оценочных токенов.
+        store.save_turn("s-1", &sample_turn(1), &[]).unwrap();
+        let mut t2 = sample_turn(2);
+        t2.started_ms = 5000;
+        store.save_turn("s-1", &t2, &[]).unwrap();
+        // День 1 UTC: ход с токенами и «нулевой» ход (не попадает).
+        let mut t3 = sample_turn(3);
+        t3.started_ms = 86_400_000 + 7000;
+        store.save_turn("s-1", &t3, &[]).unwrap();
+        let mut t4 = sample_turn(4);
+        t4.started_ms = 86_400_000 + 8000;
+        t4.est_input_tokens = 0;
+        t4.est_output_tokens = 0;
+        store.save_turn("s-1", &t4, &[]).unwrap();
+
+        assert_eq!(store.tokens_by_day(0).unwrap(), vec![(0, 60, 2), (86_400_000, 30, 1)]);
+        // since_ms фильтрует дни.
+        assert_eq!(
+            store.tokens_by_day(86_400_000).unwrap(),
+            vec![(86_400_000, 30, 1)]
         );
     }
 

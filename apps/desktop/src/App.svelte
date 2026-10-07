@@ -22,6 +22,7 @@
   import logoGif from './assets/logo.gif'
   import { Transcript as TranscriptModel, type TranscriptItem } from './lib/transcript'
   import { translate, type StrKey } from './lib/strings'
+  import { polylinePoints, barHeights, counterDeltas, groupByName } from './lib/charts'
 
   interface BuildInfo {
     version: string
@@ -38,7 +39,7 @@
   let models = $state<string[]>([])
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
-  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security' | 'mcp'>('general')
+  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security' | 'mcp' | 'telemetry'>('general')
   let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
@@ -534,6 +535,43 @@
     }
   }
 
+  /* E-8: дашборд телеметрии — токены/день, латентность провайдера,
+     лаги шины и отложенный с E-5 список фоновых задач. Данные — из
+     таблицы metrics (сэмпл раз в минуту) и агрегации turns. */
+  interface MetricPoint { name: string; ts_ms: number; value: number }
+  interface SeriesPoint { ts_ms: number; value: number }
+  interface TokenDay { day_ms: number; tokens: number; turns: number }
+  interface TaskRow { id: string; kind: string; state: string; attempts: number; next_try_ms: number; last_error: string }
+  let telTokens = $state<TokenDay[]>([])
+  let telLatency = $state<SeriesPoint[]>([])
+  let telLagE = $state<SeriesPoint[]>([])
+  let telLagD = $state<SeriesPoint[]>([])
+  let telTasks = $state<TaskRow[]>([])
+
+  async function refreshTelemetry(): Promise<void> {
+    if (!tauriAvailable) return
+    const now = Date.now()
+    try {
+      const [tokens, metrics, tasks] = await Promise.all([
+        invoke<TokenDay[]>('tokens_by_day', { sinceMs: now - 30 * 86400000 }),
+        invoke<MetricPoint[]>('metrics_history', {
+          names: ['provider_latency_ms', 'lagging_events', 'lagging_dropped'],
+          sinceMs: now - 86400000,
+        }),
+        invoke<TaskRow[]>('tasks_list'),
+      ])
+      telTokens = tokens
+      const g = groupByName(metrics)
+      telLatency = g.get('provider_latency_ms') ?? []
+      // Счётчики лагов накопительные — график строим по минутным дельтам.
+      telLagE = counterDeltas(g.get('lagging_events') ?? [])
+      telLagD = counterDeltas(g.get('lagging_dropped') ?? [])
+      telTasks = tasks
+    } catch {
+      // старое ядро без телеметрии: графики остаются пустыми
+    }
+  }
+
   function flashStatus(msg: string): void {
     dpapiStatus = msg
     setTimeout(() => (dpapiStatus = null), 2500)
@@ -603,6 +641,7 @@
   /* Вкладка безопасности обновляет свои данные при открытии. */
   $effect(() => {
     if (showSettings && settingsTab === 'security') void refreshSecurity()
+    if (showSettings && settingsTab === 'telemetry') void refreshTelemetry()
   })
 
   async function copyWorkspace(path: string): Promise<void> {
@@ -1711,6 +1750,7 @@
           <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => { settingsTab = 'plugins'; void loadJsPlugins() }}><Icon name="plug" size={14} /> Plugins</button>
           <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'telemetry'} onclick={() => { settingsTab = 'telemetry'; void refreshTelemetry() }}><Icon name="scale" size={14} /> {t('telemetryTab')}</button>
         </nav>
         <div class="settings-content">
           {#if settingsTab === 'general'}
@@ -2053,6 +2093,70 @@
                   <div class="settings-label">
                     <span class="label-desc">{mcpNote}</span>
                   </div>
+                </div>
+              {/if}
+            </div>
+          {:else if settingsTab === 'telemetry'}
+            <div class="settings-section">
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('telemetryTokens')}</span>
+                </div>
+                <button class="appearance-btn" onclick={() => void refreshTelemetry()}>{t('telemetryRefresh')}</button>
+              </div>
+              {#if telTokens.length > 0}
+                {@const hs = barHeights(telTokens.map((d) => d.tokens), 56)}
+                <svg class="tel-chart" viewBox="0 0 {telTokens.length * 10} 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryTokens')}>
+                  {#each telTokens as d, i (d.day_ms)}
+                    <rect x={i * 10 + 1} y={58 - hs[i]} width="8" height={Math.max(hs[i], 1)} class="tel-bar" />
+                  {/each}
+                </svg>
+              {:else}
+                <div class="approval-empty">{t('telemetryEmpty')}</div>
+              {/if}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('telemetryLatency')}</span>
+                </div>
+              </div>
+              <svg class="tel-chart" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryLatency')}>
+                <polyline points={polylinePoints(telLatency.map((p) => p.value), 300, 56)} class="tel-line" />
+              </svg>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('telemetryLag')}</span>
+                </div>
+              </div>
+              <svg class="tel-chart" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryLag')}>
+                <polyline points={polylinePoints(telLagE.map((p) => p.value), 300, 56)} class="tel-line" />
+                <polyline points={polylinePoints(telLagD.map((p) => p.value), 300, 56)} class="tel-line tel-line2" />
+              </svg>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('telemetryTasks')}</span>
+                </div>
+              </div>
+              {#if telTasks.length === 0}
+                <div class="approval-empty">{t('telemetryEmpty')}</div>
+              {:else}
+                <div class="approval-scroll">
+                  <table class="approval-table">
+                    <thead>
+                      <tr><th>id</th><th>kind</th><th>{t('taskColState')}</th><th>{t('taskColAttempts')}</th><th>{t('taskColNext')}</th><th>{t('taskColLog')}</th></tr>
+                    </thead>
+                    <tbody>
+                      {#each telTasks as task (task.id)}
+                        <tr>
+                          <td>{task.id}</td>
+                          <td>{task.kind}</td>
+                          <td>{task.state}</td>
+                          <td>{task.attempts}</td>
+                          <td class="log-time">{task.next_try_ms ? new Date(task.next_try_ms).toLocaleString() : '—'}</td>
+                          <td class="tel-err">{task.last_error}</td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
                 </div>
               {/if}
             </div>
@@ -3795,6 +3899,38 @@
     padding: 4px 8px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     vertical-align: top;
+  }
+
+  /* E-8: графики телеметрии — компактный SVG без библиотек. */
+  .tel-chart {
+    width: 100%;
+    height: 60px;
+    margin: 4px 0 10px;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.07);
+  }
+
+  .tel-line {
+    fill: none;
+    stroke: var(--accent, #7aa2f7);
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .tel-line2 {
+    stroke: #e06c75;
+  }
+
+  .tel-bar {
+    fill: var(--accent, #7aa2f7);
+    opacity: 0.85;
+  }
+
+  .tel-err {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .log-time {

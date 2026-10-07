@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS tasks(
   updated_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(state, next_try_ms);
+CREATE TABLE IF NOT EXISTS metrics(
+  ts_ms INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);

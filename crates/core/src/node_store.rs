@@ -547,6 +547,64 @@ impl Store for NodeStore {
         )?;
         Ok(())
     }
+
+    fn metrics_insert(&self, ts_ms: u64, name: &str, value: f64) -> StoreResult<()> {
+        self.exec(
+            "INSERT INTO metrics(ts_ms, name, value) VALUES(?1, ?2, ?3)",
+            vec![
+                json!(ts_ms.min(i64::MAX as u64) as i64),
+                json!(name),
+                json!(value),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let rows = self.query(
+            "SELECT ts_ms, value FROM metrics WHERE name = ?1 AND ts_ms >= ?2 ORDER BY ts_ms LIMIT ?3",
+            vec![json!(name), json!(since_ms.min(i64::MAX as u64) as i64), json!(limit)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    v_int(col(r, 0)).max(0) as u64,
+                    col(r, 1).as_f64().unwrap_or(0.0),
+                )
+            })
+            .collect())
+    }
+
+    fn metrics_prune(&self, before_ms: u64) -> StoreResult<()> {
+        let before = before_ms.min(i64::MAX as u64) as i64;
+        self.exec(
+            "DELETE FROM metrics WHERE ts_ms < ?1",
+            vec![json!(before)],
+        )?;
+        Ok(())
+    }
+
+    fn tokens_by_day(&self, since_ms: u64) -> StoreResult<Vec<(u64, u64, u64)>> {
+        let rows = self.query(
+            "SELECT (started_ms / 86400000) * 86400000 AS day,
+                    SUM(est_in + est_out) AS tokens, COUNT(*) AS turns
+             FROM turns WHERE started_ms >= ?1 AND (est_in + est_out) > 0
+             GROUP BY day ORDER BY day",
+            vec![json!(since_ms.min(i64::MAX as u64) as i64)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    v_int(col(r, 0)).max(0) as u64,
+                    v_int(col(r, 1)).max(0) as u64,
+                    v_int(col(r, 2)).max(0) as u64,
+                )
+            })
+            .collect())
+    }
 }
 
 /// E-5: строка tasks из sidecar-ответа — порядок колонок TASK_COLS.
@@ -708,6 +766,48 @@ mod tests {
         assert_eq!(cleared.approval_policy, None);
 
         assert!(store.load_session("нет-такой").unwrap().is_none());
+    }
+
+    #[test]
+    fn node_metrics_and_tokens_parity() {
+        // E-8: метрики и токены/день через sidecar — паритет с rusqlite.
+        let Some(store) = try_memory() else { return };
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn("s-1", &sample_turn(1), &ses.history)
+            .unwrap();
+        let mut t3 = sample_turn(3);
+        t3.started_ms = 86_400_000 + 7000;
+        store.save_turn("s-1", &t3, &ses.history).unwrap();
+        let mut t4 = sample_turn(4);
+        t4.started_ms = 86_400_000 + 8000;
+        t4.est_input_tokens = 0;
+        t4.est_output_tokens = 0;
+        store.save_turn("s-1", &t4, &ses.history).unwrap();
+
+        store.metrics_insert(1000, "bus_seq", 42.0).unwrap();
+        store.metrics_insert(60_000, "bus_seq", 43.0).unwrap();
+        store.metrics_insert(60_000, "sessions", 1.0).unwrap();
+        let q = store.metrics_query("bus_seq", 0, 100).unwrap();
+        assert_eq!(q, vec![(1000, 42.0), (60_000, 43.0)]);
+        let q = store.metrics_query("bus_seq", 59_000, 1).unwrap();
+        assert_eq!(q, vec![(60_000, 43.0)]);
+        store.metrics_prune(59_000).unwrap();
+        assert_eq!(
+            store.metrics_query("bus_seq", 0, 100).unwrap(),
+            vec![(60_000, 43.0)]
+        );
+        assert_eq!(store.metrics_query("sessions", 0, 100).unwrap(), vec![(60_000, 1.0)]);
+
+        assert_eq!(
+            store.tokens_by_day(0).unwrap(),
+            vec![(0, 30, 1), (86_400_000, 30, 1)]
+        );
+        assert_eq!(
+            store.tokens_by_day(86_400_000).unwrap(),
+            vec![(86_400_000, 30, 1)]
+        );
     }
 
     #[test]

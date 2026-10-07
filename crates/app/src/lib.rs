@@ -1204,6 +1204,7 @@ pub(crate) async fn start_turn_core(
                         max_tokens: None,
                         tools: tool_wire.clone(),
                     };
+                    let stream_started = std::time::Instant::now();
                     let (mut rx, handle) = match provider.stream(request) {
                         Ok(pair) => pair,
                         Err(e) => {
@@ -1220,11 +1221,26 @@ pub(crate) async fn start_turn_core(
                     };
                     let mut acc = swagcod_core::turn::StreamAccumulator::default();
                     let mut stopped = false;
+                    let mut latency_recorded = false;
                     let mut stream_error: Option<String> = None;
                     while let Some(event) = rx.recv().await {
                         // B-8: токен — событие. Долгая генерация reasoning не
                         // должна выглядеть для watchdog как зависание.
                         touch_turn(&app_state, &turn, None);
+                        /* E-8: латентность провайдера — время до первого
+                           события стрима. Одна точка на запрос, fire-and-
+                           forget: телеметрия не должна ломать ход. */
+                        if !latency_recorded {
+                            latency_recorded = true;
+                            let ms = stream_started.elapsed().as_secs_f64() * 1000.0;
+                            if let Ok(g) = app_state.store.lock() {
+                                let _ = g.metrics_insert(
+                                    swagcod_core::bus::now_ms(),
+                                    "provider_latency_ms",
+                                    ms,
+                                );
+                            }
+                        }
                         if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
                             stopped = true;
                             handle.abort();
@@ -2989,6 +3005,45 @@ async fn http_api_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::
     }))
 }
 
+/// E-8: история телеметрии для графиков — выборки по именам с since_ms,
+/// одним списком {name, ts_ms, value}. Предел 5000 точек на имя.
+#[tauri::command]
+async fn metrics_history(
+    state: State<'_, Arc<AppState>>,
+    names: Vec<String>,
+    since_ms: u64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    let Ok(g) = state.store.lock() else {
+        return Err("store недоступен".into());
+    };
+    for name in names.iter().take(10) {
+        if let Ok(rows) = g.metrics_query(name, since_ms, 5_000) {
+            for (ts_ms, value) in rows {
+                out.push(serde_json::json!({ "name": name, "ts_ms": ts_ms, "value": value }));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// E-8: токены/день (UTC) — агрегация оценочных токенов ходов, которые
+/// машина хода и так пишет в turns (est_in/est_out).
+#[tauri::command]
+async fn tokens_by_day(
+    state: State<'_, Arc<AppState>>,
+    since_ms: u64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let g = state.store.lock().map_err(|e| e.to_string())?;
+    let rows = g.tokens_by_day(since_ms).map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|(day_ms, tokens, turns)| {
+            serde_json::json!({ "day_ms": day_ms, "tokens": tokens, "turns": turns })
+        })
+        .collect())
+}
+
 /* E-7: ядро диагностики — общее для IPC и loopback REST. */
 pub(crate) fn get_diagnostics_core(state: &AppState) -> serde_json::Value {
     let now = swagcod_core::bus::now_ms();
@@ -3480,6 +3535,60 @@ async fn run_due_tasks(state: &Arc<AppState>) {
     }
 }
 
+/* E-8: сэмплер телеметрии — точка раз в минуту, хранение 30 дней.
+   Стоимость прохода: несколько атомарных чтений и по одному INSERT на
+   метрику; prune — индексированный DELETE, обычно по нулю строк. */
+pub const METRICS_SAMPLE_MS: u64 = 60_000;
+pub const METRICS_RETENTION_MS: u64 = 30 * 24 * 3_600_000;
+
+/// Срез текущих счётчиков — чистая функция, тестируется без таймеров.
+pub fn sample_metrics(state: &AppState) -> Vec<(&'static str, f64)> {
+    let mut rows: Vec<(&'static str, f64)> = vec![
+        (
+            "lagging_events",
+            state.lagging_events.load(std::sync::atomic::Ordering::Relaxed) as f64,
+        ),
+        (
+            "lagging_dropped",
+            state.lagging_dropped.load(std::sync::atomic::Ordering::Relaxed) as f64,
+        ),
+        ("bus_seq", state.bus.seq() as f64),
+        ("bus_subscribers", state.bus.subscriber_count() as f64),
+        (
+            "sessions",
+            state.sessions.try_lock().map(|s| s.len()).unwrap_or(0) as f64,
+        ),
+    ];
+    if let Ok(activity) = state.turn_activity.lock() {
+        rows.push(("active_turns", activity.len() as f64));
+        rows.push((
+            "waiting_human",
+            activity.values().filter(|a| a.waiting_human).count() as f64,
+        ));
+    }
+    rows
+}
+
+/// Один проход сэмплера: срез → база + гигиена. Отдельно от цикла —
+/// для тестов (как run_due_tasks у задач E-5).
+pub fn run_metrics_sample(state: &AppState) {
+    let now = swagcod_core::bus::now_ms();
+    let rows = sample_metrics(state);
+    let Ok(g) = state.store.lock() else { return };
+    for (name, value) in rows {
+        let _ = g.metrics_insert(now, name, value);
+    }
+    let _ = g.metrics_prune(now.saturating_sub(METRICS_RETENTION_MS));
+}
+
+async fn metrics_worker(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(METRICS_SAMPLE_MS));
+    loop {
+        ticker.tick().await;
+        run_metrics_sample(&state);
+    }
+}
+
 /// Обработчики задач по kind. Ok — сообщение журнала исполнения,
 /// Err — причина для ретрая с backoff.
 async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, String> {
@@ -3725,6 +3834,12 @@ pub fn run() {
                 let st = state.clone();
                 tauri::async_runtime::spawn(tasks_worker(st));
             }
+            /* E-8: сэмплер телеметрии — точка раз в минуту с первого тика
+               (interval стартует сразу), хранение 30 дней. */
+            {
+                let st = state.clone();
+                tauri::async_runtime::spawn(metrics_worker(st));
+            }
             /* E-7: loopback REST API стартует, только если порт явно задан
                (env SWAGCOD_HTTP_PORT или prefs http_api_port). По
                умолчанию API выключен — поверхности нет. */
@@ -3792,6 +3907,8 @@ pub fn run() {
             clear_protected_key,
             get_diagnostics,
             http_api_status,
+            metrics_history,
+            tokens_by_day,
             bus_seq,
             start_turn,
             stop_turn,
@@ -4239,6 +4356,46 @@ mod tests {
         assert_eq!(quiet_turns_to_warn(&exactly, now, QUIET_TURN_MS, QUIET_REWARN_MS).len(), 1);
         let just_under = vec![("t".to_string(), now - QUIET_TURN_MS + 1, false, None)];
         assert!(quiet_turns_to_warn(&just_under, now, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
+    }
+
+    // ---- E-8: сэмплер телеметрии ----
+
+    #[test]
+    fn metrics_sample_snapshots_counters_into_store() {
+        let state = AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        };
+        state.lagging_events.store(7, std::sync::atomic::Ordering::Relaxed);
+        state.lagging_dropped.store(2, std::sync::atomic::Ordering::Relaxed);
+        state.turn_activity.lock().unwrap().insert(
+            "t-wait".into(),
+            TurnActivity {
+                session: "s1".into(),
+                started_ms: 0,
+                last_ms: 0,
+                waiting_human: true,
+                warned_ms: None,
+            },
+        );
+        let rows = sample_metrics(&state);
+        let get = |n: &str| rows.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
+        assert_eq!(get("lagging_events"), Some(7.0));
+        assert_eq!(get("lagging_dropped"), Some(2.0));
+        assert_eq!(get("active_turns"), Some(1.0));
+        assert_eq!(get("waiting_human"), Some(1.0));
+        assert_eq!(get("sessions"), Some(0.0));
+        assert!(get("bus_seq").is_some());
+        assert!(get("bus_subscribers").is_some());
+
+        // Проход сэмплера кладёт точки в базу тем же значением.
+        run_metrics_sample(&state);
+        let g = state.store.lock().unwrap();
+        let q = g.metrics_query("lagging_events", 0, 10).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].1, 7.0);
+        assert_eq!(g.metrics_query("waiting_human", 0, 10).unwrap().len(), 1);
+        assert_eq!(g.metrics_query("bus_seq", 0, 10).unwrap().len(), 1);
     }
 
     #[test]
