@@ -19,6 +19,7 @@ pub mod stdio_rpc;
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId};
+use swagcod_core::tasks::{task_backoff_ms, Task, TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_QUEUED};
 use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
@@ -501,10 +502,12 @@ async fn delete_background(name: String) -> Result<(), String> {
 /// reasoning и content остаются отдельными строками (находка 1, §5.6).
 /// Пользовательские реплики и выводы тулзов берём из wire-истории сессии —
 /// в журнале ходов их нет.
-#[tauri::command]
-async fn session_transcript(
-    state: State<'_, Arc<AppState>>,
-    session_id: String,
+/// События сессии в wire-формате B-8 (D-121: ленивая история — перед
+/// экспортом сессия догружается). Потребители: команда session_transcript
+/// и задача E-5 journal_export.
+async fn transcript_events(
+    state: &AppState,
+    session_id: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
     use serde_json::{json, Value};
     use swagcod_provider::types::Role;
@@ -515,7 +518,7 @@ async fn session_transcript(
         .find(|s| s.id.as_str() == session_id)
         .ok_or_else(|| format!("сессия {session_id} не найдена"))?;
     // D-121: транскрипт — один из двух потребителей полной сессии.
-    rehydrate_session(&state, session);
+    rehydrate_session(state, session);
 
     let mut user_texts: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut tool_outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -580,6 +583,15 @@ async fn session_transcript(
         }));
     }
     Ok(out)
+}
+
+/// Журнал сессии в формате B-8.
+#[tauri::command]
+async fn session_transcript(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    transcript_events(&state, &session_id).await
 }
 
 /// Журнал сессии в файл, выбранный в нативном диалоге: JSONL wire-событий
@@ -3001,6 +3013,211 @@ async fn js_plugins_reload(state: State<'_, Arc<AppState>>) -> Result<serde_json
     js_plugins_list(state).await
 }
 
+/* ===================== E-5: tasks + воркер ===================== */
+
+/// Период опроса воркера (override SWAGCOD_TASKS_POLL_MS, 1..3600 с).
+pub const TASKS_POLL_MS: u64 = 15_000;
+/// Попыток до терминального failed (backoff B-6: 30 с → 30 мин).
+pub const TASKS_MAX_ATTEMPTS: u32 = 5;
+/// Таймаут сетевой операции git fetch.
+const GIT_FETCH_TIMEOUT_SECS: u64 = 120;
+
+fn tasks_poll_ms() -> u64 {
+    std::env::var("SWAGCOD_TASKS_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(1_000, 3_600_000))
+        .unwrap_or(TASKS_POLL_MS)
+}
+
+/// E-5: воркер фоновых задач — живёт как насос watchdog: тикает, забирает
+/// задачи с наступившим сроком, фиксирует исход с backoff.
+async fn tasks_worker(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tasks_poll_ms()));
+    loop {
+        ticker.tick().await;
+        run_due_tasks(&state).await;
+    }
+}
+
+/// Один проход воркера: claim + обработка. Отдельно от цикла — для тестов.
+async fn run_due_tasks(state: &Arc<AppState>) {
+    let claimed = match state.store.lock() {
+        Ok(g) => g.task_claim_due(swagcod_core::bus::now_ms()),
+        Err(e) => {
+            eprintln!("tasks: store: {e}");
+            return;
+        }
+    };
+    let due = match claimed {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tasks: claim: {e}");
+            return;
+        }
+    };
+    for task in due {
+        let outcome = run_task_handler(state, &task).await;
+        let (next_state, msg, attempts, next_try) = match outcome {
+            Ok(m) => match task.every_ms {
+                // Периодическая задача перевооружается, разовая — done.
+                Some(every) => (TASK_QUEUED, m, 0, swagcod_core::bus::now_ms() + every),
+                None => (TASK_DONE, m, 0, 0),
+            },
+            Err(e) => {
+                // attempts уже посчитаны claim'ом: backoff по текущему числу.
+                if task.attempts >= TASKS_MAX_ATTEMPTS {
+                    (TASK_FAILED, e, task.attempts, 0)
+                } else {
+                    let delay = task_backoff_ms(task.attempts);
+                    (TASK_QUEUED, e, task.attempts, swagcod_core::bus::now_ms() + delay)
+                }
+            }
+        };
+        let res = match state.store.lock() {
+            Ok(g) => g.task_update(&task.id, next_state, &msg, attempts, next_try),
+            Err(e) => {
+                eprintln!("tasks: store: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = res {
+            eprintln!("tasks: finish {}: {e}", task.id);
+        }
+    }
+}
+
+/// Обработчики задач по kind. Ok — сообщение журнала исполнения,
+/// Err — причина для ретрая с backoff.
+async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, String> {
+    match task.kind.as_str() {
+        "semantic_reindex" => {
+            // Без cwd в payload цель динамическая: воркспейс свежайшей
+            // сессии (периодическая задача не прибивается к устаревшему пути).
+            let cwd = task
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let cwd = match cwd {
+                Some(c) if !c.trim().is_empty() => c,
+                _ => {
+                    let sessions = state.sessions.lock().await;
+                    sessions
+                        .iter()
+                        .max_by_key(|s| s.created_ms)
+                        .map(|s| s.cwd.clone())
+                        .unwrap_or_default()
+                }
+            };
+            if cwd.trim().is_empty() {
+                return Ok("нет воркспейса — пропуск".into());
+            }
+            if spawn_semantic_index(state.clone(), std::path::PathBuf::from(&cwd), true) {
+                Ok(format!("переиндексация запущена: {cwd}"))
+            } else {
+                Ok("индексация уже идёт — пропуск".into())
+            }
+        }
+        "git_fetch" => {
+            let cwd = task.payload.get("cwd").and_then(|v| v.as_str()).unwrap_or_default();
+            if cwd.trim().is_empty() {
+                return Err("git_fetch: в payload нет cwd".into());
+            }
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.arg("fetch").arg("--quiet").current_dir(cwd);
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000);
+            let out = tokio::time::timeout(
+                std::time::Duration::from_secs(GIT_FETCH_TIMEOUT_SECS),
+                cmd.output(),
+            )
+            .await
+            .map_err(|_| format!("git_fetch: таймаут {GIT_FETCH_TIMEOUT_SECS} с"))?
+            .map_err(|e| format!("git_fetch: {e}"))?;
+            if out.status.success() {
+                Ok(format!("git fetch: ok ({cwd})"))
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(format!("git fetch: {}", stderr.trim()))
+            }
+        }
+        "journal_export" => {
+            let sid = task
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let path = task.payload.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            if sid.is_empty() || path.trim().is_empty() {
+                return Err("journal_export: в payload нужны session_id и path".into());
+            }
+            // Тот же whitelist расширений, что у ручного экспорта:
+            // задача — не обход защиты.
+            let lower = path.to_ascii_lowercase();
+            if !(lower.ends_with(".jsonl") || lower.ends_with(".json") || lower.ends_with(".txt")) {
+                return Err("journal_export: разрешены только .jsonl/.json/.txt".into());
+            }
+            let events = transcript_events(state, sid).await?;
+            let body: String = events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+            tokio::fs::write(path, body)
+                .await
+                .map_err(|e| format!("journal_export: {e}"))?;
+            Ok(format!("journal_export: {} событий → {path}", events.len()))
+        }
+        other => Err(format!("неизвестный вид задачи: {other}")),
+    }
+}
+
+/// E-5: список задач для UI/диагностики (журнал исполнения — last_error).
+#[tauri::command]
+async fn tasks_list(state: State<'_, Arc<AppState>>) -> Result<Vec<Task>, String> {
+    let guard = state.store.lock().map_err(|e| e.to_string())?;
+    guard.tasks_list(200).map_err(|e| e.to_string())
+}
+
+/// E-5: отмена задачи, которая ещё не стартовала. Выполняющуюся отменить
+/// нельзя: обработчик владеет процессом/IO — честное прерывание не имитируем.
+#[tauri::command]
+async fn task_cancel(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+    let guard = state.store.lock().map_err(|e| e.to_string())?;
+    let t = guard
+        .task_get(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "нет такой задачи".to_string())?;
+    if t.state != TASK_QUEUED {
+        return Err(format!("нельзя отменить: задача в состоянии {}", t.state));
+    }
+    guard
+        .task_update(&id, TASK_CANCELLED, "отменена пользователем", t.attempts, 0)
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// E-5: ручная постановка задачи. Виды — whitelist: неизвестный вид
+/// отклоняется сразу, а не после круга воркера.
+#[tauri::command]
+async fn task_add(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    payload: serde_json::Value,
+    every_ms: Option<u64>,
+) -> Result<Task, String> {
+    const ALLOWED: &[&str] = &["semantic_reindex", "git_fetch", "journal_export"];
+    if !ALLOWED.contains(&kind.as_str()) {
+        return Err(format!("неизвестный вид задачи: {kind}"));
+    }
+    let now = swagcod_core::bus::now_ms();
+    let id = format!("{kind}-{}", short_id());
+    let t = match every_ms.filter(|v| *v >= 60_000) {
+        Some(every) => Task::periodic(id, kind.as_str(), payload, every, now),
+        None => Task::new(id, kind.as_str(), payload, now),
+    };
+    let guard = state.store.lock().map_err(|e| e.to_string())?;
+    guard.task_enqueue(&t).map_err(|e| e.to_string())?;
+    Ok(t)
+}
+
 pub fn run() {
     /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
        панику инициализации. Лог — на диске, телеметрии нет. */
@@ -3091,6 +3308,30 @@ pub fn run() {
                     start_js_plugins(&st).await;
                 });
             }
+            /* E-5: tasks — восстановить сирот после краша (running →
+               queued), вычистить старые done, сидировать периодическую
+               переиндексацию (первый старт через сутки: стартовую
+               индексацию уже делает триггер E-2). Сид идемпотентен:
+               INSERT OR IGNORE, отменённая задача не воскрешается. */
+            {
+                if let Ok(g) = state.store.lock() {
+                    let _ = g.tasks_recover_running();
+                    let _ = g.tasks_prune(
+                        swagcod_core::bus::now_ms().saturating_sub(7 * 24 * 3_600_000),
+                    );
+                    let _ = g.task_enqueue(&Task::periodic(
+                        "semantic-reindex",
+                        "semantic_reindex",
+                        serde_json::json!({}),
+                        24 * 3_600_000,
+                        swagcod_core::bus::now_ms(),
+                    ));
+                }
+            }
+            {
+                let st = state.clone();
+                tauri::async_runtime::spawn(tasks_worker(st));
+            }
             app.manage(state.clone());
 
             let handle = app.handle().clone();
@@ -3116,6 +3357,9 @@ pub fn run() {
             mcp_remove,
             js_plugins_list,
             js_plugins_reload,
+            tasks_list,
+            task_cancel,
+            task_add,
             initial_prefs,
             save_background,
             load_background,
@@ -3744,6 +3988,117 @@ rl.on('line', (l) => {
         assert!(out.output.contains("не подключён"), "{}", out.output);
 
         state.mcp.lock().await.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tasks_worker_runs_handlers_with_backoff() {
+        use swagcod_core::session::{TurnId, TurnRecord};
+
+        // open_memory: sidecar при доступном node (SQL-паритет обоих
+        // бэкендов проверяется одним тестом), иначе rusqlite.
+        let state = Arc::new(AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        });
+
+        let dir = std::env::temp_dir().join(format!("swagcod-tasks-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        /* Живая сессия для journal_export: задача покрывает rehydrate-путь
+           и запись wire-журнала B-8. */
+        let sid = "task-sess";
+        let mut s = Session::new(
+            SessionId::new(sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        s.turns.push(TurnRecord {
+            id: TurnId::new("t-1"),
+            started_ms: 100,
+            ended_ms: Some(200),
+            content: "готово".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            est_input_tokens: 1,
+            est_output_tokens: 2,
+            ok: true,
+            failure: None,
+        });
+        let out_path = dir.join("journal.jsonl");
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+            g.save_turn(sid, &s.turns[0], &s.history).unwrap();
+            g.task_enqueue(&Task::new("t-unknown", "no_such_kind", serde_json::json!({}), 0))
+                .unwrap();
+            g.task_enqueue(&Task::new(
+                "t-export",
+                "journal_export",
+                serde_json::json!({"session_id": sid, "path": out_path.to_string_lossy()}),
+                0,
+            ))
+            .unwrap();
+            g.task_enqueue(&Task::new(
+                "t-git",
+                "git_fetch",
+                serde_json::json!({"cwd": dir.join("no-git").to_string_lossy()}),
+                0,
+            ))
+            .unwrap();
+        }
+        state.sessions.lock().await.push(s);
+
+        run_due_tasks(&state).await;
+
+        {
+            let g = state.store.lock().unwrap();
+
+            // Успех: журнал записан, задача done, сообщение в last_error.
+            let export = g.task_get("t-export").unwrap().unwrap();
+            assert_eq!(export.state, TASK_DONE, "{export:?}");
+            assert!(export.last_error.contains("событий"), "{:?}", export.last_error);
+            let body = std::fs::read_to_string(&out_path).unwrap();
+            assert!(
+                body.contains(sid) && body.contains("turn_started"),
+                "журнал записан"
+            );
+
+            // Неизвестный вид: первая ошибка — backoff-ретрай, не терминал.
+            let unknown = g.task_get("t-unknown").unwrap().unwrap();
+            assert_eq!(unknown.state, TASK_QUEUED);
+            assert_eq!(unknown.attempts, 1);
+            assert!(unknown.last_error.contains("неизвестный вид"), "{unknown:?}");
+            assert!(unknown.next_try_ms > 0, "следующая попытка назначена");
+
+            // git_fetch на каталоге без репозитория — честная ошибка.
+            let git = g.task_get("t-git").unwrap().unwrap();
+            assert_eq!(git.state, TASK_QUEUED);
+            assert_eq!(git.attempts, 1);
+            assert!(git.last_error.contains("git_fetch"), "{git:?}");
+        }
+
+        // Исчерпание попыток → терминальный failed.
+        for _ in 1..TASKS_MAX_ATTEMPTS {
+            {
+                let g = state.store.lock().unwrap();
+                let t = g.task_get("t-unknown").unwrap().unwrap();
+                g.task_update("t-unknown", TASK_QUEUED, &t.last_error, t.attempts, 0)
+                    .unwrap();
+            }
+            run_due_tasks(&state).await;
+        }
+        {
+            let g = state.store.lock().unwrap();
+            let t = g.task_get("t-unknown").unwrap().unwrap();
+            assert_eq!(
+                t.state,
+                TASK_FAILED,
+                "терминал после {TASKS_MAX_ATTEMPTS} попыток: {t:?}"
+            );
+            assert!(t.attempts >= TASKS_MAX_ATTEMPTS);
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

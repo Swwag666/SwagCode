@@ -107,6 +107,22 @@ Node теперь и так живёт рядом с приложением — 
 
 ## E-5: Фоновые задачи и планировщик
 
+> ЗАКРЫТ (ревизия 32): таблица `tasks(id, kind, payload, state,
+> attempts, next_try_ms, last_error, every_ms + метки времени)` в обоих
+> бэкендах стора (SQL один — паритет rusqlite/NodeStore покрыт тестом
+> через open_memory). Воркер в app-слое: опрос 15 с
+> (SWAGCOD_TASKS_POLL_MS), claim со счётчиком попыток и guard'ом
+> state='queued', ретраи по механике B-6 (экспонента 30 с → 30 мин,
+> после 5 попыток терминальный failed), журнал исполнения — last_error.
+> Краш-восстановление при старте: running → queued, prune done старше
+> 7 дней. Периодические задачи (every_ms) перевооружаются после успеха —
+> сид `semantic-reindex` (24 ч, цель — воркспейс свежайшей сессии,
+> идемпотентный INSERT OR IGNORE). Обработчики: semantic_reindex (force
+> E-2), git_fetch (таймаут 120 с, без автосида), journal_export (wire
+> B-8, whitelist расширений как у ручного экспорта). Команды
+> tasks_list/task_cancel/task_add (whitelist видов); UI — вместе с
+> дашбордом E-8.
+
 - Таблица `tasks(id, kind, payload, state, attempts, next_try_ms)` +
   воркер в ядре: ретраи с backoff (механика B-6 переиспользуется),
   отмена, журнал прогонов.

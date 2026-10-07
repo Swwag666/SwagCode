@@ -104,9 +104,22 @@ CREATE TABLE IF NOT EXISTS approvals(
   actor TEXT NOT NULL DEFAULT 'user',
   decided_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tasks(
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_try_ms INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  every_ms INTEGER,
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);
+CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(state, next_try_ms);
 "#;
 
 /// Хранилище: синхронный контракт домена над персистентностью.
@@ -134,6 +147,29 @@ pub trait Store: Send {
     /// B-7: журнал подтверждений.
     fn log_approval(&self, e: &ApprovalEntry) -> StoreResult<()>;
     fn approval_log(&self, session_id: Option<&str>, limit: usize) -> StoreResult<Vec<ApprovalEntry>>;
+    /// E-5: очередь фоновых задач. id — ключ дедупликации (INSERT OR
+    /// IGNORE): сид периодической задачи идемпотентен, отмена не
+    /// воскрешается повторным сидом.
+    fn task_enqueue(&self, t: &crate::tasks::Task) -> StoreResult<()>;
+    /// E-5: забрать задачи с наступившим сроком (queued, next_try_ms <=
+    /// now): перевод в running со счётчиком попыток и возврат списка.
+    fn task_claim_due(&self, now_ms: u64) -> StoreResult<Vec<crate::tasks::Task>>;
+    fn task_get(&self, id: &str) -> StoreResult<Option<crate::tasks::Task>>;
+    /// E-5: исход задачи — состояние, сообщение журнала (last_error),
+    /// попытки и следующий срок. updated_ms ставит база (strftime).
+    fn task_update(
+        &self,
+        id: &str,
+        state: &str,
+        message: &str,
+        attempts: u32,
+        next_try_ms: u64,
+    ) -> StoreResult<()>;
+    fn tasks_list(&self, limit: usize) -> StoreResult<Vec<crate::tasks::Task>>;
+    /// E-5: сироты после краша — вернуть running в очередь.
+    fn tasks_recover_running(&self) -> StoreResult<()>;
+    /// E-5: гигиена — удалить старые done.
+    fn tasks_prune(&self, before_ms: u64) -> StoreResult<()>;
 }
 
 /// SQLite-реализация контракта [`Store`].
@@ -480,6 +516,122 @@ impl Store for SqliteStore {
         };
         Ok(rows)
     }
+
+    fn task_enqueue(&self, t: &crate::tasks::Task) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tasks(id, kind, payload, state, attempts, next_try_ms, last_error, every_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, '', ?5, ?6, ?6)",
+            params![
+                t.id,
+                t.kind,
+                t.payload.to_string(),
+                t.next_try_ms as i64,
+                t.every_ms.map(|v| v as i64),
+                t.created_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn task_claim_due(&self, now_ms: u64) -> StoreResult<Vec<crate::tasks::Task>> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM tasks WHERE state = 'queued' AND next_try_ms <= ?1 ORDER BY next_try_ms, id LIMIT 8",
+            )?;
+            let mapped = stmt.query_map(params![now_ms as i64], |r| r.get::<_, String>(0))?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            // Guard state='queued': единственный воркер, но защита от
+            // двойного claim дешевле расследования.
+            self.conn.execute(
+                "UPDATE tasks SET state = 'running', attempts = attempts + 1,
+                 updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+                 WHERE id = ?1 AND state = 'queued'",
+                params![id],
+            )?;
+            if let Some(t) = self.task_get(&id)? {
+                if t.state == crate::tasks::TASK_RUNNING {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn task_get(&self, id: &str) -> StoreResult<Option<crate::tasks::Task>> {
+        let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut mapped = stmt.query_map(params![id], task_from_row)?;
+        Ok(mapped.next().transpose()?)
+    }
+
+    fn task_update(
+        &self,
+        id: &str,
+        state: &str,
+        message: &str,
+        attempts: u32,
+        next_try_ms: u64,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE tasks SET state = ?2, last_error = ?3, attempts = ?4, next_try_ms = ?5,
+             updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+             WHERE id = ?1",
+            params![id, state, message, attempts as i64, next_try_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    fn tasks_list(&self, limit: usize) -> StoreResult<Vec<crate::tasks::Task>> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let sql = format!("SELECT {TASK_COLS} FROM tasks ORDER BY created_ms DESC, id DESC LIMIT ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mapped = stmt.query_map(params![limit], task_from_row)?;
+        Ok(mapped.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn tasks_recover_running(&self) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE tasks SET state = 'queued', next_try_ms = 0,
+             updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+             WHERE state = 'running'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn tasks_prune(&self, before_ms: u64) -> StoreResult<()> {
+        // u64::MAX as i64 дал бы -1: зажимаем до i64::MAX («удалить всё»).
+        let before = before_ms.min(i64::MAX as u64) as i64;
+        self.conn.execute(
+            "DELETE FROM tasks WHERE state = 'done' AND updated_ms < ?1",
+            params![before],
+        )?;
+        Ok(())
+    }
+}
+
+/// E-5: колонки tasks — порядок общий для rusqlite и NodeStore.
+pub(crate) const TASK_COLS: &str =
+    "id, kind, payload, state, attempts, next_try_ms, last_error, every_ms, created_ms, updated_ms";
+
+fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tasks::Task> {
+    let payload: String = r.get(2)?;
+    let every: Option<i64> = r.get(7)?;
+    Ok(crate::tasks::Task {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        payload: serde_json::from_str(&payload).unwrap_or_else(|_| serde_json::json!({})),
+        state: r.get(3)?,
+        attempts: r.get::<_, i64>(4)?.max(0) as u32,
+        next_try_ms: r.get::<_, i64>(5)?.max(0) as u64,
+        last_error: r.get(6)?,
+        every_ms: every.map(|v| v.max(0) as u64),
+        created_ms: r.get::<_, i64>(8)?.max(0) as u64,
+        updated_ms: r.get::<_, i64>(9)?.max(0) as u64,
+    })
 }
 
 /// Ходы и сообщения сессии из базы в живую структуру.

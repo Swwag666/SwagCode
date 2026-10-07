@@ -17,6 +17,7 @@ pub mod node_store;
 pub mod semantic;
 pub mod session;
 pub mod store;
+pub mod tasks;
 pub mod turn;
 
 pub use bus::{Bus, BusError, Event, EventKind};

@@ -447,6 +447,121 @@ impl Store for NodeStore {
             })
             .collect())
     }
+
+    fn task_enqueue(&self, t: &crate::tasks::Task) -> StoreResult<()> {
+        self.exec(
+            "INSERT OR IGNORE INTO tasks(id, kind, payload, state, attempts, next_try_ms, last_error, every_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, '', ?5, ?6, ?6)",
+            vec![
+                json!(t.id),
+                json!(t.kind),
+                json!(t.payload.to_string()),
+                json!(t.next_try_ms as i64),
+                t.every_ms.map(|v| json!(v as i64)).unwrap_or(Value::Null),
+                json!(t.created_ms as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn task_claim_due(&self, now_ms: u64) -> StoreResult<Vec<crate::tasks::Task>> {
+        let rows = self.query(
+            "SELECT id FROM tasks WHERE state = 'queued' AND next_try_ms <= ?1 ORDER BY next_try_ms, id LIMIT 8",
+            vec![json!(now_ms as i64)],
+        )?;
+        let ids: Vec<String> = rows.iter().map(|r| v_text(col(r, 0))).collect();
+        let mut out = Vec::new();
+        for id in ids {
+            // Guard state='queued': защита от двойного claim.
+            self.exec(
+                "UPDATE tasks SET state = 'running', attempts = attempts + 1,
+                 updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+                 WHERE id = ?1 AND state = 'queued'",
+                vec![json!(id)],
+            )?;
+            if let Some(t) = self.task_get(&id)? {
+                if t.state == crate::tasks::TASK_RUNNING {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn task_get(&self, id: &str) -> StoreResult<Option<crate::tasks::Task>> {
+        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", crate::store::TASK_COLS);
+        let rows = self.query(&sql, vec![json!(id)])?;
+        Ok(rows.into_iter().next().map(|r| task_from_values(&r)))
+    }
+
+    fn task_update(
+        &self,
+        id: &str,
+        state: &str,
+        message: &str,
+        attempts: u32,
+        next_try_ms: u64,
+    ) -> StoreResult<()> {
+        self.exec(
+            "UPDATE tasks SET state = ?2, last_error = ?3, attempts = ?4, next_try_ms = ?5,
+             updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+             WHERE id = ?1",
+            vec![
+                json!(id),
+                json!(state),
+                json!(message),
+                json!(attempts as i64),
+                json!(next_try_ms as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn tasks_list(&self, limit: usize) -> StoreResult<Vec<crate::tasks::Task>> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let sql = format!(
+            "SELECT {} FROM tasks ORDER BY created_ms DESC, id DESC LIMIT ?1",
+            crate::store::TASK_COLS
+        );
+        let rows = self.query(&sql, vec![json!(limit)])?;
+        Ok(rows.iter().map(|r| task_from_values(r)).collect())
+    }
+
+    fn tasks_recover_running(&self) -> StoreResult<()> {
+        self.exec(
+            "UPDATE tasks SET state = 'queued', next_try_ms = 0,
+             updated_ms = CAST(strftime('%s','now') AS INTEGER) * 1000
+             WHERE state = 'running'",
+            vec![],
+        )?;
+        Ok(())
+    }
+
+    fn tasks_prune(&self, before_ms: u64) -> StoreResult<()> {
+        // u64::MAX as i64 дал бы -1: зажимаем до i64::MAX («удалить всё»).
+        let before = before_ms.min(i64::MAX as u64) as i64;
+        self.exec(
+            "DELETE FROM tasks WHERE state = 'done' AND updated_ms < ?1",
+            vec![json!(before)],
+        )?;
+        Ok(())
+    }
+}
+
+/// E-5: строка tasks из sidecar-ответа — порядок колонок TASK_COLS.
+fn task_from_values(r: &[Value]) -> crate::tasks::Task {
+    crate::tasks::Task {
+        id: v_text(col(r, 0)),
+        kind: v_text(col(r, 1)),
+        payload: serde_json::from_str(&v_text(col(r, 2))).unwrap_or_else(|_| json!({})),
+        state: v_text(col(r, 3)),
+        attempts: v_int(col(r, 4)).max(0) as u32,
+        next_try_ms: v_int(col(r, 5)).max(0) as u64,
+        last_error: v_text(col(r, 6)),
+        every_ms: col(r, 7).as_i64().map(|v| v.max(0) as u64),
+        created_ms: v_int(col(r, 8)).max(0) as u64,
+        updated_ms: v_int(col(r, 9)).max(0) as u64,
+    }
 }
 
 impl NodeStore {
