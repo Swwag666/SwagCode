@@ -38,7 +38,7 @@
   let models = $state<string[]>([])
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
-  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security'>('general')
+  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security' | 'mcp'>('general')
   let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
@@ -376,6 +376,57 @@
       dshImportNote = String(e)
     } finally {
       dshImportBusy = false
+    }
+  }
+
+  /* E-3: MCP-серверы — реестр в настройках (prefs на бэкенде), живые
+     статусы подключений, добавление одной строкой «команда с аргументами». */
+  let mcpServers = $state<{ name: string; command: string; args: string[]; enabled: boolean; state: string; tools: number }[]>([])
+  let mcpName = $state('')
+  let mcpCommand = $state('')
+  let mcpBusy = $state(false)
+  let mcpNote = $state('')
+  async function loadMcp(): Promise<void> {
+    try {
+      const r = await invoke<{ servers: { name: string; command: string; args: string[]; enabled: boolean; state: string; tools: number }[]; tools: string[] }>('mcp_list')
+      mcpServers = r.servers
+    } catch (e) {
+      mcpServers = []
+      mcpNote = String(e)
+    }
+  }
+  async function addMcp(): Promise<void> {
+    const name = mcpName.trim()
+    const parts = mcpCommand.trim().split(/\s+/).filter(Boolean)
+    if (!name || parts.length === 0) {
+      mcpNote = t('mcpNeedBoth')
+      return
+    }
+    mcpBusy = true
+    mcpNote = ''
+    try {
+      const r = await invoke<{ name: string; tools: number; state: string }>('mcp_add', {
+        name,
+        command: parts[0],
+        args: parts.slice(1),
+      })
+      mcpNote = `${r.name}: ${r.state}`
+      mcpName = ''
+      mcpCommand = ''
+      await loadMcp()
+    } catch (e) {
+      mcpNote = String(e)
+    } finally {
+      mcpBusy = false
+    }
+  }
+  async function removeMcp(name: string): Promise<void> {
+    mcpNote = ''
+    try {
+      await invoke('mcp_remove', { name })
+      await loadMcp()
+    } catch (e) {
+      mcpNote = String(e)
     }
   }
 
@@ -1597,6 +1648,7 @@
           <button class="settings-nav-item" class:active={settingsTab === 'models'} onclick={() => (settingsTab = 'models')}><Icon name="cpu" size={14} /> {t('modelTitle')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => (settingsTab = 'plugins')}><Icon name="plug" size={14} /> Plugins</button>
           <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
         </nav>
         <div class="settings-content">
           {#if settingsTab === 'general'}
@@ -1898,6 +1950,40 @@
                   </button>
                 {/each}
               </div>
+            </div>
+          {:else if settingsTab === 'mcp'}
+            <div class="settings-section">
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('mcpTitle')}</span>
+                  <span class="label-desc">{t('mcpDesc')}</span>
+                </div>
+              </div>
+              {#each mcpServers as s (s.name)}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{s.name}</span>
+                    <span class="label-desc">{s.state} — {s.tools} {t('mcpToolsWord')}</span>
+                  </div>
+                  <button class="appearance-btn" onclick={() => void removeMcp(s.name)}>{t('mcpRemove')}</button>
+                </div>
+              {/each}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <input class="settings-number" style="width:110px" bind:value={mcpName} placeholder={t('mcpNamePh')} aria-label={t('mcpNamePh')} />
+                  <input class="settings-number" style="width:240px" bind:value={mcpCommand} placeholder={t('mcpCommandPh')} aria-label={t('mcpCommandPh')} />
+                </div>
+                <button class="appearance-btn" disabled={mcpBusy} onclick={() => void addMcp()}>
+                  {mcpBusy ? t('mcpBusy') : t('mcpAdd')}
+                </button>
+              </div>
+              {#if mcpNote}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-desc">{mcpNote}</span>
+                  </div>
+                </div>
+              {/if}
             </div>
           {:else}
             <div class="settings-section">

@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
+pub mod mcp;
 
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
@@ -83,6 +84,9 @@ pub struct AppState {
     /// «лёгкими» (история и журнал ходов — в базе, грузятся по требованию),
     /// поэтому list_sessions берёт счётчики отсюда, а не из пустого журнала.
     pub session_meta: std::sync::Mutex<std::collections::HashMap<String, SessionMeta>>,
+    /// E-3: MCP-серверы — живые stdio-соединения, инструменты для модели и
+    /// честные статусы. tokio-мьютекс: подключение — async (рукопожатие).
+    pub mcp: Mutex<mcp::McpRegistry>,
 }
 
 /// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
@@ -191,6 +195,7 @@ impl Default for AppState {
             lagging_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turn_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_meta: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mcp: Mutex::new(mcp::McpRegistry::default()),
         }
     }
 }
@@ -969,6 +974,16 @@ async fn start_turn(
         description: p.description.clone(),
         parameters: p.parameters.clone(),
     }));
+    /* E-3: инструменты MCP-серверов видны модели одним списком с
+       встроенными и плагинами B-5. */
+    {
+        let reg = state.mcp.lock().await;
+        specs.extend(reg.tools.iter().map(|t| ToolSpec {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: t.parameters.clone(),
+        }));
+    }
     let tool_wire: Vec<serde_json::Value> =
         ChatRequest::new(&effective_model, Vec::new()).with_tools(&specs).tools;
     let temperature = temperature.map(|t| t as f32);
@@ -1254,9 +1269,13 @@ async fn start_turn(
                     let started = std::time::Instant::now();
                     /* E-2: semantic_search исполняется здесь, а не в
                        execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
-                       и сеть, а execute_tool остаётся чистой и тестируемой. */
+                       и сеть, а execute_tool остаётся чистой и тестируемой.
+                       E-3: то же для mcp:* — вызов идёт в живой
+                       stdio-процесс сервера из реестра AppState. */
                     let tool_outcome = if call.name == "semantic_search" {
                         run_semantic_search(&app_state, &call, &cwd).await
+                    } else if call.name.starts_with(mcp::MCP_PREFIX) {
+                        run_mcp_call(&app_state, &call).await
                     } else {
                         execute_tool(&call, &cwd, tool_timeout, &plugins).await
                     };
@@ -2726,6 +2745,130 @@ async fn import_dsh_sessions(state: State<'_, Arc<AppState>>) -> Result<serde_js
     }))
 }
 
+/* ===================== E-3: MCP-клиент ===================== */
+
+/// Реестр MCP-серверов живёт в prefs (`mcp_servers`, JSON-массив) —
+/// конфигурация переживает перезапуск, живые соединения не переживают.
+fn mcp_configs(state: &AppState) -> Vec<mcp::McpServerConfig> {
+    state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get_pref("mcp_servers").ok())
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
+fn save_mcp_configs(state: &AppState, cfgs: &[mcp::McpServerConfig]) -> Result<(), String> {
+    let v = serde_json::to_string(cfgs).map_err(|e| format!("mcp: json: {e}"))?;
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.set_pref("mcp_servers", &v).map_err(|e| e.to_string())
+}
+
+/// E-3: вызов MCP-инструмента из хода. Имя `mcp:<server>:<tool>` не входит
+/// в BUILTIN, поэтому подтверждение при OnDangerous уже спросила машина
+/// хода, а журнал B-7 получил tool с префиксом `mcp:` — здесь только
+/// исполнение с таймаутом.
+async fn run_mcp_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    let Some((server, tool)) = mcp::split_tool_name(&call.name) else {
+        return fail(format!("mcp: неверное имя инструмента: {}", call.name));
+    };
+    let conn = state.mcp.lock().await.conn(server);
+    let Some(conn) = conn else {
+        return fail(format!(
+            "mcp: сервер не подключён: {server} (проверьте статус в настройках MCP)"
+        ));
+    };
+    let args = serde_json::Value::Object(call.arguments.clone());
+    match mcp::call_tool(&conn, tool, args, mcp::call_timeout()).await {
+        Ok(text) => ToolOutcome {
+            ok: true,
+            output: if text.trim().is_empty() {
+                "(пустой ответ)".to_string()
+            } else {
+                text
+            },
+        },
+        Err(e) => fail(e),
+    }
+}
+
+/// E-3: реестр для UI — конфигурация (prefs) + живые статусы подключений.
+#[tauri::command]
+async fn mcp_list(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let cfgs = mcp_configs(&state);
+    let reg = state.mcp.lock().await;
+    let statuses = reg.status();
+    let servers: Vec<serde_json::Value> = cfgs
+        .iter()
+        .map(|c| {
+            let st = statuses.iter().find(|s| s.name == c.name);
+            serde_json::json!({
+                "name": c.name,
+                "command": c.command,
+                "args": c.args,
+                "enabled": c.enabled,
+                "state": st.map(|s| s.state.clone()).unwrap_or_else(|| "не запущен".to_string()),
+                "tools": st.map(|s| s.tools).unwrap_or(0),
+            })
+        })
+        .collect();
+    let tools: Vec<String> = reg.tools.iter().map(|t| t.name.clone()).collect();
+    Ok(serde_json::json!({ "servers": servers, "tools": tools }))
+}
+
+/// E-3: добавить (или заменить) сервер и сразу подключить. Ошибка
+/// подключения — не ошибка команды: сервер записан в реестр, статус
+/// честный, повторить можно из UI.
+#[tauri::command]
+async fn mcp_add(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    command: String,
+    args: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    let name = name.trim().to_string();
+    if !mcp::valid_server_name(&name) {
+        return Err("имя: непустое, без двоеточий, до 64 символов".into());
+    }
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        return Err("команда не может быть пустой".into());
+    }
+    let cfg = mcp::McpServerConfig {
+        name: name.clone(),
+        command,
+        args: args.unwrap_or_default(),
+        env: std::collections::HashMap::new(),
+        enabled: true,
+    };
+    let mut cfgs = mcp_configs(&state);
+    cfgs.retain(|c| c.name != name);
+    cfgs.push(cfg.clone());
+    save_mcp_configs(&state, &cfgs)?;
+    let mut reg = state.mcp.lock().await;
+    let tools = reg.connect_server(&cfg).await;
+    let status = reg
+        .status()
+        .into_iter()
+        .find(|s| s.name == name)
+        .map(|s| s.state)
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "name": name, "tools": tools, "state": status }))
+}
+
+/// E-3: убрать сервер из реестра и убить его процесс.
+#[tauri::command]
+async fn mcp_remove(state: State<'_, Arc<AppState>>, name: String) -> Result<(), String> {
+    let cfgs: Vec<mcp::McpServerConfig> =
+        mcp_configs(&state).into_iter().filter(|c| c.name != name).collect();
+    save_mcp_configs(&state, &cfgs)?;
+    state.mcp.lock().await.disconnect(&name).await;
+    Ok(())
+}
+
 pub fn run() {
     /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
        панику инициализации. Лог — на диске, телеметрии нет. */
@@ -2797,6 +2940,17 @@ pub fn run() {
                     });
                 }
             }
+            /* E-3: MCP-серверы из prefs поднимаются фоном — старт не ждёт
+               рукопожатий внешних процессов. Статусы видны в настройках. */
+            {
+                let st = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    for cfg in mcp_configs(&st) {
+                        let n = st.mcp.lock().await.connect_server(&cfg).await;
+                        eprintln!("mcp: {} — {n} инструментов", cfg.name);
+                    }
+                });
+            }
             app.manage(state.clone());
 
             let handle = app.handle().clone();
@@ -2817,6 +2971,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             build_info,
             import_dsh_sessions,
+            mcp_list,
+            mcp_add,
+            mcp_remove,
             initial_prefs,
             save_background,
             load_background,
@@ -3383,5 +3540,68 @@ mod tests {
             assert_eq!(s.history.len(), 2);
             assert_eq!(s.history[0].role, swagcod_provider::types::Role::User);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_mcp_call_routes_to_live_server() {
+        /* E-3: диспетчерный уровень — ToolCall с именем mcp:<server>:<tool>
+           уходит в живой stdio-процесс и возвращается ToolOutcome. */
+        let Some(node) = mcp::tests_node() else { return };
+        let dir = std::env::temp_dir().join(format!("swagcod-mcp-rt-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("srv.js");
+        std::fs::write(
+            &script,
+            r#"
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+rl.on('line', (l) => {
+  let m; try { m = JSON.parse(l); } catch { return; }
+  if (m.method === 'initialize') send({jsonrpc:'2.0', id:m.id, result:{protocolVersion:'2024-11-05', capabilities:{}, serverInfo:{name:'rt', version:'0'}}});
+  else if (m.method === 'tools/list') send({jsonrpc:'2.0', id:m.id, result:{tools:[{name:'echo', description:'эхо', inputSchema:{type:'object'}}]}});
+  else if (m.method === 'tools/call') send({jsonrpc:'2.0', id:m.id, result:{content:[{type:'text', text:'rt:' + ((m.params.arguments||{}).text||'')}], isError:false}});
+});
+"#,
+        )
+        .unwrap();
+
+        let state = Arc::new(AppState::default());
+        let cfg = mcp::McpServerConfig {
+            name: "rt".into(),
+            command: node,
+            args: vec![script.to_string_lossy().to_string()],
+            env: std::collections::HashMap::new(),
+            enabled: true,
+        };
+        {
+            let mut reg = state.mcp.lock().await;
+            assert_eq!(reg.connect_server(&cfg).await, 1);
+        }
+
+        let call = ToolCall {
+            id: "c-1".into(),
+            name: "mcp:rt:echo".into(),
+            arguments: serde_json::json!({"text": "данные"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let out = run_mcp_call(&state, &call).await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "rt:данные");
+
+        // Незнакомый сервер — честная ошибка, а не паника.
+        let ghost = ToolCall {
+            id: "c-2".into(),
+            name: "mcp:ghost:echo".into(),
+            arguments: Default::default(),
+        };
+        let out = run_mcp_call(&state, &ghost).await;
+        assert!(!out.ok);
+        assert!(out.output.contains("не подключён"), "{}", out.output);
+
+        state.mcp.lock().await.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -60,6 +60,17 @@ B-1…B-8 закрыты, better-sqlite3 в Node-sidecar стал основны
 
 ## E-3: MCP-клиент (Model Context Protocol)
 
+> ЗАКРЫТ (ревизия 30): `crates/app/src/mcp.rs` — stdio-транспорт
+> (newline-delimited JSON-RPC 2.0), рукопожатие initialize →
+> notifications/initialized → tools/list, вызовы tools/call с
+> таймаутами (15 с init/list, 60 с вызов, override
+> SWAGCOD_MCP_TIMEOUT_MS), kill_on_drop — без сирот. Реестр в prefs
+> (`mcp_servers`), фоновое подключение на старте, честные статусы.
+> Имена `mcp:<server>:<tool>` не-builtin → approval-машина и журнал B-7
+> работают без отдельной ветки. Вкладка MCP в настройках: список со
+> статусами, добавление (имя + команда с аргументами), удаление. 10
+> тестов, включая живой echo-сервер на node и таймаут молчуна.
+
 Внешние серверы инструментов — стандарт, который ждут от агента в 2026.
 
 - stdio-транспорт: spawn процесса сервера, JSON-RPC 2.0, discover
