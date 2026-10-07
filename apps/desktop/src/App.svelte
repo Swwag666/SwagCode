@@ -729,6 +729,33 @@
      шины (liveStates), sendingSession живёт между invoke и turn_started. */
   let sendingSession = $state<string | null>(null)
   let inputText = $state('')
+  /* Скрепка: выбранные в диалоге файлы ждут отправки чипами над полем
+     ввода и уходят вместе со следующей репликой (в т.ч. из очереди). */
+  let attachments = $state<string[]>([])
+
+  function attachName(p: string): string {
+    const parts = p.split(/[\\/]/)
+    return parts[parts.length - 1] || p
+  }
+
+  async function attachFiles(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      const picked = await openDialog({ multiple: true, title: t('attachTitle') })
+      if (!picked) return
+      const list = Array.isArray(picked) ? picked : [picked]
+      for (const p of list) {
+        if (!attachments.includes(p)) attachments.push(p)
+      }
+    } catch (err) {
+      console.error('attach failed:', err)
+    }
+  }
+
+  function removeAttachment(index: number): void {
+    attachments.splice(index, 1)
+  }
+
   let creatingSession = $state(false)
   /* Анимация рождения чата: включается кнопкой создания, гаснет с первым
      сообщением. Пассивно на старте приложения не горит. */
@@ -998,11 +1025,16 @@
   let filesRoot = $derived(currentSession ? (sessionCwds[currentSession] ?? '') : '')
 
   /* Очередь сообщений — своя у каждой сессии: пока нейронка думает, новые
-     реплики не теряются и не льются в чужой разговор. */
-  let queues = $state<Record<string, string[]>>({})
+     реплики не теряются и не льются в чужой разговор. Вложения (скрепка)
+     travelling вместе с репликой: что прикрепил, то и уйдёт в ход. */
+  interface QueueItem {
+    text: string
+    attach: string[]
+  }
+  let queues = $state<Record<string, QueueItem[]>>({})
   let queue = $derived(queues[currentSession ?? ''] ?? [])
 
-  function queueFor(sid: string): string[] {
+  function queueFor(sid: string): QueueItem[] {
     let q = queues[sid]
     if (!q) {
       q = []
@@ -1041,7 +1073,7 @@
     if (!q || q.length === 0 || sessionBusy(sid)) return
     const next = q.shift()
     if (next === undefined) return
-    await sendText(next, sid)
+    await sendText(next.text, sid, next.attach)
   }
 
   const bootStart = performance.now()
@@ -1265,12 +1297,12 @@
 
   /** Отправка одной реплики в конкретную сессию. Очередь вызывает её же
       после конца хода — и всегда в ту сессию, где реплику написали. */
-  async function sendText(text: string, targetSession?: string): Promise<void> {
+  async function sendText(text: string, targetSession?: string, attach?: string[]): Promise<void> {
     if (!text) return
     let sid = targetSession ?? currentSession
     if (sid && sessionBusy(sid)) {
       /* Чат занят своим ходом: реплика ждёт в ЕГО очереди, а не в чужой. */
-      queueFor(sid).push(text)
+      queueFor(sid).push({ text, attach: attach ?? [] })
       return
     }
     if (sendingSession !== null) return
@@ -1301,6 +1333,8 @@
         // Температура — автоматом от провайдера: None не сериализуется в тело
         // запроса (crates/provider/src/types.rs), провайдер применяет свой дефолт.
         temperature: null,
+        // Скрепка: текстовые вложения бекенд подшивает к сообщению сам.
+        attachments: attach && attach.length > 0 ? attach : null,
       })
     } catch (err) {
       console.error('start_turn failed:', err)
@@ -1320,11 +1354,15 @@
     const text = inputText.trim()
     if (!text) return
     inputText = ''
+    /* Вложения уходят с этой репликой и список очищается — даже если она
+       встанет в очередь: attach travels вместе с QueueItem. */
+    const attach = attachments.length > 0 ? [...attachments] : undefined
+    attachments = []
     if (sessionBusy(currentSession)) {
-      if (currentSession) queueFor(currentSession).push(text)
+      if (currentSession) queueFor(currentSession).push({ text, attach: attach ?? [] })
       return
     }
-    await sendText(text)
+    await sendText(text, undefined, attach)
   }
 
   onMount(() => {
@@ -2400,14 +2438,31 @@
       {#if queue.length > 0}
         <div class="queue-strip" aria-label={t('queueTitle')}>
           <span class="queue-title">{t('queueTitle')}:</span>
-          {#each queue as q, i (q + i)}
+          {#each queue as q, i (q.text + i)}
             <span class="queue-chip">
-              <span class="queue-text" title={q}>{q}</span>
+              <span class="queue-text" title={q.text}>{q.text}</span>
               <button
                 class="queue-drop"
                 title={t('studioMediaClear')}
                 aria-label={t('studioMediaClear')}
                 onclick={() => removeFromQueue(i)}
+              ><Icon name="close" size={10} /></button>
+            </span>
+          {/each}
+        </div>
+      {/if}
+
+      {#if attachments.length > 0}
+        <div class="queue-strip" aria-label={t('attachTitle')}>
+          <span class="queue-title"><Icon name="paperclip" size={11} /></span>
+          {#each attachments as a, i (a + i)}
+            <span class="queue-chip">
+              <span class="queue-text" title={a}>{attachName(a)}</span>
+              <button
+                class="queue-drop"
+                title={t('studioMediaClear')}
+                aria-label={t('studioMediaClear')}
+                onclick={() => removeAttachment(i)}
               ><Icon name="close" size={10} /></button>
             </span>
           {/each}
@@ -2429,7 +2484,7 @@
           rows="2"
         ></textarea>
         <div class="input-actions">
-          <button class="action-btn" title="прикрепить" aria-label="прикрепить"><Icon name="paperclip" size={14} /></button>
+          <button class="action-btn" title={t('attachTitle')} aria-label={t('attachTitle')} onclick={() => void attachFiles()}><Icon name="paperclip" size={14} /></button>
           <button
             class="action-btn perm-btn"
             class:danger={permissionMode === 'never'}

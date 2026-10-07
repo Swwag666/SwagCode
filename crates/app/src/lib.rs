@@ -729,6 +729,54 @@ fn pty_kill(state: State<'_, Arc<AppState>>, pty_id: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Вложения пользователя (скрепка в UI): текстовые файлы подшиваются к
+/// сообщению блоками с содержимым. Провайдер текстовый — картинки и
+/// бинарщина честно помечаются неприкреплёнными, а не молча теряются.
+/// Лимит 200 КБ на файл бережёт контекст (B-3) от одного жирного лога.
+const ATTACH_MAX_BYTES: u64 = 200 * 1024;
+
+fn render_attachments(paths: &[String]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        let name = std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.clone());
+        let ext = std::path::Path::new(p)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") {
+            out.push_str(&format!(
+                "\n\n---\nВложение {name}: не прикреплено — картинки пока не поддерживаются (текстовый провайдер)."
+            ));
+            continue;
+        }
+        match std::fs::metadata(p) {
+            Ok(md) if md.len() > ATTACH_MAX_BYTES => {
+                out.push_str(&format!(
+                    "\n\n---\nВложение {name}: не прикреплено — файл больше {} КБ.",
+                    ATTACH_MAX_BYTES / 1024
+                ));
+            }
+            Ok(_) => match std::fs::read_to_string(p) {
+                Ok(text) => {
+                    out.push_str(&format!("\n\n---\nВложение: {name} ({p})\n```\n{text}\n```"));
+                }
+                Err(_) => {
+                    out.push_str(&format!(
+                        "\n\n---\nВложение {name}: не прикреплено — бинарный файл."
+                    ));
+                }
+            },
+            Err(e) => {
+                out.push_str(&format!("\n\n---\nВложение {name}: не прикреплено — {e}."));
+            }
+        }
+    }
+    out
+}
+
 /// Запустить ход: сообщение пользователя → агентский цикл → журнал сессии.
 ///
 /// Цикл ведёт [`TurnMachine`] из swagcod-core: эта задача лишь выполняет
@@ -742,8 +790,15 @@ async fn start_turn(
     message: String,
     model: Option<String>,
     temperature: Option<f64>,
+    attachments: Option<Vec<String>>,
 ) -> Result<String, String> {
-    let message = message.trim().to_string();
+    /* Скрепка: вложения подшиваются к тексту одним сообщением — история
+       и контекст видят их как часть реплики пользователя. */
+    let mut message = message.trim().to_string();
+    if let Some(paths) = attachments.as_ref().filter(|a| !a.is_empty()) {
+        message.push_str(&render_attachments(paths));
+        message = message.trim().to_string();
+    }
     if message.is_empty() {
         return Err("сообщение не может быть пустым".into());
     }
@@ -2207,6 +2262,43 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachments_text_goes_in_binary_and_big_get_honest_note() {
+        let dir = std::env::temp_dir().join(format!("swagcod-attach-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, "содержимое").unwrap();
+        let bin = dir.join("data.bin");
+        std::fs::write(&bin, [0xFF_u8, 0xFE, 0x00, 0x01]).unwrap();
+        let big = dir.join("big.log");
+        std::fs::write(&big, vec![b'x'; ATTACH_MAX_BYTES as usize + 1]).unwrap();
+        let gone = dir.join("missing.txt");
+
+        let out = render_attachments(&[
+            txt.to_string_lossy().to_string(),
+            bin.to_string_lossy().to_string(),
+            big.to_string_lossy().to_string(),
+            gone.to_string_lossy().to_string(),
+        ]);
+
+        // Текстовый файл — содержимым в блок кода.
+        assert!(out.contains("Вложение: note.txt"), "{out}");
+        assert!(out.contains("```\nсодержимое\n```"), "{out}");
+        // Бинарный, слишком большой и отсутствующий — честные пометки, не тишина.
+        assert!(out.contains("data.bin: не прикреплено — бинарный файл"), "{out}");
+        assert!(out.contains("big.log: не прикреплено — файл больше"), "{out}");
+        assert!(out.contains("missing.txt: не прикреплено —"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachments_images_are_marked_unsupported() {
+        let out = render_attachments(&["C:/pics/cat.PNG".to_string()]);
+        assert!(out.contains("cat.PNG"), "{out}");
+        assert!(out.contains("картинки пока не поддерживаются"), "{out}");
+    }
 
     #[test]
     fn session_brief_falls_back_to_cwd_as_title() {
