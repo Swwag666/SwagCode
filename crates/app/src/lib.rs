@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub mod crashlog;
 pub mod dpapi;
+pub mod dsh_import;
 
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
@@ -78,6 +79,71 @@ pub struct AppState {
     /// std-мьютекс: обновление на каждом токене стрима должно быть дешевле
     /// самого токена.
     pub turn_activity: Arc<std::sync::Mutex<std::collections::HashMap<String, TurnActivity>>>,
+    /// D-121: сводные цифры сессий для сайдбара. Сессии живут в памяти
+    /// «лёгкими» (история и журнал ходов — в базе, грузятся по требованию),
+    /// поэтому list_sessions берёт счётчики отсюда, а не из пустого журнала.
+    pub session_meta: std::sync::Mutex<std::collections::HashMap<String, SessionMeta>>,
+}
+
+/// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
+/// истории в RAM.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionMeta {
+    pub turns: usize,
+    pub est_context_tokens: u32,
+    pub last_ok: Option<bool>,
+    pub last_activity_ms: u64,
+}
+
+fn meta_of(s: &Session) -> SessionMeta {
+    SessionMeta {
+        turns: s.turns.len(),
+        est_context_tokens: s.estimate_context_tokens(),
+        last_ok: s.turns.last().map(|t| t.ok),
+        last_activity_ms: s
+            .turns
+            .last()
+            .map(|t| t.ended_ms.unwrap_or(t.started_ms))
+            .unwrap_or(s.created_ms),
+    }
+}
+
+/// D-121: сделать список сессий «лёгким» для RAM: тяжёлые история и журнал
+/// вычищаются (они уже в базе), сводные цифры уходят в meta-карту.
+fn light_sessions(
+    loaded: Vec<Session>,
+) -> (Vec<Session>, std::collections::HashMap<String, SessionMeta>) {
+    let mut meta = std::collections::HashMap::new();
+    let mut light: Vec<Session> = Vec::with_capacity(loaded.len());
+    for mut s in loaded {
+        meta.insert(s.id.to_string(), meta_of(&s));
+        s.history.clear();
+        s.turns.clear();
+        light.push(s);
+    }
+    (light, meta)
+}
+
+/// D-121: подгрузить историю и журнал сессии из store, если в памяти их
+/// нет. Вызывается перед началом хода и при показе транскрипта — двум
+/// командам нужна полная сессия, остальным достаточно лёгкой.
+fn rehydrate_session(state: &AppState, session: &mut Session) {
+    if !session.history.is_empty() || !session.turns.is_empty() {
+        return;
+    }
+    if let Ok(store) = state.store.lock() {
+        match store.load_session(session.id.as_str()) {
+            Ok(Some(full)) => {
+                session.history = full.history;
+                session.turns = full.turns;
+                if session.summary.is_empty() {
+                    session.summary = full.summary;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("store: история сессии не подгружена: {e}"),
+        }
+    }
 }
 
 /// B-8: запись watchdog о живом ходе.
@@ -124,6 +190,7 @@ impl Default for AppState {
             lagging_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lagging_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turn_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_meta: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -427,11 +494,13 @@ async fn session_transcript(
     use serde_json::{json, Value};
     use swagcod_provider::types::Role;
 
-    let guard = state.sessions.lock().await;
+    let mut guard = state.sessions.lock().await;
     let session = guard
-        .iter()
+        .iter_mut()
         .find(|s| s.id.as_str() == session_id)
         .ok_or_else(|| format!("сессия {session_id} не найдена"))?;
+    // D-121: транскрипт — один из двух потребителей полной сессии.
+    rehydrate_session(&state, session);
 
     let mut user_texts: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut tool_outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -530,7 +599,25 @@ async fn save_session_log(
 #[tauri::command]
 async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<SessionBrief>, String> {
     let guard = state.sessions.lock().await;
-    Ok(guard.iter().map(SessionBrief::from).collect())
+    let meta = state.session_meta.lock().ok();
+    Ok(guard
+        .iter()
+        .map(|s| {
+            let mut b = SessionBrief::from(s);
+            /* D-121: «лёгкая» сессия имеет пустой журнал — цифры сайдбара
+               берутся из meta-снимка. У живой (регидратированной) сессии
+               журнал свежее снимка — тогда верим памяти. */
+            if b.turns == 0 {
+                if let Some(m) = meta.as_ref().and_then(|m| m.get(&b.id)) {
+                    b.turns = m.turns;
+                    b.est_context_tokens = m.est_context_tokens;
+                    b.last_ok = m.last_ok;
+                    b.last_activity_ms = m.last_activity_ms;
+                }
+            }
+            b
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -564,6 +651,10 @@ async fn create_session(
     let id = SessionId::new(format!("s-{}", short_id()));
     let session = Session::new(id.clone(), cwd, model);
     let brief = SessionBrief::from(&session);
+    // D-121: новая сессия сразу получает meta-запись (нулевую).
+    if let Ok(mut m) = state.session_meta.lock() {
+        m.insert(brief.id.clone(), meta_of(&session));
+    }
     /* B-1: сессия сразу уходит в store — перезапуск не потеряет даже
        сессию без единого хода. */
     if let Ok(store) = state.store.lock() {
@@ -625,6 +716,10 @@ async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> 
     // B-4: watcher и кэш индекса умирают вместе с сессией.
     state.watches.lock().await.remove(&session_id);
     if let Ok(mut m) = state.indexes.lock() {
+        m.remove(&session_id);
+    }
+    // D-121: meta-снимок — тоже.
+    if let Ok(mut m) = state.session_meta.lock() {
         m.remove(&session_id);
     }
     let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -831,6 +926,10 @@ async fn start_turn(
             return Err(format!("сессия занята: {:?}", session.status));
         }
 
+        /* D-121: второй потребитель полной сессии — ход. История грузится
+           из базы лениво: в покое RAM не держит чужие транскрипты. */
+        rehydrate_session(&state, session);
+
         let ok = session.push_user_message(&message);
         if !ok {
             return Err("не удалось начать ход".into());
@@ -963,6 +1062,11 @@ async fn start_turn(
                                 if let Some(s) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
                                     s.summary = summary.clone();
                                     s.history = history.clone();
+                                    // D-121: после сжатия контекст стал легче —
+                                    // снимок для сайдбара обновляется сразу.
+                                    if let Ok(mut m) = app_state.session_meta.lock() {
+                                        m.insert(sid.clone(), meta_of(s));
+                                    }
                                 }
                             }
                             if let Ok(store) = app_state.store.lock() {
@@ -1231,6 +1335,10 @@ async fn start_turn(
                     if let Err(e) = store.save_turn(&sid, &record, &session.history) {
                         eprintln!("store: ход не записан: {e}");
                     }
+                }
+                // D-121: сайдбар видит свежие счётчики без полной сессии.
+                if let Ok(mut m) = app_state.session_meta.lock() {
+                    m.insert(sid.clone(), meta_of(session));
                 }
             }
         }
@@ -2552,6 +2660,72 @@ fn short_id() -> String {
     format!("{nanos:08x}{n:08x}")
 }
 
+/* ===================== E-9: импорт сессий из DSH ===================== */
+
+/// Прогнать импорт и поставить флаг готовности. Отсутствие DSH на машине —
+/// тихий пропуск (флаг всё равно ставится). После успешного импорта
+/// перечитываем сессии в память: UI видит перенесённое без перезапуска.
+fn run_dsh_import(state: &Arc<AppState>, auto: bool) -> dsh_import::ImportReport {
+    let mut report = dsh_import::ImportReport::default();
+    let root = match dsh_import::dsh_sessions_root() {
+        Some(r) => r,
+        None => {
+            if let Ok(store) = state.store.lock() {
+                let _ = store.set_pref("dsh_import_done", "no-dsh");
+            }
+            return report;
+        }
+    };
+    if let Ok(store) = state.store.lock() {
+        report = dsh_import::import_dsh_sessions(store.as_ref(), &root);
+        let _ = store.set_pref(
+            "dsh_import_done",
+            &format!("sessions={},turns={}", report.sessions, report.turns),
+        );
+    }
+    if report.sessions > 0 {
+        if let Ok(store) = state.store.lock() {
+            if let Ok(loaded) = store.load_all() {
+                /* D-121: импортированная история не остаётся в RAM — список
+                   переустанавливается «лёгким», цифры уходят в meta. */
+                let (light, meta) = light_sessions(loaded);
+                if let Ok(mut m) = state.session_meta.lock() {
+                    *m = meta;
+                }
+                if let Ok(mut sessions) = state.sessions.try_lock() {
+                    *sessions = light;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "dsh-import{}: сессий {}, ходов {}, пропущено {}, ошибок {}",
+        if auto { " (авто)" } else { "" },
+        report.sessions,
+        report.turns,
+        report.skipped,
+        report.errors.len()
+    );
+    report
+}
+
+/// E-9: ручной импорт — кнопка в настройках. Тяжёлая работа (zstd, обход,
+/// запись в базу) уходит в blocking-пул.
+#[tauri::command]
+async fn import_dsh_sessions(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let st = state.inner().clone();
+    let report = tokio::task::spawn_blocking(move || run_dsh_import(&st, false))
+        .await
+        .map_err(|e| format!("импорт DSH: {e}"))?;
+    Ok(serde_json::json!({
+        "sessions": report.sessions,
+        "turns": report.turns,
+        "messages": report.messages,
+        "skipped": report.skipped,
+        "errors": report.errors,
+    }))
+}
+
 pub fn run() {
     /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
        панику инициализации. Лог — на диске, телеметрии нет. */
@@ -2586,10 +2760,41 @@ pub fn run() {
             if let Ok(store) = state.store.lock() {
                 match store.load_all() {
                     Ok(loaded) => {
+                        /* D-121: бюджет памяти — в RAM живёт «лёгкий» список
+                           (история и журнал остаются в базе), цифры сайдбара
+                           уезжают в session_meta. Старт с 69 импортированными
+                           сессиями без этого стоил 68 МБ приватной памяти. */
+                        let (light, meta) = light_sessions(loaded);
+                        if let Ok(mut m) = state.session_meta.lock() {
+                            *m = meta;
+                        }
                         let mut sessions = state.sessions.blocking_lock();
-                        *sessions = loaded;
+                        *sessions = light;
                     }
                     Err(e) => eprintln!("store: не прочитал сессии: {e}"),
+                }
+            }
+            /* E-9: одноразовый автоимпорт сессий DSH. Только в фоне:
+               бюджет старта (bench < 400 мс) не должен зависеть от размера
+               чужой истории. Флаг dsh_import_done ставится даже когда DSH
+               на машине нет — проверять каждый старт незачем. */
+            {
+                /* get_pref даёт Option<Option<String>>: flatten обязателен —
+                   без него Some(None) (pref не задан) читался как «уже
+                   сделано», и автоимпорт не стартовал никогда. Поймано
+                   живой приёмкой (D-119). */
+                let need_import = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get_pref("dsh_import_done").ok())
+                    .flatten()
+                    .is_none();
+                if need_import {
+                    let st = state.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        run_dsh_import(&st, true);
+                    });
                 }
             }
             app.manage(state.clone());
@@ -2611,6 +2816,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             build_info,
+            import_dsh_sessions,
             initial_prefs,
             save_background,
             load_background,
@@ -3120,5 +3326,62 @@ mod tests {
         // Часы — параметр: функция детерминирована и не спит в тестах.
         let entries: Vec<(String, u64, bool, Option<u64>)> = vec![];
         assert!(quiet_turns_to_warn(&entries, 0, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
+    }
+
+    #[test]
+    fn lazy_sessions_roundtrip_d121() {
+        use swagcod_core::session::{TurnId, TurnRecord};
+        use swagcod_provider::types::ChatMessage;
+
+        let state = Arc::new(AppState::default());
+        let sid = "s-lazy-1";
+        {
+            let store = state.store.lock().unwrap();
+            let mut s = Session::new(
+                SessionId::new(sid),
+                "C:\\tmp".to_string(),
+                "m".to_string(),
+            );
+            s.created_ms = 1000;
+            store.create_session(&s).unwrap();
+            let rec = TurnRecord {
+                id: TurnId::new("t-1"),
+                started_ms: 1,
+                ended_ms: Some(2),
+                content: "привет".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                est_input_tokens: 0,
+                est_output_tokens: 0,
+                ok: true,
+                failure: None,
+            };
+            store
+                .save_turn(sid, &rec, &[ChatMessage::user("ау"), ChatMessage::assistant("привет")])
+                .unwrap();
+        }
+
+        // Полный список → «лёгкий»: история и журнал вычищены, цифры — в meta.
+        let loaded = state.store.lock().unwrap().load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].turns.len(), 1);
+        let (light, meta) = light_sessions(loaded);
+        assert!(light[0].turns.is_empty() && light[0].history.is_empty());
+        let m = meta.get(sid).unwrap();
+        assert_eq!(m.turns, 1);
+        assert_eq!(m.last_ok, Some(true));
+        assert!(m.est_context_tokens > 0, "снимок помнит оценку контекста");
+        *state.session_meta.lock().unwrap() = meta;
+        *state.sessions.try_lock().unwrap() = light;
+
+        // Регидратация по требованию возвращает всё из базы.
+        {
+            let mut sessions = state.sessions.try_lock().unwrap();
+            let s = sessions.iter_mut().find(|s| s.id.as_str() == sid).unwrap();
+            rehydrate_session(&state, s);
+            assert_eq!(s.turns.len(), 1);
+            assert_eq!(s.history.len(), 2);
+            assert_eq!(s.history[0].role, swagcod_provider::types::Role::User);
+        }
     }
 }

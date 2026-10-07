@@ -348,6 +348,37 @@
     invoke('open_in_explorer', { sessionId, path }).catch(() => {})
   }
 
+  /* E-9: импорт сессий из DSH Desktop (кнопка в настройках General).
+     Бэкенд идемпотентен: повторный импорт не плодит дубли. */
+  let dshImportBusy = $state(false)
+  let dshImportNote = $state('')
+  async function runDshImport(): Promise<void> {
+    if (dshImportBusy) return
+    dshImportBusy = true
+    dshImportNote = ''
+    try {
+      const r = await invoke<{ sessions: number; turns: number; messages: number; skipped: number; errors: string[] }>('import_dsh_sessions')
+      if (r.sessions === 0 && r.skipped === 0) {
+        dshImportNote = t('dshImportNone')
+      } else {
+        dshImportNote = t('dshImportDone')
+          .replace('{s}', String(r.sessions))
+          .replace('{t}', String(r.turns))
+          .replace('{m}', String(r.messages))
+        if (r.skipped > 0) dshImportNote += `, ${t('dshImportSkipped')}: ${r.skipped}`
+        if (r.errors.length > 0) dshImportNote += `, ${t('dshImportErrors')}: ${r.errors.length}`
+      }
+      if (r.sessions > 0) {
+        sessionRefreshTick++
+        void loadWorkspaces()
+      }
+    } catch (e) {
+      dshImportNote = String(e)
+    } finally {
+      dshImportBusy = false
+    }
+  }
+
   /* Диалог подтверждения действия: ядро спрашивает событием
      approval_required, решение уходит командой respond_approval.
      Решение принимает человек здесь, но исполняет его ядро — не UI. */
@@ -1676,6 +1707,15 @@
                   <option value="sphere">Wireframe sphere</option>
                   <option value="matrix">Matrix rain</option>
                 </select>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('dshImportTitle')}</span>
+                  <span class="label-desc">{dshImportNote || t('dshImportDesc')}</span>
+                </div>
+                <button class="appearance-btn" disabled={dshImportBusy} onclick={() => void runDshImport()}>
+                  {dshImportBusy ? t('dshImportBusy') : t('dshImportRun')}
+                </button>
               </div>
               <div class="settings-row">
                 <div class="settings-label">
