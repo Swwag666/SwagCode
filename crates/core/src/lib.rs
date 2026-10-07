@@ -14,6 +14,7 @@
 pub mod bus;
 pub mod context;
 pub mod node_store;
+pub mod semantic;
 pub mod session;
 pub mod store;
 pub mod turn;

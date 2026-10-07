@@ -35,6 +35,8 @@ pub use sse::{SseParser, StreamEvent};
 pub use types::{ChatMessage, ChatRequest, Role, ToolCall, ToolSpec};
 
 #[cfg(feature = "http")]
-pub use http::{OpenAiProvider, ProviderError};
+pub use http::{parse_embeddings, OpenAiProvider, ProviderError};
 #[cfg(feature = "http")]
-pub use router::{backoff_delay, parse_fallbacks, Provider, Router, RouterEndpoint};
+pub use router::{
+    backoff_delay, embeddings_model, parse_fallbacks, Provider, Router, RouterEndpoint,
+};

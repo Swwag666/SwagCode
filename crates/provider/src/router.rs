@@ -139,6 +139,38 @@ impl Router {
     pub fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
     }
+
+    /// E-2: эмбеддинги через всю fallback-цепочку. Модель общая для всех
+    /// точек: chat-подмены моделей из `SWAGCOD_FALLBACKS` не применяются —
+    /// эмбеддинги своя семья моделей (см. [`embeddings_model`]). Между
+    /// попытками — тот же backoff с jitter, что и у чата.
+    pub async fn embeddings(&self, input: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model = embeddings_model();
+        let mut last: Option<ProviderError> = None;
+        for (attempt, ep) in self.endpoints.iter().enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(backoff_delay(attempt as u32, attempt as u64)).await;
+            }
+            match ep.provider.embeddings(&model, input).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    eprintln!("embeddings: эндпоинт {} отпал: {e}", ep.provider.base_url());
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| ProviderError::Config("пустая цепочка эндпоинтов".into())))
+    }
+}
+
+/// E-2: модель эмбеддингов — своя env-переменная; дефолт соответствует
+/// публичному `/v1/embeddings`-семейству. Локальные серверы (Ollama,
+/// llama.cpp с флагом embedding) переопределяют её своей моделью.
+pub fn embeddings_model() -> String {
+    std::env::var("SWAGCOD_EMBEDDINGS_MODEL").unwrap_or_else(|_| "text-embedding-3-small".into())
 }
 
 /// Разбор `SWAGCOD_FALLBACKS`: точки через ';', поля через '|'.

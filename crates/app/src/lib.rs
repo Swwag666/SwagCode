@@ -60,6 +60,15 @@ pub struct AppState {
     /// аргументы JSON-ом в stdin. Не-встроенное имя при OnDangerous всегда
     /// уходит на подтверждение (ApprovalPolicy::BUILTIN).
     pub plugins: std::sync::Mutex<Vec<PluginTool>>,
+    /// E-2: кэш эмбеддингов (отдельная база embeddings.db — кэш, не домен).
+    /// Ленивое открытие при первом обращении; поиск синхронный и быстрый,
+    /// поэтому std-мьютекс, как у store.
+    pub semantic: std::sync::Mutex<Option<swagcod_core::semantic::SemanticIndex>>,
+    /// E-2: индексация в ходе — две задачи не должны толкаться в одной базе.
+    pub semantic_busy: std::sync::atomic::AtomicBool,
+    /// E-2: когда последний раз запускалась индексация (мс epoch) — частые
+    /// ходы не должны гонять полный обход репозитория каждый раз.
+    pub semantic_last_ms: std::sync::atomic::AtomicU64,
     /// B-8: сколько раз UI-насос отставал и сколько событий при этом
     /// потеряно. Диагностический экспорт без этих чисел слеп: «лагает»
     /// без счётчика — это анекдот, а не наблюдение.
@@ -109,6 +118,9 @@ impl Default for AppState {
             watches: Mutex::new(std::collections::HashMap::new()),
             indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
             plugins: std::sync::Mutex::new(Vec::new()),
+            semantic: std::sync::Mutex::new(None),
+            semantic_busy: std::sync::atomic::AtomicBool::new(false),
+            semantic_last_ms: std::sync::atomic::AtomicU64::new(0),
             lagging_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lagging_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turn_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -880,6 +892,10 @@ async fn start_turn(
             turn: tid.clone(),
             session: swagcod_core::SessionId::new(&sid),
         });
+        /* E-2: в начале каждого хода фоном освежаем семантический индекс.
+           Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
+           репозитория и не толкаются в одной базе. */
+        spawn_semantic_index(app_state.clone(), cwd.clone(), false);
         /* B-8: watchdog получает запись о живом ходе. Время — now_ms из
            шины: диагностика и журнал живут на одних часах. */
         if let Ok(mut activity) = app_state.turn_activity.lock() {
@@ -1132,7 +1148,14 @@ async fn start_turn(
                 }
                 TurnStep::ExecuteTool { call } => {
                     let started = std::time::Instant::now();
-                    let tool_outcome = execute_tool(&call, &cwd, tool_timeout, &plugins).await;
+                    /* E-2: semantic_search исполняется здесь, а не в
+                       execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
+                       и сеть, а execute_tool остаётся чистой и тестируемой. */
+                    let tool_outcome = if call.name == "semantic_search" {
+                        run_semantic_search(&app_state, &call, &cwd).await
+                    } else {
+                        execute_tool(&call, &cwd, tool_timeout, &plugins).await
+                    };
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     bus.publish(EventKind::ToolResult {
                         turn: tid.clone(),
@@ -1552,10 +1575,379 @@ fn arg_str(call: &ToolCall, key: &str) -> String {
         .to_string()
 }
 
+/* ===================== E-2: семантический поиск по кодовой базе ===================== */
+
+/// Кэш эмбеддингов живёт рядом с основной базой: embeddings.db.
+/// Это перестраиваемый кэш, а не доменные данные (D-113) — отдельный
+/// файл на rusqlite, без stdio-налога на десятки тысяч векторов.
+/// `SWAGCOD_SEMANTIC_DB` переопределяет путь (тесты, переносимость).
+fn semantic_path() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("SWAGCOD_SEMANTIC_DB") {
+        if !p.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(p));
+        }
+    }
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "не удалось определить локальный профиль".to_string())?;
+    Ok(std::path::PathBuf::from(base).join("SwagCod").join("embeddings.db"))
+}
+
+/// Лениво открыть индекс и применить синхронную операцию.
+/// Guard не должен жить через await: поиск/запись миллисекундные.
+fn with_semantic<R>(
+    state: &AppState,
+    f: impl FnOnce(&swagcod_core::semantic::SemanticIndex) -> R,
+) -> Result<R, String> {
+    let mut guard = state.semantic.lock().map_err(|e| format!("semantic: {e}"))?;
+    if guard.is_none() {
+        let path = semantic_path()?;
+        *guard = Some(
+            swagcod_core::semantic::SemanticIndex::open(&path)
+                .map_err(|e| format!("semantic index: {e}"))?,
+        );
+    }
+    Ok(f(guard.as_ref().expect("индекс только что установлен")))
+}
+
+/// Текстовые расширения, которые стоит эмбеддить. Всё остальное
+/// (бинарщина, lock-файлы, картинки) индексатор пропускает.
+const SEMANTIC_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "svelte", "json", "md", "toml", "yaml", "yml", "html", "css",
+    "scss", "py", "go", "c", "h", "cpp", "hpp", "cs", "java", "kt", "rb", "php", "sql", "sh",
+    "ps1", "bat", "txt", "xml", "ini", "conf", "env",
+];
+
+/// Потолок размера файла для эмбеддингов: 512 КБ текста — это ~120 чанков,
+/// дальше стоимость не окупает ценность.
+const MAX_SEMANTIC_FILE_BYTES: u64 = 512 * 1024;
+/// Потолок длины чанка в символах для запроса эмбеддингов.
+const MAX_SEMANTIC_CHUNK_CHARS: usize = 4000;
+/// Файлов на один запрос `/v1/embeddings`.
+const SEMANTIC_EMBED_BATCH: usize = 16;
+/// Кулдаун повторной индексации: ходы частые, обход репозитория недешёв.
+const SEMANTIC_REINDEX_COOLDOWN_MS: u64 = 5 * 60 * 1000;
+
+fn is_semantic_candidate(rel: &str) -> bool {
+    match rel.rsplit_once('.') {
+        Some((_, ext)) => {
+            let e = ext.to_ascii_lowercase();
+            SEMANTIC_EXTENSIONS.iter().any(|x| *x == e)
+        }
+        None => false,
+    }
+}
+
+/// Запустить фоновую индексацию, если она не идёт и кулдаун истёк
+/// (или `force`). Возвращает true, когда задача действительно поднята.
+fn spawn_semantic_index(state: Arc<AppState>, cwd: std::path::PathBuf, force: bool) -> bool {
+    use std::sync::atomic::Ordering;
+    let now = swagcod_core::bus::now_ms();
+    let last = state.semantic_last_ms.load(Ordering::Relaxed);
+    if !force && now.saturating_sub(last) < SEMANTIC_REINDEX_COOLDOWN_MS {
+        return false;
+    }
+    if state.semantic_busy.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    state.semantic_last_ms.store(now, Ordering::Relaxed);
+    tauri::async_runtime::spawn(async move {
+        match index_workspace(&state, &cwd).await {
+            Ok(n) if n > 0 => eprintln!("semantic: проиндексировано файлов: {n} ({cwd:?})"),
+            Ok(_) => {}
+            Err(e) => eprintln!("semantic: индексация {cwd:?}: {e}"),
+        }
+        state.semantic_busy.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
+/// Обход рабочей директории (FileIndex уважает .gitignore) → текстовые
+/// файлы ≤ 512 КБ → чанки по 40 строк → эмбеддинги → upsert в индекс.
+/// Вкус эмбеддингов (E-2): `cloud:<model>` через Router `/v1/embeddings`
+/// или `local:v1` — локальный лексический feature-hashing, когда у
+/// провайдера эмбеддингов нет (живой rustvy.xyz: 13 моделей, все чатовые).
+/// Режим — `SWAGCOD_EMBEDDINGS_MODE`: auto (default) | cloud | local.
+/// Auto-фолбэк в локальный — громкий (eprintln), а смена маркера
+/// пространства стирает старый кэш: вектора разных эмбеддеров несравнимы.
+async fn index_workspace(state: &Arc<AppState>, cwd: &std::path::Path) -> Result<usize, String> {
+    use swagcod_core::semantic::{chunk_text, content_hash, local_embedding, Chunk};
+
+    let mode = std::env::var("SWAGCOD_EMBEDDINGS_MODE")
+        .unwrap_or_else(|_| "auto".into())
+        .to_ascii_lowercase();
+    let mut router: Option<Router> = None;
+    let flavor = match mode.as_str() {
+        "local" => "local:v1".to_string(),
+        "cloud" => {
+            let r = Router::from_env_with_key(dpapi_key(state))
+                .map_err(|e| format!("эмбеддинги (cloud): {e}"))?;
+            // Проба обязательна: cloud-режим без эмбеддингов — громкая
+            // ошибка конфигурации, никакого тихого местного суррогата.
+            r.embeddings(&["swagcod probe".to_string()])
+                .await
+                .map_err(|e| format!("эмбеддинги (cloud): {e}"))?;
+            router = Some(r);
+            format!("cloud:{}", swagcod_provider::embeddings_model())
+        }
+        _ => match Router::from_env_with_key(dpapi_key(state)) {
+            Ok(r) => match r.embeddings(&["swagcod probe".to_string()]).await {
+                Ok(_) => {
+                    router = Some(r);
+                    format!("cloud:{}", swagcod_provider::embeddings_model())
+                }
+                Err(e) => {
+                    eprintln!("semantic: /v1/embeddings недоступен ({e}) — локальный лексический эмбеддер");
+                    "local:v1".to_string()
+                }
+            },
+            Err(e) => {
+                eprintln!("semantic: роутер эмбеддингов не собрать ({e}) — локальный лексический эмбеддер");
+                "local:v1".to_string()
+            }
+        },
+    };
+
+    // Смена пространства — полная перестройка; иначе берём snapshot хэшей.
+    let stored = with_semantic(state, |ix| -> Result<_, String> {
+        let prev = ix.embedder().map_err(|e| e.to_string())?;
+        if prev.as_deref() != Some(flavor.as_str()) {
+            ix.clear_all().map_err(|e| e.to_string())?;
+            ix.set_embedder(&flavor).map_err(|e| e.to_string())?;
+        }
+        ix.file_hashes().map_err(|e| e.to_string())
+    })??;
+
+    let idx = swagcod_fsx::FileIndex::build(cwd).map_err(|e| format!("индекс файлов: {e}"))?;
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todo: Vec<(String, String, String)> = Vec::new(); // (rel, hash, text)
+    for rel in &idx.files {
+        if !is_semantic_candidate(rel) {
+            continue;
+        }
+        present.insert(rel.clone());
+        let abs = cwd.join(rel);
+        match std::fs::metadata(&abs) {
+            Ok(m) if m.len() <= MAX_SEMANTIC_FILE_BYTES => {}
+            _ => continue,
+        }
+        let text = match std::fs::read_to_string(&abs) {
+            Ok(t) => t,
+            Err(_) => continue, // бинарщина под текстовым расширением — пропускаем
+        };
+        let hash = content_hash(&text);
+        if stored.get(rel).map(|s| s.as_str()) == Some(hash.as_str()) {
+            continue;
+        }
+        todo.push((rel.clone(), hash, text));
+    }
+
+    let mut indexed = 0usize;
+
+    // Локальный вкус: сети нет, всё считается на месте.
+    if router.is_none() {
+        for (rel, hash, text) in &todo {
+            let items: Vec<(Chunk, Vec<f32>)> = chunk_text(text)
+                .into_iter()
+                .map(|c| {
+                    let t: String = c.text.chars().take(MAX_SEMANTIC_CHUNK_CHARS).collect();
+                    (c, local_embedding(&t))
+                })
+                .collect();
+            with_semantic(state, |ix| {
+                ix.upsert_file(rel, hash, &items).map_err(|e| e.to_string())
+            })??;
+            indexed += 1;
+            if indexed % 64 == 0 {
+                // Индексация фоновая, но event loop не должен голодать.
+                tokio::task::yield_now().await;
+            }
+        }
+        return finish_indexing(state, &present, indexed);
+    }
+
+    // Облачный вкус: батчи через Router (фолбэк-цепочка B-6 работает).
+    let router = router.expect("проверено выше");
+    for batch in todo.chunks(SEMANTIC_EMBED_BATCH) {
+        let mut per_file: Vec<(&String, &String, Vec<Chunk>)> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
+        for (rel, hash, text) in batch {
+            let chunks = chunk_text(text);
+            if chunks.is_empty() {
+                // Пустой файл: хэш всё равно запоминаем, чтобы не перечитывать.
+                let _ = with_semantic(state, |ix| {
+                    ix.upsert_file(rel, hash, &[]).map_err(|e| e.to_string())
+                });
+                indexed += 1;
+                continue;
+            }
+            counts.push(chunks.len());
+            for c in &chunks {
+                texts.push(c.text.chars().take(MAX_SEMANTIC_CHUNK_CHARS).collect());
+            }
+            per_file.push((rel, hash, chunks));
+        }
+        if texts.is_empty() {
+            continue;
+        }
+        let vecs = router
+            .embeddings(&texts)
+            .await
+            .map_err(|e| format!("эмбеддинги: {e}"))?;
+        if vecs.len() != texts.len() {
+            return Err(format!(
+                "эмбеддинги: вернули {} векторов на {} запросов",
+                vecs.len(),
+                texts.len()
+            ));
+        }
+        let mut offset = 0usize;
+        for ((rel, hash, chunks), count) in per_file.iter().zip(counts.iter()) {
+            let items: Vec<(Chunk, Vec<f32>)> = chunks
+                .iter()
+                .cloned()
+                .zip(vecs[offset..offset + count].to_vec())
+                .collect();
+            offset += count;
+            with_semantic(state, |ix| {
+                ix.upsert_file(rel, hash, &items).map_err(|e| e.to_string())
+            })??;
+            indexed += 1;
+        }
+        tokio::task::yield_now().await;
+    }
+    finish_indexing(state, &present, indexed)
+}
+
+/// Хвост индексации: вычистить пропавшие файлы, отрапортовать.
+fn finish_indexing(
+    state: &Arc<AppState>,
+    present: &std::collections::HashSet<String>,
+    indexed: usize,
+) -> Result<usize, String> {
+    let removed = with_semantic(state, |ix| {
+        ix.prune_missing(present).map_err(|e| e.to_string())
+    })
+    .unwrap_or(Ok(0))
+    .unwrap_or(0);
+    if removed > 0 {
+        eprintln!("semantic: вычищено устаревших файлов: {removed}");
+    }
+    Ok(indexed)
+}
+
+/// Инструмент агента `semantic_search`: запрос → эмбеддинг → косинус-поиск
+/// по индексу → топ-k фрагментов с путями, строками и оценкой. Обновление
+/// индекса запускается фоном и ответ не блокирует: поиск идёт по тому,
+/// что уже есть. Пустой индекс — честный ответ «повторите позже».
+async fn run_semantic_search(
+    state: &Arc<AppState>,
+    call: &ToolCall,
+    cwd: &std::path::Path,
+) -> ToolOutcome {
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    let query = arg_str(call, "query");
+    if query.trim().is_empty() {
+        return fail("semantic_search: пустой запрос".into());
+    }
+    let top_k = call
+        .arguments
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8)
+        .clamp(1, 50) as usize;
+
+    let stats = match with_semantic(state, |ix| ix.stats().map_err(|e| e.to_string())) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) | Err(e) => return fail(format!("semantic_search: {e}")),
+    };
+    spawn_semantic_index(state.clone(), cwd.to_path_buf(), false);
+    if stats.1 == 0 {
+        return fail(
+            "семантический индекс пуст — запущена фоновая индексация; повторите вызов через минуту-другую".into(),
+        );
+    }
+
+    // E-2: запрос эмбеддится в ТОМ ЖЕ пространстве, что и индекс.
+    // Маркер хранится в базе: cloud:<model> → Router /v1/embeddings,
+    // local:v1 → локальный лексический эмбеддер. Смешивать нельзя.
+    let kind = match with_semantic(state, |ix| ix.embedder().map_err(|e| e.to_string())) {
+        Ok(Ok(Some(k))) => k,
+        Ok(Ok(None)) => {
+            return fail("семантический индекс без маркера пространства — индексация пересоберёт его; повторите позже".into())
+        }
+        Ok(Err(e)) | Err(e) => return fail(format!("semantic_search: {e}")),
+    };
+    let qv = if kind.starts_with("cloud:") {
+        let router = match Router::from_env_with_key(dpapi_key(state)) {
+            Ok(r) => r,
+            Err(e) => return fail(format!("semantic_search: {e}")),
+        };
+        match router.embeddings(std::slice::from_ref(&query)).await {
+            Ok(mut v) if !v.is_empty() => v.remove(0),
+            Ok(_) => return fail("semantic_search: эмбеддинги вернули пустоту".into()),
+            Err(e) => return fail(format!("semantic_search: эмбеддинги: {e}")),
+        }
+    } else {
+        swagcod_core::semantic::local_embedding(&query)
+    };
+    let hits = match with_semantic(state, |ix| ix.search(&qv, top_k).map_err(|e| e.to_string())) {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) | Err(e) => return fail(format!("semantic_search: {e}")),
+    };
+    if hits.is_empty() {
+        return ToolOutcome {
+            ok: true,
+            output: format!(
+                "по запросу «{query}» ничего не найдено (индекс: {} файлов, {} чанков{})",
+                stats.0,
+                stats.1,
+                if kind.starts_with("local:") {
+                    ", лексический"
+                } else {
+                    ""
+                }
+            ),
+        };
+    }
+
+    let mut out = String::new();
+    if kind.starts_with("local:") {
+        out.push_str(
+            "# индекс лексический (локальный эмбеддер): ищет совпадение терминов, не смысл; \
+             для настоящей семантики нужен эндпоинт /v1/embeddings (SWAGCOD_EMBEDDINGS_MODE/MODEL)\n",
+        );
+    }
+    for h in &hits {
+        out.push_str(&format!(
+            "{}:{}-{} (близость {:.2})\n",
+            h.path, h.start, h.end, h.score
+        ));
+        if let Ok(text) = std::fs::read_to_string(cwd.join(&h.path)) {
+            out.push_str("```\n");
+            for line in text
+                .lines()
+                .skip((h.start as usize).saturating_sub(1))
+                .take((h.end - h.start + 1) as usize)
+                .take(12)
+            {
+                let trimmed: String = line.chars().take(160).collect();
+                out.push_str(&trimmed);
+                out.push('\n');
+            }
+            out.push_str("```\n");
+        }
+    }
+    ToolOutcome { ok: true, output: out }
+}
+
 /// Выполнить один вызов. Не паникует и не возвращает Err: любой отказ
 /// становится результатом ok=false, и модель видит его как ответ тулза.
 /// `plugins` — зарегистрированные внешние инструменты (B-5): неизвестное
 /// встроенное имя ищется там и исполняется отдельной командой.
+/// E-2: `semantic_search` исполняется НЕ здесь, а в `run_semantic_search`
+/// (нужны AppState и сеть); диспетчер хода ветвит по имени до вызова.
 async fn execute_tool(
     call: &ToolCall,
     cwd: &std::path::Path,
@@ -2298,6 +2690,65 @@ mod tests {
         let out = render_attachments(&["C:/pics/cat.PNG".to_string()]);
         assert!(out.contains("cat.PNG"), "{out}");
         assert!(out.contains("картинки пока не поддерживаются"), "{out}");
+    }
+
+    /// E-2: сквозной тест локального вкуса — index_workspace собирает кэш
+    /// из временного воркспейса, semantic_search находит нужный файл по
+    /// лексическому запросу. Сеть не трогается: mode=local явно.
+    #[tokio::test]
+    async fn semantic_local_flavor_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("swagcod-semantic-{}", short_id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/payments.rs"),
+            "pub fn process_payment(order: &Order) -> Receipt {\n    approve_user_charge(order)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/db.rs"),
+            "pub fn open_store(path: &Path) -> Store {\n    /* sqlite */\n    todo!()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("logo.png"), [0x89_u8, b'P', b'N', b'G']).unwrap();
+
+        std::env::set_var("SWAGCOD_EMBEDDINGS_MODE", "local");
+        std::env::set_var("SWAGCOD_SEMANTIC_DB", dir.join("embeddings.db"));
+        let state = Arc::new(AppState::default());
+
+        let indexed = index_workspace(&state, &dir).await.unwrap();
+        assert_eq!(indexed, 2, "png не кандидат, два .rs обязаны проиндексироваться");
+
+        // Кулдаун свежего старта гасит фоновый respawn внутри run_semantic_search.
+        state
+            .semantic_last_ms
+            .store(swagcod_core::bus::now_ms(), std::sync::atomic::Ordering::Relaxed);
+
+        let call = ToolCall {
+            id: "call-sem-1".into(),
+            name: "semantic_search".into(),
+            arguments: serde_json::json!({"query": "process payment approve charge"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let out = run_semantic_search(&state, &call, &dir).await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("payments.rs"), "поиск не попал в payments.rs:\n{}", out.output);
+        assert!(out.output.contains("лексический"), "локальный индекс обязан маркироваться:\n{}", out.output);
+
+        // Повторный прогон ничего не переиндексирует: хэши совпали.
+        let again = index_workspace(&state, &dir).await.unwrap();
+        assert_eq!(again, 0, "неизменённые файлы не должны переустанавливаться");
+
+        let empty = ToolCall {
+            id: "call-sem-2".into(),
+            name: "semantic_search".into(),
+            arguments: serde_json::json!({"query": "   "}).as_object().unwrap().clone(),
+        };
+        let out = run_semantic_search(&state, &empty, &dir).await;
+        assert!(!out.ok && out.output.contains("пустой запрос"), "{}", out.output);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

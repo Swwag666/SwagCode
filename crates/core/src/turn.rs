@@ -61,6 +61,7 @@ impl ApprovalPolicy {
     /// Встроенные имена тулзов (B-5). Всё, что не здесь, — плагин:
     /// внешняя команда не должна исполняться молча, поэтому при
     /// [`ApprovalPolicy::OnDangerous`] неизвестное имя считается опасным.
+    /// E-2: `semantic_search` — встроенный и read-only, в опасные не входит.
     pub const BUILTIN: &'static [&'static str] = &[
         "read",
         "list",
@@ -71,6 +72,7 @@ impl ApprovalPolicy {
         "glob",
         "patch",
         "fetch_url",
+        "semantic_search",
     ];
 
     /// Нужно ли подтверждение для этого вызова.
@@ -549,6 +551,20 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url"]
             }),
         },
+        /* E-2: семантический поиск по кодовой базе. Read-only, поэтому вне
+           списка опасных; индекс строится фоном при старте хода. */
+        ToolSpec {
+            name: "semantic_search".into(),
+            description: "Semantic search over the workspace code: finds meaning, not exact strings (e.g. \"where payments are processed\"). Returns top matching fragments with paths, line ranges and similarity scores. The embedding index builds in the background; if it is still empty the tool says so — retry a bit later.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural-language query" },
+                    "top_k": { "type": "integer", "description": "Max fragments to return, 1..50, default 8" }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -643,6 +659,19 @@ mod tests {
     #[test]
     fn never_policy_approves_nothing() {
         assert!(!ApprovalPolicy::Never.requires_approval("bash"));
+    }
+
+    /// E-2: semantic_search — встроенный read-only инструмент: при
+    /// OnDangerous подтверждения не требует и в спеках модели присутствует.
+    #[test]
+    fn semantic_search_is_builtin_and_safe() {
+        assert!(!ApprovalPolicy::OnDangerous.requires_approval("semantic_search"));
+        assert!(builtin_tool_specs().iter().any(|s| s.name == "semantic_search"));
+        let spec = builtin_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "semantic_search")
+            .unwrap();
+        assert_eq!(spec.parameters["required"][0], "query");
     }
 
     #[test]

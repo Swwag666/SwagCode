@@ -101,6 +101,36 @@ impl OpenAiProvider {
         }
     }
 
+    /// E-2: эмбеддинги — POST /embeddings, OpenAI-совместимый формат.
+    /// Векторы приходят в `data[]` в произвольном порядке — [`parse_embeddings`]
+    /// сортирует их по `index`.
+    pub async fn embeddings(
+        &self,
+        model: &str,
+        input: &[String],
+    ) -> Result<Vec<Vec<f32>>, ProviderError> {
+        let body = serde_json::json!({ "model": model, "input": input });
+        let resp = self
+            .auth(self.client.post(format!("{}/embeddings", self.base_url)).json(&body))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::Status {
+                status: status.as_u16(),
+                body: text.chars().take(500).collect(),
+            });
+        }
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Http(format!("embeddings json: {e}")))?;
+        parse_embeddings(&json)
+    }
+
     /// Список моделей провайдера. Возвращает сырой JSON: формат `data[]`
     /// различается у агрегаторов, а нормализация нам пока не нужна.
     pub async fn list_models(&self) -> Result<serde_json::Value, ProviderError> {
@@ -207,5 +237,72 @@ impl OpenAiProvider {
             }
         });
         Ok((rx, handle))
+    }
+}
+
+/// Чистый парсер ответа `/embeddings`: `data[]` сортируется по `index`
+/// (провайдеры отдают элементы в произвольном порядке), векторы — f32.
+/// Функция не знает про сеть и тестируется headless.
+pub fn parse_embeddings(v: &serde_json::Value) -> Result<Vec<Vec<f32>>, ProviderError> {
+    let data = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| ProviderError::Http("embeddings: в ответе нет data[]".into()))?;
+    if data.is_empty() {
+        return Err(ProviderError::Http("embeddings: пустой data[]".into()));
+    }
+    let mut items: Vec<(i64, Vec<f32>)> = Vec::with_capacity(data.len());
+    for (i, item) in data.iter().enumerate() {
+        let idx = item.get("index").and_then(|x| x.as_i64()).unwrap_or(i as i64);
+        let emb = item
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| ProviderError::Http(format!("embeddings: у data[{i}] нет embedding[]")))?;
+        let vec: Vec<f32> = emb
+            .iter()
+            .filter_map(|x| x.as_f64().map(|f| f as f32))
+            .collect();
+        if vec.is_empty() {
+            return Err(ProviderError::Http(format!("embeddings: data[{i}] — пустой вектор")));
+        }
+        items.push((idx, vec));
+    }
+    items.sort_by_key(|(idx, _)| *idx);
+    Ok(items.into_iter().map(|(_, v)| v).collect())
+}
+
+#[cfg(test)]
+mod embeddings_tests {
+    use super::parse_embeddings;
+    use serde_json::json;
+
+    #[test]
+    fn parses_and_sorts_by_index() {
+        let v = json!({"data": [
+            {"index": 1, "embedding": [3.0, 4.0]},
+            {"index": 0, "embedding": [1.0, 2.0]}
+        ]});
+        let out = parse_embeddings(&v).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vec![1.0, 2.0]);
+        assert_eq!(out[1], vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn missing_data_is_error() {
+        assert!(parse_embeddings(&json!({})).is_err());
+        assert!(parse_embeddings(&json!({"data": []})).is_err());
+    }
+
+    #[test]
+    fn empty_vector_is_error() {
+        let v = json!({"data": [{"index": 0, "embedding": []}]});
+        assert!(parse_embeddings(&v).is_err());
+    }
+
+    #[test]
+    fn item_without_embedding_is_error() {
+        let v = json!({"data": [{"index": 0}]});
+        assert!(parse_embeddings(&v).is_err());
     }
 }
