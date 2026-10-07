@@ -3240,3 +3240,67 @@ D-014) была самодеятельностью — вопрос задали
   parent_turn_id в turns, оба сайдкара живы; bench: старт 67.6 мс,
   our private 6.3 МБ — в бюджете (RSS/family — информационно вне,
   D-013).
+
+## Ревизия 34 — E-7: локальный HTTP API (loopback REST + SSE)
+
+**D-134. Hand-rolled HTTP/1.1 на tokio TcpListener, без новых зависимостей.**
+`crates/app/src/httpapi.rs`: минимальный парсер (стартовая строка +
+заголовки до `\r\n\r\n`, тело строго по Content-Length), `connection:
+close` на каждый ответ, chunked-encoding не поддерживаем сознательно —
+целевой клиент скрипт/CI (curl, Invoke-WebRequest), не браузер.
+Двойной Content-Length — честный 400 (признак request smuggling).
+Пределы: заголовки 64 КБ, тело 1 МБ — превышение даёт 400, а не OOM.
+Bind только `127.0.0.1:{port}` — внешний интерфейс не слушается
+никогда. API выключен по умолчанию: порт из env `SWAGCOD_HTTP_PORT`
+(приоритет) или prefs `http_api_port`; не задан — сервер не стартует,
+поверхности нет вообще.
+
+**D-135. Токен: BCryptGenRandom + DPAPI (механика B-7), сравнение
+постоянное по времени.** 32 случайных байта через
+`BCryptGenRandom(NULL, …, BCRYPT_USE_SYSTEM_PREFERRED_RNG=2)` из
+windows-sys 0.59 — фича Win32_Security_Cryptography уже включена для
+DPAPI, ноль новых зависимостей. Хранение: prefs-ключ
+`http_api_token_blob` — только DPAPI-blob (hex), plaintext существует
+в памяти процесса и в UI «Настройки → Безопасность» (та же модель
+доверия, что у показа DPAPI-ключа провайдера). Битый blob (не та
+учётная запись) — молчаливый перевыпуск токена. Вне Windows DPAPI
+честно отказывает (паттерн dpapi.rs) — значит и API недоступен:
+`random_hex → None`, `serve` возвращает ошибку. Аутентификация:
+`Authorization: Bearer <token>`, сравнение `ct_eq` (XOR-fold, без
+early-exit по байтам). Единственный маршрут без токена — `GET
+/health` (liveness-проба для скриптов).
+
+**D-136. Ядра команд извлечены из Tauri-State — IPC и REST исполняют
+один код.** `start_turn_core(Arc<AppState>, …)`,
+`list_sessions_core(&AppState)`, `respond_approval_core(&AppState, …)`,
+`get_diagnostics_core(&AppState)` — команды стали тонкими обёртками.
+Никакого форка поведения: REST-ход идёт через ту же машину хода, ту же
+шину, те же подтверждения. Маршруты: `GET /v1/diagnostics`, `GET
+/v1/sessions`, `POST /v1/turns {session_id,message,model?,temperature?}`
+→ `{turn_id}`, `POST /v1/approvals {call_id,decision}` (approved/denied,
+регистронезависимо), `GET /v1/events` — SSE-поток шины
+(`bus.subscribe()`, кадр `data: {json}\n\n`; broadcast-lag — честный
+комментарий `: lagged N`, не разрыв; отвал клиента — выход по ошибке
+записи). Ошибки ядра → 400 с `{"error":…}` (тексты ядра как есть:
+«нет ожидающего подтверждения», «сообщение не может быть пустым»).
+
+**Приёмка (живой задеплоенный exe, порт 47479 через pref-инъекцию):**
+`/health` 200 `{"ok":true}`; без токена и с чужим — 401; с токеном
+`/v1/diagnostics` 200 (`version=0.1.0`), `/v1/sessions` 200 (боевой
+список 18 КБ); `POST /v1/approvals` с неизвестным call_id — 400;
+`POST /v1/turns` с пустым сообщением — 400; `GET /v1/events` — 200
+`content-type: text/event-stream`. Токен сгенерировало само приложение
+при старте (64 hex), расшифрован снаружи через CryptUnprotectData под
+той же учётной записью — полный цикл DPAPI-хранения доказан. После
+приёмки prefs удалены (дефолтное «выключено» восстановлено), артефакт
+`bench-out/e7-acceptance.json` (untracked, как e5-acceptance).
+
+**Гейты ревизии 34:** app 64 теста (+6: parse_head, ct_eq, authorized,
+configured_port, DPAPI-токен Windows, интеграция на эфемерном порту —
+health/401/200/sessions/turns-400/approvals-400/404/SSE-кадр), core 94,
+provider 46, pty 36, fsx 20+1 ignored; clippy 0; svelte-check 0/0;
+vitest 74; JS-бандл 331607/332000 — запас всего 393 байта, E-8
+(дашборд телеметрии) потребует подъёма LIMIT по прецеденту D-124.
+Bench: старт 133.1 мс (API включён) / 136.1 мс (shipped, выключен),
+our private 12.2 / 11.9 МБ — оба в бюджете; разброс против rev33
+(67.6/6.3) — среда, а не E-7: выключенный путь стоит один env-рид.

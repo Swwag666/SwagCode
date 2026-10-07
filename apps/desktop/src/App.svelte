@@ -498,6 +498,9 @@
   }
   let approvalRows = $state<ApprovalRow[]>([])
   let approvalLogLoaded = $state(false)
+  /* E-7: loopback REST API — порт и токен показываются здесь (та же
+     модель доверия, что у DPAPI-ключа): API слушает только 127.0.0.1. */
+  let httpApi = $state<{ enabled: boolean; port: number | null; token: string | null } | null>(null)
 
   async function refreshSecurity(): Promise<void> {
     if (!tauriAvailable) return
@@ -508,11 +511,26 @@
       dpapiStored = false
     }
     try {
+      httpApi = await invoke<{ enabled: boolean; port: number | null; token: string | null }>('http_api_status')
+    } catch {
+      httpApi = null // старое ядро без HTTP API
+    }
+    try {
       const list = await invoke<{ id: string; approval_policy?: string | null }[]>('list_sessions')
       const cur = list.find((s) => s.id === currentSession)
       sessPolicy = (cur?.approval_policy as PermissionMode | null | undefined) ?? 'global'
     } catch {
       // старое ядро без per-session политики: оставляем «как глобальные»
+    }
+  }
+
+  async function copyHttpToken(): Promise<void> {
+    if (!httpApi?.token) return
+    try {
+      await navigator.clipboard.writeText(httpApi.token)
+      flashStatus(t('httpApiCopied'))
+    } catch {
+      flashStatus(t('httpApiCopyFail'))
     }
   }
 
@@ -1894,6 +1912,15 @@
                   <span class="label-title">{dpapiStored ? t('dpapiStored') : t('dpapiNotStored')}</span>
                 </div>
                 {#if dpapiStatus}<span class="dpapi-status">{dpapiStatus}</span>{/if}
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('httpApiTitle')}</span>
+                  <span class="label-desc">{httpApi?.enabled ? `${t('httpApiOn')} 127.0.0.1:${httpApi.port}` : t('httpApiOff')}</span>
+                </div>
+                {#if httpApi?.token}
+                  <button class="appearance-btn" onclick={() => void copyHttpToken()}>{t('httpApiCopy')}</button>
+                {/if}
               </div>
               <div class="settings-row">
                 <div class="settings-label">

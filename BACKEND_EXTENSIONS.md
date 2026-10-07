@@ -155,6 +155,21 @@ Node теперь и так живёт рядом с приложением — 
 
 ## E-7: Локальный HTTP API / удалённое управление
 
+> ЗАКРЫТ (ревизия 34): `crates/app/src/httpapi.rs` — hand-rolled
+> HTTP/1.1 на tokio TcpListener (без новых зависимостей, connection:
+> close, Content-Length обязателен, chunked не поддерживаем). Только
+> `127.0.0.1`; по умолчанию ВЫКЛЮЧЕН — порт из `SWAGCOD_HTTP_PORT`
+> или prefs `http_api_port`. Bearer-токен: 32 байта BCryptGenRandom,
+> хранение под DPAPI (prefs `http_api_token_blob`, механика B-7),
+> сравнение постоянное по времени. Маршруты: GET /health (без
+> токена), GET /v1/diagnostics, GET /v1/sessions, POST /v1/turns,
+> POST /v1/approvals, GET /v1/events (SSE шины; lagged — честный
+> комментарий). Ядра команд извлечены из Tauri-State
+> (start_turn_core/list_sessions_core/respond_approval_core/
+> get_diagnostics_core) — IPC и REST исполняют один код. Команда
+> http_api_status + строка в Настройки → Безопасность (порт,
+> копирование токена).
+
 - Аутентифицированный токеном REST рядом с шиной: те же команды, что
   IPC (start_turn, approval, diagnostics) — для скриптов и CI.
 - Только loopback, токен в DPAPI-хранилище (механика B-7).

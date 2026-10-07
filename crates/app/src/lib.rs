@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
+pub mod httpapi;
 pub mod jsplugins;
 pub mod mcp;
 pub mod stdio_rpc;
@@ -630,9 +631,14 @@ async fn save_session_log(
 
 #[tauri::command]
 async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<SessionBrief>, String> {
+    Ok(list_sessions_core(&state).await)
+}
+
+/* E-7: ядро списка сессий — общее для IPC и loopback REST. */
+pub(crate) async fn list_sessions_core(state: &AppState) -> Vec<SessionBrief> {
     let guard = state.sessions.lock().await;
     let meta = state.session_meta.lock().ok();
-    Ok(guard
+    guard
         .iter()
         .map(|s| {
             let mut b = SessionBrief::from(s);
@@ -649,7 +655,7 @@ async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<SessionBri
             }
             b
         })
-        .collect())
+        .collect()
 }
 
 #[tauri::command]
@@ -931,6 +937,27 @@ async fn start_turn(
     temperature: Option<f64>,
     attachments: Option<Vec<String>>,
 ) -> Result<String, String> {
+    start_turn_core(
+        state.inner().clone(),
+        session_id,
+        message,
+        model,
+        temperature,
+        attachments,
+    )
+    .await
+}
+
+/* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
+   loopback REST API. Поведение идентично: та же машина хода, та же шина. */
+pub(crate) async fn start_turn_core(
+    state: Arc<AppState>,
+    session_id: String,
+    message: String,
+    model: Option<String>,
+    temperature: Option<f64>,
+    attachments: Option<Vec<String>>,
+) -> Result<String, String> {
     /* Скрепка: вложения подшиваются к тексту одним сообщением — история
        и контекст видят их как часть реплики пользователя. */
     let mut message = message.trim().to_string();
@@ -1026,7 +1053,7 @@ async fn start_turn(
     let bus = state.bus.clone();
     let turn = turn_id.clone();
     let sid = session_id.clone();
-    let app_state = state.inner().clone();
+    let app_state = state.clone();
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancelled_in_task = cancelled.clone();
 
@@ -2750,6 +2777,15 @@ async fn respond_approval(
     call_id: String,
     decision: ApprovalDecision,
 ) -> Result<(), String> {
+    respond_approval_core(&state, call_id, decision).await
+}
+
+/* E-7: ядро ответа на подтверждение — общее для IPC и REST. */
+pub(crate) async fn respond_approval_core(
+    state: &AppState,
+    call_id: String,
+    decision: ApprovalDecision,
+) -> Result<(), String> {
     let tx = state
         .approvals
         .lock()
@@ -2932,6 +2968,29 @@ fn spawn_watchdog(state: Arc<AppState>) {
 /// Lagging, живые ходы с возрастом и тишиной, шина, uptime.
 #[tauri::command]
 fn get_diagnostics(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    get_diagnostics_core(&state)
+}
+
+/// E-7: статус loopback REST API — порт и токен для экрана настроек.
+/// Токен показывается только локальному UI (та же модель доверия, что
+/// у DPAPI-ключа во вкладке «Безопасность»): API слушает лишь 127.0.0.1.
+#[tauri::command]
+async fn http_api_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let port = httpapi::configured_port(&state);
+    let token = if port.is_some() {
+        httpapi::api_token(&state)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "enabled": port.is_some(),
+        "port": port,
+        "token": token,
+    }))
+}
+
+/* E-7: ядро диагностики — общее для IPC и loopback REST. */
+pub(crate) fn get_diagnostics_core(state: &AppState) -> serde_json::Value {
     let now = swagcod_core::bus::now_ms();
     let turns: Vec<serde_json::Value> = state
         .turn_activity
@@ -3666,6 +3725,17 @@ pub fn run() {
                 let st = state.clone();
                 tauri::async_runtime::spawn(tasks_worker(st));
             }
+            /* E-7: loopback REST API стартует, только если порт явно задан
+               (env SWAGCOD_HTTP_PORT или prefs http_api_port). По
+               умолчанию API выключен — поверхности нет. */
+            if let Some(port) = httpapi::configured_port(&state) {
+                let st = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = httpapi::serve(st.clone(), port).await {
+                        st.bus.publish(EventKind::Status { message: e });
+                    }
+                });
+            }
             app.manage(state.clone());
 
             let handle = app.handle().clone();
@@ -3721,6 +3791,7 @@ pub fn run() {
             save_protected_key,
             clear_protected_key,
             get_diagnostics,
+            http_api_status,
             bus_seq,
             start_turn,
             stop_turn,
