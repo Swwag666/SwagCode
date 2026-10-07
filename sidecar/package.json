@@ -1,0 +1,10 @@
+{
+  "name": "swagcod-store-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "better-sqlite3 хранилище SwagCod: stdio JSON-RPC сервер рядом с Rust-ядром",
+  "main": "store-server.js",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1"
+  }
+}

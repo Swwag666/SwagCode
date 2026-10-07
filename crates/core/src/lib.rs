@@ -13,6 +13,7 @@
 
 pub mod bus;
 pub mod context;
+pub mod node_store;
 pub mod session;
 pub mod store;
 pub mod turn;

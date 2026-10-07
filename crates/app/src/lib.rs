@@ -15,7 +15,6 @@ pub mod dpapi;
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId};
-use swagcod_core::store::Store;
 use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
@@ -46,7 +45,7 @@ pub struct AppState {
     /// B-1: персистентность сессий и настроек. Синхронный SQLite за
     /// std-мьютексом: операции миллисекундные, async над ними дал бы
     /// только сложность (философия better-sqlite из плана B-1).
-    pub store: std::sync::Mutex<swagcod_core::store::SqliteStore>,
+    pub store: std::sync::Mutex<Box<dyn swagcod_core::store::Store>>,
     /// B-2: реестр PTY-сессий. Arc: сливной поток вывода живёт дольше
     /// команды, которая его подняла.
     pub ptys: std::sync::Arc<swagcod_pty::PtyManager>,
@@ -105,10 +104,7 @@ impl Default for AppState {
             config: Mutex::new(TurnConfig::default()),
             turns: Mutex::new(std::collections::HashMap::new()),
             approvals: Mutex::new(std::collections::HashMap::new()),
-            store: std::sync::Mutex::new(
-                swagcod_core::store::SqliteStore::in_memory()
-                    .expect("in-memory SQLite не может не открыться"),
-            ),
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
             ptys: std::sync::Arc::new(swagcod_pty::PtyManager::new()),
             watches: Mutex::new(std::collections::HashMap::new()),
             indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2133,7 +2129,7 @@ pub fn run() {
             /* B-1: файловая база в локальном профиле и сидирование сессий
                из неё — история переживает перезапуск приложения. */
             match db_path() {
-                Ok(path) => match swagcod_core::store::SqliteStore::open(&path) {
+                Ok(path) => match swagcod_core::store::open(&path) {
                     Ok(store) => state.store = std::sync::Mutex::new(store),
                     Err(e) => eprintln!("store: не открыл базу {path:?}: {e}"),
                 },

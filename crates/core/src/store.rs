@@ -25,6 +25,9 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// Ревизия 25: ошибки Node-sidecar (better-sqlite3) — процесс, канал, SQL.
+    #[error("sidecar: {0}")]
+    Sidecar(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -108,9 +111,12 @@ CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decide
 
 /// Хранилище: синхронный контракт домена над персистентностью.
 ///
-/// Реализация одна (`SqliteStore`), но контракт отдельный: тесты и будущие
-/// бэкенды (например, репликация) не зависят от SQLite напрямую.
-pub trait Store {
+/// Ревизия 25: реализаций две — основной [`crate::node_store::NodeStore`]
+/// (better-sqlite3 в Node-sidecar, как просил пользователь) и аварийный
+/// [`SqliteStore`] (встроенный rusqlite, если Node нет). Выбор — через
+/// фабрики [`open`]/[`open_memory`]. Send обязателен: состояние приложения
+/// носит трейт-объект за Mutex между потоками.
+pub trait Store: Send {
     fn create_session(&self, s: &Session) -> StoreResult<()>;
     fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()>;
     /// B-3: свёртка старых ходов живёт рядом с сессией.
@@ -170,7 +176,7 @@ impl SqliteStore {
     }
 }
 
-fn role_to_str(role: Role) -> &'static str {
+pub(crate) fn role_to_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",
         Role::User => "user",
@@ -179,7 +185,7 @@ fn role_to_str(role: Role) -> &'static str {
     }
 }
 
-fn role_from_str(s: &str) -> Role {
+pub(crate) fn role_from_str(s: &str) -> Role {
     match s {
         "system" => Role::System,
         "user" => Role::User,
@@ -190,7 +196,7 @@ fn role_from_str(s: &str) -> Role {
 
 /* B-7: политика сессии хранится строкой — теми же значениями, что serde
    пишет в wire-формат (snake_case), чтобы журнал и конфиг читались одинаково. */
-fn policy_to_str(p: crate::turn::ApprovalPolicy) -> &'static str {
+pub(crate) fn policy_to_str(p: crate::turn::ApprovalPolicy) -> &'static str {
     match p {
         crate::turn::ApprovalPolicy::Always => "always",
         crate::turn::ApprovalPolicy::Never => "never",
@@ -198,13 +204,53 @@ fn policy_to_str(p: crate::turn::ApprovalPolicy) -> &'static str {
     }
 }
 
-fn policy_from_str_opt(s: Option<String>) -> Option<crate::turn::ApprovalPolicy> {
+pub(crate) fn policy_from_str_opt(s: Option<String>) -> Option<crate::turn::ApprovalPolicy> {
     match s.as_deref() {
         Some("always") => Some(crate::turn::ApprovalPolicy::Always),
         Some("never") => Some(crate::turn::ApprovalPolicy::Never),
         Some("on_dangerous") => Some(crate::turn::ApprovalPolicy::OnDangerous),
         _ => None,
     }
+}
+
+/* Ревизия 25: выбор хранилища. better-sqlite3 через Node-sidecar —
+   основное хранилище (прямое требование пользователя); встроенный
+   rusqlite — аварийный фолбэк для окружений без Node. SWAGCOD_STORE
+   форсирует выбор: `node` — только sidecar (падение громкое, без
+   тихой подмены), `sqlite` — только встроенный, иначе auto. */
+
+/// Открыть файловую базу: sidecar, при неудаче (в auto) — rusqlite.
+pub fn open(path: &Path) -> StoreResult<Box<dyn Store>> {
+    let mode = std::env::var("SWAGCOD_STORE").unwrap_or_else(|_| "auto".to_string());
+    if mode != "sqlite" {
+        match crate::node_store::NodeStore::open(path) {
+            Ok(s) => return Ok(Box::new(s)),
+            Err(e) => {
+                if mode == "node" {
+                    return Err(e);
+                }
+                eprintln!("store: better-sqlite3 sidecar недоступен, фолбэк на встроенный SQLite: {e}");
+            }
+        }
+    }
+    Ok(Box::new(SqliteStore::open(path)?))
+}
+
+/// In-memory база: sidecar для тестов, rusqlite если Node не завёлся.
+pub fn open_memory() -> Box<dyn Store> {
+    let mode = std::env::var("SWAGCOD_STORE").unwrap_or_else(|_| "auto".to_string());
+    if mode != "sqlite" {
+        match crate::node_store::NodeStore::in_memory() {
+            Ok(s) => return Box::new(s),
+            Err(e) => {
+                if mode == "node" {
+                    panic!("SWAGCOD_STORE=node, но sidecar не поднялся: {e}");
+                }
+                eprintln!("store: sidecar недоступен, in-memory на встроенном SQLite: {e}");
+            }
+        }
+    }
+    Box::new(SqliteStore::in_memory().expect("in-memory SQLite открывается"))
 }
 
 impl Store for SqliteStore {
