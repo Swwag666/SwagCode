@@ -19,6 +19,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # E-1: vendor/node + vendor/sidecar нужны сборке (tauri resources) и
+      # тестам node_store. pnpm здесь только ради зависимостей sidecar,
+      # поэтому --ignore-scripts: нативный бинарник better-sqlite3
+      # bundle-sidecar.ps1 сам качает prebuilt под pinned ABI (v137) и
+      # принимает пингом — не зависим от node-gyp и node раннера.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: fetch node + bundle sidecar (E-1)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch-node.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/bundle-sidecar.ps1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:

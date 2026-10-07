@@ -2924,3 +2924,33 @@ D-014) была самодеятельностью — вопрос задали
   молча — в сообщение уходит честная пометка «не прикреплено — причина»
   (провайдер текстовый, мультимодальность — отдельный этап). Пустая реплика
   с вложениями валидна: текст дадут файлы. Два теста покрывают все ветки.
+
+## Ревизия 27: E-1 — sidecar упакован, приложение возит свой Node (18:45)
+
+Первый этап BACKEND_EXTENSIONS.md закрыт: better-sqlite3 больше не зависит
+от Node, стоящего на машине пользователя.
+
+- D-109: vendor-расклад — `tools/fetch-node.ps1` (pinned node 24.19.0,
+  88.5 МБ, ABI v137; версия продублирована в `.nvmrc`) и
+  `tools/bundle-sidecar.ps1` (плоский `vendor/sidecar`: store-server.js +
+  better-sqlite3 с нативным бинарником + bindings + file-uri-to-path,
+  11.8 МБ; приёмка — пинг протокола через vendor-ный node.exe). vendor/
+  в gitignore: тяжёлое, воспроизводится скриптами. Tauri
+  `bundle.resources` кладёт `node.exe` и `sidecar/` рядом с exe
+  установщика — ровно туда, где их ищет NodeStore.
+- D-110: резолв рантайма в NodeStore — `SWAGCOD_NODE` → `node.exe` рядом
+  с exe → `vendor/node/node.exe` рядом с exe → PATH (разработка). Скрипт
+  ищется так же: env → `sidecar`/`vendor/sidecar` у exe → цепочка
+  предков cwd. Бандл всегда запускает СВОЙ node: ABI бинарника
+  better-sqlite3 гарантированно совпадает с рантаймом.
+- D-111: скрипты упаковки — ASCII-only. Урок: edit-инструмент снимает
+  BOM, а Windows PowerShell 5.1 читает BOM-less UTF-8 как ANSI —
+  кириллица в строках ломает парсер («Unexpected token»). Плюс две
+  ловушки 5.1: `$dep:` в строке парсится как drive-qualified переменная
+  (лечится `${dep}`), а stderr нативной команды при
+  `$ErrorActionPreference='Stop'` и `2>$null` становится terminating
+  error (лечится временным Continue вокруг вызова).
+- D-112: CI — шаг «fetch node + bundle sidecar» в rust-джобе до cargo
+  (pnpm install --ignore-scripts + prebuilt-бинарник из скрипта):
+  resources обязаны существовать на свежем клоне, а заодно это
+  регрессионный тест всей цепочки упаковки на каждом пуше.

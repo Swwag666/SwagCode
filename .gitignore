@@ -17,6 +17,10 @@ apps/desktop/dist/
 apps/desktop/.svelte-kit/
 apps/desktop/build/
 
+# E-1: упаковочный вендор — node.exe и плоский sidecar. Тяжёлое,
+# воспроизводится скриптами tools/fetch-node.ps1 + tools/bundle-sidecar.ps1.
+vendor/
+
 # Tauri
 crates/app/gen/schemas/
 

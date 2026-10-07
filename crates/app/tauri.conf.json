@@ -29,6 +29,10 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "../../vendor/node/node.exe": "node.exe",
+      "../../vendor/sidecar": "sidecar"
+    }
   }
 }

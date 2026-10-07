@@ -10,6 +10,14 @@ B-1…B-8 закрыты, better-sqlite3 в Node-sidecar стал основны
 
 ## E-1: Упаковка sidecar в бандл (обязательный следующий шаг)
 
+> ЗАКРЫТ (ревизия 27): `tools/fetch-node.ps1` (pinned node 24.19.0 — ABI
+> v137, зафиксирован в `.nvmrc`) и `tools/bundle-sidecar.ps1` (плоский
+> `vendor/sidecar` с prebuilt-бинарником better-sqlite3 и приёмкой пингом
+> через vendor-ный node.exe). Tauri `bundle.resources` кладёт `node.exe` и
+> `sidecar/` рядом с exe установщика; `NodeStore` резолвит рантайм в
+> порядке `SWAGCOD_NODE` → `node.exe` рядом с exe → `vendor/node` → PATH,
+> скрипт ищет там же. CI собирает vendor до cargo-шагов.
+
 Сейчас better-sqlite3 работает, потому что Node стоит на машине разработки.
 На чужой машине приложения без Node упадёт в rusqlite-фолбэк — это тихо и
 неправильно: пользователь просил better-sqlite3.

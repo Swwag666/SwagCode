@@ -63,7 +63,7 @@ impl NodeStore {
 
     fn start(path: &Path) -> StoreResult<Self> {
         let script = sidecar_script()?;
-        let node = std::env::var("SWAGCOD_NODE").unwrap_or_else(|_| "node".to_string());
+        let node = node_binary();
         let mut child = Command::new(&node)
             .arg(&script)
             .stdin(Stdio::piped())
@@ -154,26 +154,57 @@ impl Drop for NodeStore {
     }
 }
 
-/// Где искать скрипт sidecar'а: env → рядом с exe → от cwd и вверх по
-/// предкам (тесты cargo стартуют из каталога крейта, не из воркспейса).
+/// E-1: каким node запускать sidecar. Порядок: явный `SWAGCOD_NODE` →
+/// упакованный `node.exe` рядом с exe (бандл везёт свой рантайм — ABI
+/// совпадает с бинарником better-sqlite3 гарантированно) → `vendor/node`
+/// (локальный расклад инструментов упаковки) → node из PATH (разработка).
+fn node_binary() -> String {
+    if let Ok(p) = std::env::var("SWAGCOD_NODE") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("node.exe");
+            if bundled.is_file() {
+                return bundled.to_string_lossy().to_string();
+            }
+            let vendored = dir.join("vendor").join("node").join("node.exe");
+            if vendored.is_file() {
+                return vendored.to_string_lossy().to_string();
+            }
+        }
+    }
+    "node".to_string()
+}
+
+/// Где искать скрипт sidecar'а: env → рядом с exe (бандл) → vendor рядом
+/// с exe → от cwd и вверх по предкам, включая vendor (тесты cargo стартуют
+/// из каталога крейта, разработка — из воркспейса).
 fn sidecar_script() -> StoreResult<PathBuf> {
     if let Ok(p) = std::env::var("SWAGCOD_STORE_SIDECAR") {
         return Ok(PathBuf::from(p));
     }
+    const CANDIDATES: &[&str] = &["sidecar", "vendor/sidecar", "vendor\\sidecar"];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("sidecar").join("store-server.js");
-            if p.is_file() {
-                return Ok(p);
+            for rel in CANDIDATES {
+                let p = dir.join(rel).join("store-server.js");
+                if p.is_file() {
+                    return Ok(p);
+                }
             }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         let mut dir = cwd.as_path();
         for _ in 0..6 {
-            let p = dir.join("sidecar").join("store-server.js");
-            if p.is_file() {
-                return Ok(p);
+            for rel in CANDIDATES {
+                let p = dir.join(rel).join("store-server.js");
+                if p.is_file() {
+                    return Ok(p);
+                }
             }
             match dir.parent() {
                 Some(parent) => dir = parent,
@@ -182,7 +213,7 @@ fn sidecar_script() -> StoreResult<PathBuf> {
         }
     }
     Err(StoreError::Sidecar(
-        "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe или cwd)".into(),
+        "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe, vendor или cwd)".into(),
     ))
 }
 
@@ -583,6 +614,17 @@ mod tests {
     fn node_integrity_ok() {
         let Some(store) = try_memory() else { return };
         assert_eq!(store.integrity_check().unwrap(), "ok");
+    }
+
+    /// E-1: тестовый exe живёт в target/*/deps — там нет ни node.exe, ни
+    /// vendor, поэтому резолв обязан упасть в PATH-`node` (если только
+    /// SWAGCOD_NODE не переопределил выбор явно).
+    #[test]
+    fn node_binary_falls_back_to_path_node() {
+        if std::env::var_os("SWAGCOD_NODE").is_some() {
+            return;
+        }
+        assert_eq!(node_binary(), "node");
     }
 
     /// Схема не разъезжается с JS-sidecar: одинаковый набор таблиц.
