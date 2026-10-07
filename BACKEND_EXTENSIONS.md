@@ -83,6 +83,17 @@ B-1…B-8 закрыты, better-sqlite3 в Node-sidecar стал основны
 
 ## E-4: JS-плагины в sidecar (горячая загрузка)
 
+> ЗАКРЫТ (ревизия 31): `sidecar/plugin-server.js` на вендорном node —
+> отдельные vm-контексты на плагин, жёсткий дедлайн (vm убивает
+> синхронный handler, 30 с default / SWAGCOD_JS_TIMEOUT_MS), console
+> перехвачен в output, fs/сеть недоступны. Мост к хранилищу — только
+> read-only prefs (get/all). Каталог `plugins/*.js` (SWAGCOD_PLUGINS_DIR
+> → exe_dir → cwd+предки), манифест — `swagcod.define({name,
+> description, parameters, handler})`. Имена `js:<name>` → approval и
+> журнал B-7 работают как для MCP. Вкладка Plugins: список, ошибки
+> загрузки, горячая перезагрузка (рестарт sidecar). Транспорт — общий
+> `stdio_rpc.rs` (выделен из mcp.rs). Демо: `plugins/hello.js`.
+
 Node теперь и так живёт рядом с приложением — грех не дать плагинам
 быть обычным JS вместо отдельных exe (B-5).
 

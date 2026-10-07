@@ -18,16 +18,15 @@
 //! статус честно виден в реестре.
 
 use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+/// Соединение с MCP-сервером — общий JSON-RPC-по-stdio транспорт
+/// (stdio_rpc): E-3 был первым потребителем, E-4 (JS-плагины) переиспользует.
+pub type Conn = crate::stdio_rpc::RpcConn;
 
 /// Версия протокола, которую предлагает клиент. Сервер отвечает своей —
 /// работаем с той, что вернул initialize.
@@ -36,9 +35,6 @@ pub const MCP_INIT_TIMEOUT_MS: u64 = 15_000;
 pub const MCP_CALL_TIMEOUT_MS: u64 = 60_000;
 /// Префикс имён MCP-инструментов в модели и журнале.
 pub const MCP_PREFIX: &str = "mcp:";
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Конфигурация сервера. Хранится JSON-массивом в prefs под ключом
 /// `mcp_servers` — реестр переживает перезапуск.
@@ -68,122 +64,14 @@ pub struct McpTool {
     pub parameters: Value,
 }
 
-/// Живое соединение: писатель в stdin, карта ожидающих ответов, ребёнок.
-pub struct Conn {
-    writer: AsyncMutex<ChildStdin>,
-    pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    next_id: AtomicU64,
-    child: AsyncMutex<Child>,
-}
-
-impl Conn {
-    /// JSON-RPC запрос с таймаутом. Потеря канала (сервер умер) — ошибка,
-    /// а не вечное ожидание.
-    pub async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let mut line = serde_json::to_string(&msg).map_err(|e| format!("mcp: json: {e}"))?;
-        line.push('\n');
-        {
-            let mut w = self.writer.lock().await;
-            if let Err(e) = w.write_all(line.as_bytes()).await {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(format!("mcp: stdin закрыт: {e}"));
-            }
-            let _ = w.flush().await;
-        }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(_)) => Err(format!("mcp: сервер завершил соединение ({method})")),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(format!("mcp: таймаут {method} ({} мс)", timeout.as_millis()))
-            }
-        }
-    }
-
-    /// Уведомление без id (notifications/initialized).
-    async fn notify(&self, method: &str) {
-        let msg = json!({"jsonrpc": "2.0", "method": method});
-        if let Ok(mut line) = serde_json::to_string(&msg) {
-            line.push('\n');
-            let mut w = self.writer.lock().await;
-            let _ = w.write_all(line.as_bytes()).await;
-            let _ = w.flush().await;
-        }
-    }
-
-    /// Убить процесс сервера (disconnect / удаление / выход).
-    pub async fn kill(&self) {
-        let _ = self.child.lock().await.start_kill();
-    }
-}
-
-/// Читатель stdout: ответы с id уходят ожидающим; серверные уведомления и
-/// запросы игнорируются (tools-only клиент). Конец stdout — сервер умер:
-/// pending вычищается, ожидающие получают ошибку канала.
-async fn reader_task(
-    stdout: tokio::process::ChildStdout,
-    pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    server: String,
-) {
-    let mut lines = BufReader::new(stdout).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                let v: Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue, // мусор в stdout сервера — не наш протокол
-                };
-                let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
-                    continue;
-                };
-                if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                    let _ = tx.send(v);
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    eprintln!("mcp: сервер {server} закрыл stdout");
-    pending.lock().unwrap().clear();
-}
-
 /// Поднять сервер и выполнить рукопожатие MCP. Ошибка — строка для статуса
 /// реестра: подключение не должно ронять приложение.
 pub async fn connect_with_timeout(
     cfg: &McpServerConfig,
     init_timeout: Duration,
 ) -> Result<Arc<Conn>, String> {
-    let mut cmd = Command::new(&cfg.command);
-    cmd.args(&cfg.args)
-        .envs(&cfg.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Сироты недопустимы: соединение, которое не дожило до реестра
-        // (таймаут рукопожатия, ошибка), обязано унести процесс с собой.
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("mcp {}: запуск: {e}", cfg.name))?;
-    let stdin = child.stdin.take().ok_or_else(|| "mcp: нет stdin".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "mcp: нет stdout".to_string())?;
-
-    let pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let conn = Arc::new(Conn {
-        writer: AsyncMutex::new(stdin),
-        pending: pending.clone(),
-        next_id: AtomicU64::new(0),
-        child: AsyncMutex::new(child),
-    });
-    tokio::spawn(reader_task(stdout, pending, cfg.name.clone()));
+    let label = format!("mcp {}", cfg.name);
+    let conn = crate::stdio_rpc::spawn(&cfg.command, &cfg.args, &cfg.env, &label)?;
 
     let init = conn
         .request(
@@ -196,9 +84,10 @@ pub async fn connect_with_timeout(
             init_timeout,
         )
         .await?;
-    if let Some(err) = init.get("error") {
+    if let Err(e) = crate::stdio_rpc::unwrap_response(&init, &format!("mcp {} initialize", cfg.name))
+    {
         conn.kill().await;
-        return Err(format!("mcp {}: initialize: {}", cfg.name, err));
+        return Err(e);
     }
     conn.notify("notifications/initialized").await;
     Ok(conn)

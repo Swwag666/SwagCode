@@ -158,7 +158,9 @@ impl Drop for NodeStore {
 /// упакованный `node.exe` рядом с exe (бандл везёт свой рантайм — ABI
 /// совпадает с бинарником better-sqlite3 гарантированно) → `vendor/node`
 /// (локальный расклад инструментов упаковки) → node из PATH (разработка).
-fn node_binary() -> String {
+/// E-4: pub — app-слой переиспользует порядок для JS-плагинов (один
+/// рантайм на все sidecar-процессы).
+pub fn node_binary() -> String {
     if let Ok(p) = std::env::var("SWAGCOD_NODE") {
         if !p.is_empty() {
             return p;
@@ -179,20 +181,17 @@ fn node_binary() -> String {
     "node".to_string()
 }
 
-/// Где искать скрипт sidecar'а: env → рядом с exe (бандл) → vendor рядом
-/// с exe → от cwd и вверх по предкам, включая vendor (тесты cargo стартуют
-/// из каталога крейта, разработка — из воркспейса).
-fn sidecar_script() -> StoreResult<PathBuf> {
-    if let Ok(p) = std::env::var("SWAGCOD_STORE_SIDECAR") {
-        return Ok(PathBuf::from(p));
-    }
+/// E-4: найти любой файл sidecar-расклада (store-server.js,
+/// plugin-server.js) по тем же кандидатам: рядом с exe (бандл) → vendor
+/// рядом с exe → от cwd и вверх по предкам, включая vendor.
+pub fn sidecar_file(name: &str) -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &["sidecar", "vendor/sidecar", "vendor\\sidecar"];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for rel in CANDIDATES {
-                let p = dir.join(rel).join("store-server.js");
+                let p = dir.join(rel).join(name);
                 if p.is_file() {
-                    return Ok(p);
+                    return Some(p);
                 }
             }
         }
@@ -201,9 +200,9 @@ fn sidecar_script() -> StoreResult<PathBuf> {
         let mut dir = cwd.as_path();
         for _ in 0..6 {
             for rel in CANDIDATES {
-                let p = dir.join(rel).join("store-server.js");
+                let p = dir.join(rel).join(name);
                 if p.is_file() {
-                    return Ok(p);
+                    return Some(p);
                 }
             }
             match dir.parent() {
@@ -212,9 +211,21 @@ fn sidecar_script() -> StoreResult<PathBuf> {
             }
         }
     }
-    Err(StoreError::Sidecar(
-        "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe, vendor или cwd)".into(),
-    ))
+    None
+}
+
+/// Где искать скрипт sidecar'а: env → рядом с exe (бандл) → vendor рядом
+/// с exe → от cwd и вверх по предкам, включая vendor (тесты cargo стартуют
+/// из каталога крейта, разработка — из воркспейса).
+fn sidecar_script() -> StoreResult<PathBuf> {
+    if let Ok(p) = std::env::var("SWAGCOD_STORE_SIDECAR") {
+        return Ok(PathBuf::from(p));
+    }
+    sidecar_file("store-server.js").ok_or_else(|| {
+        StoreError::Sidecar(
+            "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe, vendor или cwd)".into(),
+        )
+    })
 }
 
 /* ── Декодирование строк: JSON-значения колонок в доменные типы. ── */

@@ -12,7 +12,9 @@ use std::sync::Arc;
 pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
+pub mod jsplugins;
 pub mod mcp;
+pub mod stdio_rpc;
 
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
@@ -87,6 +89,11 @@ pub struct AppState {
     /// E-3: MCP-серверы — живые stdio-соединения, инструменты для модели и
     /// честные статусы. tokio-мьютекс: подключение — async (рукопожатие).
     pub mcp: Mutex<mcp::McpRegistry>,
+    /// E-4: sidecar JS-плагинов — живое соединение, загруженные инструменты
+    /// и честные ошибки загрузки каталога.
+    pub js_host: std::sync::Mutex<Option<Arc<jsplugins::JsHost>>>,
+    pub js_tools: std::sync::Mutex<Vec<jsplugins::JsPluginTool>>,
+    pub js_errors: std::sync::Mutex<Vec<String>>,
 }
 
 /// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
@@ -196,6 +203,9 @@ impl Default for AppState {
             turn_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_meta: std::sync::Mutex::new(std::collections::HashMap::new()),
             mcp: Mutex::new(mcp::McpRegistry::default()),
+            js_host: std::sync::Mutex::new(None),
+            js_tools: std::sync::Mutex::new(Vec::new()),
+            js_errors: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -984,6 +994,14 @@ async fn start_turn(
             parameters: t.parameters.clone(),
         }));
     }
+    /* E-4: JS-плагины sidecar — тот же единый список (имена js:*). */
+    if let Ok(tools) = state.js_tools.lock() {
+        specs.extend(tools.iter().map(|t| ToolSpec {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: t.parameters.clone(),
+        }));
+    }
     let tool_wire: Vec<serde_json::Value> =
         ChatRequest::new(&effective_model, Vec::new()).with_tools(&specs).tools;
     let temperature = temperature.map(|t| t as f32);
@@ -1276,6 +1294,8 @@ async fn start_turn(
                         run_semantic_search(&app_state, &call, &cwd).await
                     } else if call.name.starts_with(mcp::MCP_PREFIX) {
                         run_mcp_call(&app_state, &call).await
+                    } else if call.name.starts_with(jsplugins::JS_PREFIX) {
+                        run_js_call(&app_state, &call).await
                     } else {
                         execute_tool(&call, &cwd, tool_timeout, &plugins).await
                     };
@@ -2869,6 +2889,118 @@ async fn mcp_remove(state: State<'_, Arc<AppState>>, name: String) -> Result<(),
     Ok(())
 }
 
+/* ===================== E-4: JS-плагины в sidecar ===================== */
+
+/// Поднять (или переподнять) sidecar JS-плагинов и установить инструменты.
+/// Ошибка — не приговор: статус виден в настройках, reload повторит.
+async fn start_js_plugins(state: &AppState) {
+    let dir = jsplugins::plugins_dir();
+    let db = db_path().ok();
+    match jsplugins::JsHost::start(&dir, db.as_deref()).await {
+        Ok(host) => {
+            eprintln!(
+                "js-плагины: {} инструментов из {} (ошибок: {})",
+                host.tools.len(),
+                host.dir,
+                host.errors.len()
+            );
+            if let Ok(mut t) = state.js_tools.lock() {
+                *t = host.tools.clone();
+            }
+            if let Ok(mut e) = state.js_errors.lock() {
+                *e = host.errors.clone();
+            }
+            if let Ok(mut h) = state.js_host.lock() {
+                *h = Some(Arc::new(host));
+            }
+        }
+        Err(e) => {
+            eprintln!("js-плагины: {e}");
+            if let Ok(mut errs) = state.js_errors.lock() {
+                *errs = vec![e];
+            }
+        }
+    }
+}
+
+/// E-4: вызов JS-плагина из хода. Имя `js:<name>` не входит в BUILTIN —
+/// подтверждение при OnDangerous спрашивает машина хода, журнал B-7 пишет
+/// tool с префиксом `js:`. Дедлайн гарантирует vm на стороне sidecar.
+async fn run_js_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    let Some(short) = call.name.strip_prefix(jsplugins::JS_PREFIX) else {
+        return fail(format!("js: неверное имя инструмента: {}", call.name));
+    };
+    if short.is_empty() || short.contains(':') {
+        return fail(format!("js: неверное имя инструмента: {}", call.name));
+    }
+    let host = state
+        .js_host
+        .lock()
+        .ok()
+        .and_then(|h| h.clone());
+    let Some(host) = host else {
+        return fail("js: sidecar плагинов не запущен (перезагрузите в настройках Plugins)".into());
+    };
+    let args = serde_json::Value::Object(call.arguments.clone());
+    match host.call_plugin(short, args).await {
+        Ok((ok, output)) => ToolOutcome {
+            ok,
+            output: if output.trim().is_empty() {
+                "(пустой ответ)".to_string()
+            } else {
+                output
+            },
+        },
+        Err(e) => fail(e),
+    }
+}
+
+/// E-4: список для UI — состояние sidecar, инструменты, ошибки загрузки.
+#[tauri::command]
+async fn js_plugins_list(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let host = state.js_host.lock().ok().and_then(|h| h.clone());
+    let tools: Vec<serde_json::Value> = state
+        .js_tools
+        .lock()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.short,
+                        "description": t.description,
+                        "file": t.file,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let errors = state.js_errors.lock().map(|e| e.clone()).unwrap_or_default();
+    let dir = host
+        .as_ref()
+        .map(|h| h.dir.clone())
+        .unwrap_or_else(|| jsplugins::plugins_dir().to_string_lossy().to_string());
+    Ok(serde_json::json!({
+        "running": host.is_some(),
+        "dir": dir,
+        "tools": tools,
+        "errors": errors,
+    }))
+}
+
+/// E-4: горячая перезагрузка — полный рестарт sidecar (свежие vm-контексты,
+/// никакого устаревшего состояния). Старый процесс убиваем явно.
+#[tauri::command]
+async fn js_plugins_reload(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    // Guard std-мьютекса не переживает await: сначала забираем хост.
+    let old = state.js_host.lock().ok().and_then(|mut h| h.take());
+    if let Some(old) = old {
+        old.kill().await;
+    }
+    start_js_plugins(&state).await;
+    js_plugins_list(state).await
+}
+
 pub fn run() {
     /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
        панику инициализации. Лог — на диске, телеметрии нет. */
@@ -2951,6 +3083,14 @@ pub fn run() {
                     }
                 });
             }
+            /* E-4: sidecar JS-плагинов тоже стартует фоном — бюджет старта
+               не ждёт node-процесс и чтение каталога. */
+            {
+                let st = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    start_js_plugins(&st).await;
+                });
+            }
             app.manage(state.clone());
 
             let handle = app.handle().clone();
@@ -2974,6 +3114,8 @@ pub fn run() {
             mcp_list,
             mcp_add,
             mcp_remove,
+            js_plugins_list,
+            js_plugins_reload,
             initial_prefs,
             save_background,
             load_background,

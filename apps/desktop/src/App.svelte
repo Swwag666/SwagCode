@@ -430,6 +430,37 @@
     }
   }
 
+  /* E-4: JS-плагины sidecar — список инструментов, ошибки загрузки
+     каталога plugins/*.js и горячая перезагрузка (полный рестарт sidecar). */
+  let jsPlugTools = $state<{ name: string; description: string; file: string }[]>([])
+  let jsPlugErrors = $state<string[]>([])
+  let jsPlugDir = $state('')
+  let jsPlugBusy = $state(false)
+  async function loadJsPlugins(): Promise<void> {
+    try {
+      const r = await invoke<{ running: boolean; dir: string; tools: { name: string; description: string; file: string }[]; errors: string[] }>('js_plugins_list')
+      jsPlugTools = r.tools
+      jsPlugErrors = r.errors
+      jsPlugDir = r.dir
+    } catch (e) {
+      jsPlugErrors = [String(e)]
+    }
+  }
+  async function reloadJsPlugins(): Promise<void> {
+    jsPlugBusy = true
+    jsPlugErrors = []
+    try {
+      const r = await invoke<{ running: boolean; dir: string; tools: { name: string; description: string; file: string }[]; errors: string[] }>('js_plugins_reload')
+      jsPlugTools = r.tools
+      jsPlugErrors = r.errors
+      jsPlugDir = r.dir
+    } catch (e) {
+      jsPlugErrors = [String(e)]
+    } finally {
+      jsPlugBusy = false
+    }
+  }
+
   /* Диалог подтверждения действия: ядро спрашивает событием
      approval_required, решение уходит командой respond_approval.
      Решение принимает человек здесь, но исполняет его ядро — не UI. */
@@ -1646,7 +1677,7 @@
         <nav class="settings-nav">
           <button class="settings-nav-item" class:active={settingsTab === 'general'} onclick={() => (settingsTab = 'general')}><Icon name="gear" size={14} /> General</button>
           <button class="settings-nav-item" class:active={settingsTab === 'models'} onclick={() => (settingsTab = 'models')}><Icon name="cpu" size={14} /> {t('modelTitle')}</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => (settingsTab = 'plugins')}><Icon name="plug" size={14} /> Plugins</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => { settingsTab = 'plugins'; void loadJsPlugins() }}><Icon name="plug" size={14} /> Plugins</button>
           <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
         </nav>
@@ -1987,7 +2018,37 @@
             </div>
           {:else}
             <div class="settings-section">
-              <p class="settings-empty">Плагины скоро будут доступны</p>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('jsPlugTitle')}</span>
+                  <span class="label-desc">{jsPlugDir}</span>
+                </div>
+                <button class="appearance-btn" disabled={jsPlugBusy} onclick={() => void reloadJsPlugins()}>
+                  {jsPlugBusy ? t('jsPlugBusy') : t('jsPlugReload')}
+                </button>
+              </div>
+              {#each jsPlugTools as p (p.name)}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{p.name}</span>
+                    <span class="label-desc">{p.description}{p.file ? ` — ${p.file}` : ''}</span>
+                  </div>
+                </div>
+              {/each}
+              {#each jsPlugErrors as e, i (`err-${i}`)}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-desc">{e}</span>
+                  </div>
+                </div>
+              {/each}
+              {#if !jsPlugBusy && jsPlugTools.length === 0 && jsPlugErrors.length === 0}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-desc">{t('jsPlugNone')}</span>
+                  </div>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>

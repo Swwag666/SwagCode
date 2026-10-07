@@ -22,9 +22,11 @@ $root = Split-Path $PSScriptRoot -Parent
 $vendor = Join-Path $root 'vendor\sidecar'
 $deps = @('better-sqlite3', 'bindings', 'file-uri-to-path')
 
-# 1. Server script.
+# 1. Server scripts.
 New-Item -ItemType Directory -Force -Path $vendor | Out-Null
 Copy-Item (Join-Path $root 'sidecar\store-server.js') (Join-Path $vendor 'store-server.js') -Force
+# E-4: JS plugins sidecar shares the bundle (same node, same node_modules).
+Copy-Item (Join-Path $root 'sidecar\plugin-server.js') (Join-Path $vendor 'plugin-server.js') -Force
 
 # 2. Flat node_modules from the pnpm store: copy real package directories,
 #    resolving symlinks. /XD node_modules cuts nested pnpm links.
