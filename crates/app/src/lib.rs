@@ -142,6 +142,9 @@ pub struct SessionBrief {
     /// Когда сессия последний раз шевелилась: конец последнего хода или
     /// создание. Сайдбар сортирует группы «по обновлению» как DeepSeek.
     pub last_activity_ms: u64,
+    /// B-7: политика подтверждений сессии (None = глобальная). UI настроек
+    /// инициализирует селектор текущим значением, а не гадает.
+    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 impl From<&Session> for SessionBrief {
@@ -164,6 +167,7 @@ impl From<&Session> for SessionBrief {
                 .last()
                 .map(|t| t.ended_ms.unwrap_or(t.started_ms))
                 .unwrap_or(s.created_ms),
+            approval_policy: s.approval_policy,
         }
     }
 }

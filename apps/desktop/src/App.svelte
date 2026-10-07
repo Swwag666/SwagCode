@@ -38,7 +38,7 @@
   let models = $state<string[]>([])
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
-  let settingsTab = $state<'general' | 'models' | 'plugins'>('general')
+  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security'>('general')
   let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
@@ -363,6 +363,114 @@
       // ход уже завершился: канал закрыт, решать нечего
     }
   }
+
+  /* ── B-7/B-8: вкладка «Безопасность» — DPAPI-ключ, права сессии, журнал ──
+     Всё уже живёт в ядре (save_protected_key, set_session_approval_policy,
+     approval_log); UI только показывает и дёргает команды. */
+  let dpapiKey = $state('')
+  let dpapiStored = $state(false)
+  let dpapiStatus = $state<string | null>(null)
+  let sessPolicy = $state<'global' | PermissionMode>('global')
+  interface ApprovalRow {
+    session_id: string
+    turn_id: string
+    call_id: string
+    tool: string
+    summary: string
+    decision: string
+    actor: string
+    decided_ms: number
+  }
+  let approvalRows = $state<ApprovalRow[]>([])
+  let approvalLogLoaded = $state(false)
+
+  async function refreshSecurity(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      const blob = await invoke<string | null>('get_pref', { key: 'api_key_dpapi' })
+      dpapiStored = !!blob && blob.length > 0
+    } catch {
+      dpapiStored = false
+    }
+    try {
+      const list = await invoke<{ id: string; approval_policy?: string | null }[]>('list_sessions')
+      const cur = list.find((s) => s.id === currentSession)
+      sessPolicy = (cur?.approval_policy as PermissionMode | null | undefined) ?? 'global'
+    } catch {
+      // старое ядро без per-session политики: оставляем «как глобальные»
+    }
+  }
+
+  function flashStatus(msg: string): void {
+    dpapiStatus = msg
+    setTimeout(() => (dpapiStatus = null), 2500)
+  }
+
+  async function saveDpapiKey(): Promise<void> {
+    if (!dpapiKey.trim()) return
+    try {
+      await invoke('save_protected_key', { key: dpapiKey })
+      dpapiKey = ''
+      dpapiStored = true
+      flashStatus(t('dpapiSaved'))
+    } catch (err) {
+      flashStatus(`${t('dpapiFailed')}: ${err}`)
+    }
+  }
+
+  async function clearDpapiKey(): Promise<void> {
+    try {
+      await invoke('clear_protected_key')
+      dpapiStored = false
+      flashStatus(t('dpapiCleared'))
+    } catch (err) {
+      flashStatus(`${t('dpapiFailed')}: ${err}`)
+    }
+  }
+
+  async function applySessPolicy(p: 'global' | PermissionMode): Promise<void> {
+    sessPolicy = p
+    if (!currentSession) return
+    try {
+      await invoke('set_session_approval_policy', {
+        sessionId: currentSession,
+        policy: p === 'global' ? null : p,
+      })
+      flashStatus(t('permApplied'))
+    } catch (err) {
+      flashStatus(`${t('permFailed')}: ${err}`)
+    }
+  }
+
+  async function loadApprovalLog(): Promise<void> {
+    try {
+      approvalRows = await invoke<ApprovalRow[]>('approval_log', { sessionId: null, limit: 100 })
+      approvalLogLoaded = true
+    } catch {
+      approvalRows = []
+      approvalLogLoaded = true
+    }
+  }
+
+  function fmtLogTime(ms: number): string {
+    const d = new Date(ms)
+    return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`
+  }
+
+  /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
+     «подозрительно тихий», а не вечное «думает». Состояние живёт здесь,
+     derived turnQuiet — ниже, рядом с `thinking` (порядок объявлений). */
+  let lastLiveEventMs = $state(0)
+  let quietTick = $state(0)
+  const QUIET_MS = 5 * 60 * 1000
+  $effect(() => {
+    const id = setInterval(() => (quietTick++), 15000)
+    return () => clearInterval(id)
+  })
+  /* Вкладка безопасности обновляет свои данные при открытии. */
+  $effect(() => {
+    if (showSettings && settingsTab === 'security') void refreshSecurity()
+  })
 
   async function copyWorkspace(path: string): Promise<void> {
     try {
@@ -872,6 +980,12 @@
 
   /** Нейронка думает именно в открытом сейчас чате. */
   let thinking = $derived(liveStates[currentSession ?? ''] === 'running')
+  /* B-8: «подозрительно тихо» — производная от thinking и метки жизни:
+     ход идёт, но событий нет дольше порога. quietTick лишь тикает, чтобы
+     derived пересчитывался без внешних событий. */
+  const turnQuiet = $derived(
+    thinking && lastLiveEventMs > 0 && quietTick >= 0 && Date.now() - lastLiveEventMs > QUIET_MS
+  )
   /** Отправка идёт именно в открытый сейчас чат. */
   let sending = $derived(sendingSession !== null && sendingSession === currentSession)
   /* Плашка рождения перечитывается на каждый revision: items мутируется
@@ -972,6 +1086,8 @@
         const d = e.kind.data as { turn: string; session: string }
         turnSession.set(d.turn, d.session)
         liveStates[d.session] = 'running'
+        // B-8: новый ход — часы тишины обнуляются.
+        lastLiveEventMs = Date.now()
       }
       if (e.kind.kind === 'turn_ended') {
         const d = e.kind.data as { turn: string; session: string; ok: boolean }
@@ -997,6 +1113,8 @@
       }
       const sid = sessionOfEvent(e)
       if (!sid) continue
+      // B-8: любое событие активной сессии — признак жизни для watchdog.
+      if (sid === currentSession) lastLiveEventMs = Date.now()
       const arr = bySession.get(sid)
       if (arr) arr.push(e)
       else bySession.set(sid, [e])
@@ -1409,6 +1527,7 @@
           <button class="settings-nav-item" class:active={settingsTab === 'general'} onclick={() => (settingsTab = 'general')}><Icon name="gear" size={14} /> General</button>
           <button class="settings-nav-item" class:active={settingsTab === 'models'} onclick={() => (settingsTab = 'models')}><Icon name="cpu" size={14} /> {t('modelTitle')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => (settingsTab = 'plugins')}><Icon name="plug" size={14} /> Plugins</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
         </nav>
         <div class="settings-content">
           {#if settingsTab === 'general'}
@@ -1575,6 +1694,90 @@
                   {/if}
                 </div>
               </div>
+            </div>
+          {:else if settingsTab === 'security'}
+            <div class="settings-section">
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('dpapiTitle')}</span>
+                  <span class="label-desc">{t('dpapiDesc')}</span>
+                </div>
+                <div class="dpapi-controls">
+                  <input
+                    class="dpapi-input"
+                    type="password"
+                    bind:value={dpapiKey}
+                    placeholder="sk-..."
+                    aria-label={t('dpapiTitle')}
+                    autocomplete="off"
+                  />
+                  <button class="appearance-btn" onclick={() => void saveDpapiKey()} disabled={!dpapiKey.trim()}>{t('dpapiSave')}</button>
+                  <button class="appearance-btn" onclick={() => void clearDpapiKey()} disabled={!dpapiStored}>{t('dpapiForget')}</button>
+                </div>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{dpapiStored ? t('dpapiStored') : t('dpapiNotStored')}</span>
+                </div>
+                {#if dpapiStatus}<span class="dpapi-status">{dpapiStatus}</span>{/if}
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('sessPolicyTitle')}</span>
+                  <span class="label-desc">{t('sessPolicyDesc')}</span>
+                </div>
+                <select
+                  class="settings-select"
+                  value={sessPolicy}
+                  onchange={(e) => void applySessPolicy(e.currentTarget.value as 'global' | PermissionMode)}
+                  disabled={!currentSession}
+                >
+                  <option value="global">{t('policyGlobal')}</option>
+                  {#each permSpecs as p (p.id)}
+                    <option value={p.id}>{p.title}</option>
+                  {/each}
+                </select>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('approvalLogTitle')}</span>
+                </div>
+                <button class="appearance-btn" onclick={() => void loadApprovalLog()}>{t('approvalLogBtn')}</button>
+              </div>
+              {#if approvalLogLoaded}
+                {#if approvalRows.length === 0}
+                  <div class="approval-empty">{t('approvalLogEmpty')}</div>
+                {:else}
+                  <div class="approval-scroll">
+                    <table class="approval-table">
+                      <thead>
+                        <tr>
+                          <th>{t('logColTime')}</th>
+                          <th>{t('logColTool')}</th>
+                          <th></th>
+                          <th>{t('logColDecision')}</th>
+                          <th>{t('logColActor')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each approvalRows as r, i (i)}
+                          <tr>
+                            <td class="log-time">{fmtLogTime(r.decided_ms)}</td>
+                            <td>{r.tool}</td>
+                            <td class="log-summary" title={r.summary}>{r.summary}</td>
+                            <td>
+                              <span class="log-decision" class:ok={r.decision === 'approved'}>
+                                {r.decision === 'approved' ? t('decisionApproved') : t('decisionDenied')}
+                              </span>
+                            </td>
+                            <td>{r.actor === 'user' ? t('actorUser') : t('actorSystem')}</td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                {/if}
+              {/if}
             </div>
           {:else if settingsTab === 'models'}
             <div class="settings-section">
@@ -1922,7 +2125,11 @@
         <span class="meta">{turnsCount} {t('turns')}</span>
         {#if tokensPerSec !== null}<span class="meta speed">{tokensPerSec} tok/s</span>{/if}
         {#if thinking}
-          <span class="meta thinking-badge">● {t('thinking')}</span>
+          {#if turnQuiet}
+            <span class="meta thinking-badge quiet">● {t('quietTurn')}</span>
+          {:else}
+            <span class="meta thinking-badge">● {t('thinking')}</span>
+          {/if}
         {:else}
           <span class="meta">{t('standard')}</span>
         {/if}
@@ -3234,6 +3441,103 @@
 
   .session-title:hover .meta.thinking-badge {
     text-shadow: 0 0 8px var(--accent-glow);
+  }
+
+  /* B-8: «подозрительно тихо» — янтарный вместо акцентного, без пульса
+     «думает»: ход не думает, он молчит, и это надо заметить. */
+  .meta.thinking-badge.quiet {
+    color: #ffb86b;
+    animation: none;
+  }
+
+  /* B-7/B-8: вкладка «Безопасность» в настройках */
+  .dpapi-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .dpapi-input {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: inherit;
+    border-radius: 8px;
+    padding: 6px 10px;
+    width: 220px;
+    font-size: 12px;
+  }
+
+  .dpapi-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .dpapi-status {
+    font-size: 12px;
+    opacity: 0.75;
+  }
+
+  .approval-empty {
+    font-size: 12px;
+    opacity: 0.6;
+    padding: 4px 2px;
+  }
+
+  .approval-scroll {
+    max-height: 260px;
+    overflow-y: auto;
+    margin-top: 4px;
+  }
+
+  .approval-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .approval-table th {
+    text-align: left;
+    opacity: 0.6;
+    font-weight: 500;
+    padding: 4px 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    position: sticky;
+    top: 0;
+    background: inherit;
+  }
+
+  .approval-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    vertical-align: top;
+  }
+
+  .log-time {
+    white-space: nowrap;
+    opacity: 0.7;
+  }
+
+  .log-summary {
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.85;
+  }
+
+  .log-decision {
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(255, 90, 90, 0.14);
+    color: #ff8a8a;
+    white-space: nowrap;
+  }
+
+  .log-decision.ok {
+    background: rgba(90, 220, 130, 0.12);
+    color: #6fdc8c;
   }
 
   .tabs {
