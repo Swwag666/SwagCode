@@ -577,13 +577,14 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
            траектории сессии. Не рекурсивен: суб-агент не плодит своих. */
         ToolSpec {
             name: "subagent".into(),
-            description: "Run an isolated sub-agent for a self-contained research or analysis task. The sub-agent gets a fresh context (optionally seeded with the session summary), read-only tools only (read, list, grep, glob, fetch_url, semantic_search), its own token budget and round cap. Its full run is recorded as a child turn of the current turn, and its final report is returned here. Use for focused independent investigation that should not pollute the main context. It cannot modify files or spawn sub-agents of its own.".into(),
+            description: "Run an isolated sub-agent for a self-contained research or analysis task. The sub-agent gets a fresh context (optionally seeded with the session summary), read-only tools only (read, list, grep, glob, fetch_url, semantic_search), its own token budget and round cap. Its full run is recorded as a child turn of the current turn, and its final report is returned here. Use for focused independent investigation that should not pollute the main context. It cannot modify files or spawn sub-agents of its own. Pass a cheaper model (e.g. a flash/mini one from the active provider) for bulk research; omit model to reuse the parent turn's model.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string", "description": "Self-contained task for the sub-agent (it sees no other context by default)" },
                     "context": { "type": "boolean", "description": "Seed the sub-agent with the session summary (B-3), default false" },
-                    "max_rounds": { "type": "integer", "description": "Tool-round cap 1..12, default 6" }
+                    "max_rounds": { "type": "integer", "description": "Tool-round cap 1..12, default 6" },
+                    "model": { "type": "string", "description": "Model for the sub-agent run (must exist on the active provider); empty or omitted = parent turn's model" }
                 },
                 "required": ["prompt"]
             }),
@@ -1092,5 +1093,9 @@ mod tests {
         assert!(spec.parameters.get("properties").is_some());
         let required = spec.parameters["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "prompt"));
+        // Модель ветки — опциональный аргумент (по умолчанию модель родителя).
+        let props = spec.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("model"));
+        assert!(!required.iter().any(|v| v == "model"));
     }
 }

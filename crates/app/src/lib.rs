@@ -2214,6 +2214,19 @@ pub fn subagent_limits(args: &serde_json::Map<String, serde_json::Value>) -> (u3
     (rounds, budget)
 }
 
+/// Модель ветки: аргумент `model`, иначе модель родительского хода.
+/// Пустая/пробельная строка — тоже родитель (модель могла прийти из
+/// шаблона с незаполненным плейсхолдером). Несуществующую модель честно
+/// отвергнет сам провайдер — выдумывать проверку по списку здесь нечем.
+pub fn subagent_model(args: &serde_json::Map<String, serde_json::Value>, parent: &str) -> String {
+    args.get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(parent)
+        .to_string()
+}
+
 /// Прогнать ветку суб-агента: изолированный диалог с моделью, read-only
 /// инструменты, дочерняя запись хода. `session_history` — снимок истории
 /// СЕССИИ для save_turn: messages заменяются целиком, поэтому изолированную
@@ -2254,6 +2267,9 @@ async fn run_subagent(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let (max_rounds, budget) = subagent_limits(&call.arguments);
+    // Ветка может ехать на своей модели (дешёвый флеш для bulk-поиска),
+    // по умолчанию — модель родительского хода.
+    let model = subagent_model(&call.arguments, model);
     // turns.id — глобальный ключ: id ветки = id родителя + уникальный хвост.
     let child_id = format!("{parent_tid}-sub-{}", short_id());
     let child_tid = swagcod_core::TurnId::new(&child_id);
@@ -2295,8 +2311,8 @@ async fn run_subagent(
         .filter(|s| SUBAGENT_SAFE_TOOLS.contains(&s.name.as_str()))
         .collect();
     let tool_wire: Vec<serde_json::Value> =
-        ChatRequest::new(model, Vec::new()).with_tools(&specs).tools;
-    let cpt = swagcod_core::context::chars_per_token(model, None);
+        ChatRequest::new(&model, Vec::new()).with_tools(&specs).tools;
+    let cpt = swagcod_core::context::chars_per_token(&model, None);
 
     let mut est_in: u64 = 0;
     let mut est_out: u64 = 0;
@@ -2465,7 +2481,7 @@ async fn run_subagent(
 
     // Отчёт родительскому ходу: текст ветки + честная статистика.
     let mut output = format!(
-        "[суб-агент {child_id}] раундов: {rounds_used}, инструментов: {}, токенов (оценка): {est_in} in / {est_out} out\n",
+        "[суб-агент {child_id} · {model}] раундов: {rounds_used}, инструментов: {}, токенов (оценка): {est_in} in / {est_out} out\n",
         all_tools.len()
     );
     if final_content.trim().is_empty() {
@@ -3969,6 +3985,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_model_override_and_fallback() {
+        use serde_json::json;
+        let parent = "pro-model";
+        // Явная модель ветки — едет она.
+        let args = json!({"prompt": "x", "model": "cheap-flash"}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), "cheap-flash");
+        // Пробелы по краям режутся.
+        let args = json!({"prompt": "x", "model": "  cheap-flash  "}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), "cheap-flash");
+        // Нет/пусто/пробелы — модель родителя.
+        let args = json!({"prompt": "x"}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), parent);
+        let args = json!({"prompt": "x", "model": ""}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), parent);
+        let args = json!({"prompt": "x", "model": "   "}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), parent);
+        // Не строка — тоже родитель, а не паника.
+        let args = json!({"prompt": "x", "model": 42}).as_object().cloned().unwrap();
+        assert_eq!(subagent_model(&args, parent), parent);
+    }
 
     #[test]
     fn attachments_text_goes_in_binary_and_big_get_honest_note() {
