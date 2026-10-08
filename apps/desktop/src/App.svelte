@@ -39,7 +39,7 @@
   let models = $state<string[]>([])
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
-  let settingsTab = $state<'general' | 'models' | 'plugins' | 'security' | 'mcp' | 'telemetry'>('general')
+  let settingsTab = $state<'general' | 'models' | 'providers' | 'plugins' | 'security' | 'mcp' | 'telemetry'>('general')
   let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
@@ -351,6 +351,141 @@
     invoke('open_in_explorer', { sessionId, path }).catch(() => {})
   }
 
+  /* Провайдеры: каталог пресетов + custom, Fetch models с вопросом
+     «сохранять или нет», активный провайдер для ходов. Ключи во фронт
+     не прилетают — только has_key; ключ уходит лишь в save/fetch. */
+  interface ProviderInfo {
+    id: string
+    label: string
+    base_url: string
+    flavor: string
+    built_in: boolean
+    needs_key: boolean
+    has_key: boolean
+    key_url: string
+    models: string[]
+  }
+  interface FetchedModel { id: string; label: string }
+  let provState = $state<{ active: string; providers: ProviderInfo[] } | null>(null)
+  let provBusy = $state(false)
+  let provNote = $state('')
+  let provFetching = $state('')
+  let provKeys = $state<Record<string, string>>({})
+  let provPreview = $state<{ id: string | null; label: string; base_url: string; flavor: string; typedKey: string; models: FetchedModel[] } | null>(null)
+  let customLabel = $state('')
+  let customBase = $state('')
+  let customKey = $state('')
+  let customFlavor = $state<'openai' | 'anthropic'>('openai')
+
+  async function loadProviders(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      provState = await invoke<{ active: string; providers: ProviderInfo[] }>('providers_state')
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    }
+  }
+
+  /** Список моделей активного провайдера (старт + смена провайдера + refresh). */
+  async function reloadModels(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      const raw = await invoke<{ data: { id: string }[] }>('list_models')
+      models = raw.data.map((m) => m.id)
+      if (models.length > 0 && !models.includes(modelName)) {
+        modelName = models[0]
+      }
+    } catch {
+      // Не критично
+    }
+  }
+
+  async function useProvider(id: string): Promise<void> {
+    provBusy = true
+    try {
+      await invoke('set_active_provider', { id })
+      await loadProviders()
+      await reloadModels()
+      provNote = t('provActivated')
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    } finally {
+      provBusy = false
+    }
+  }
+
+  /** Fetch моделей: превью списком + вопрос «сохранять или нет», без тихой записи. */
+  async function fetchModels(p: { id: string | null; label: string; base_url: string; flavor: string }, typedKey: string): Promise<void> {
+    const pid = p.id ?? 'custom-new'
+    provFetching = pid
+    provNote = ''
+    try {
+      const arg: Record<string, unknown> = { baseUrl: p.base_url, flavor: p.flavor }
+      if (p.id) arg.id = p.id
+      if (typedKey.trim()) arg.key = typedKey
+      const list = await invoke<FetchedModel[]>('fetch_provider_models', arg)
+      provPreview = { id: p.id, label: p.label, base_url: p.base_url, flavor: p.flavor, typedKey, models: list }
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    } finally {
+      provFetching = ''
+    }
+  }
+
+  async function savePreview(): Promise<void> {
+    if (!provPreview) return
+    provBusy = true
+    try {
+      const pv = provPreview
+      const arg: Record<string, unknown> = {
+        label: pv.label,
+        baseUrl: pv.base_url,
+        flavor: pv.flavor,
+        models: pv.models.map((m) => m.id),
+      }
+      if (pv.id) arg.id = pv.id
+      else {
+        if (!customLabel.trim() || !customBase.trim()) return
+        arg.label = customLabel
+        arg.baseUrl = customBase
+      }
+      // Ключ кладём в DPAPI только вместе с явным сохранением.
+      if (pv.typedKey.trim()) arg.key = pv.typedKey
+      const savedId = await invoke<string>('save_provider', arg)
+      provPreview = null
+      if (!pv.id) {
+        customLabel = ''
+        customBase = ''
+        customKey = ''
+      }
+      await loadProviders()
+      // Сохранили модели активного — сразу в селект.
+      const st = provState
+      if (st && st.providers.find((x) => x.id === savedId && x.id === st.active)) {
+        await reloadModels()
+      }
+      provNote = t('provSaved')
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    } finally {
+      provBusy = false
+    }
+  }
+
+  async function deleteProvider(id: string): Promise<void> {
+    provBusy = true
+    try {
+      await invoke('delete_provider', { id })
+      await loadProviders()
+      await reloadModels()
+      provNote = t('provDeleted')
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    } finally {
+      provBusy = false
+    }
+  }
+
   /* E-9: импорт сессий из DSH Desktop (кнопка в настройках General).
      Бэкенд идемпотентен: повторный импорт не плодит дубли. */
   let dshImportBusy = $state(false)
@@ -360,18 +495,19 @@
     dshImportBusy = true
     dshImportNote = ''
     try {
-      const r = await invoke<{ sessions: number; turns: number; messages: number; skipped: number; errors: string[] }>('import_dsh_sessions')
-      if (r.sessions === 0 && r.skipped === 0) {
+      const r = await invoke<{ sessions: number; turns: number; messages: number; skipped: number; resumed: number; errors: string[] }>('import_dsh_sessions')
+      if (r.sessions === 0 && r.skipped === 0 && r.resumed === 0) {
         dshImportNote = t('dshImportNone')
       } else {
         dshImportNote = t('dshImportDone')
           .replace('{s}', String(r.sessions))
           .replace('{t}', String(r.turns))
           .replace('{m}', String(r.messages))
+        if (r.resumed > 0) dshImportNote += `, ${t('dshImportResumed')}: ${r.resumed}`
         if (r.skipped > 0) dshImportNote += `, ${t('dshImportSkipped')}: ${r.skipped}`
         if (r.errors.length > 0) dshImportNote += `, ${t('dshImportErrors')}: ${r.errors.length}`
       }
-      if (r.sessions > 0) {
+      if (r.sessions > 0 || r.resumed > 0) {
         sessionRefreshTick++
         void loadWorkspaces()
       }
@@ -1649,15 +1785,7 @@
         /* Карта сессия→cwd нужна до первого «+»: новая сессия идёт в папку,
            где сидит пользователь, а не в домашнюю. */
         void loadWorkspaces()
-        try {
-          const raw = await invoke<{ data: { id: string }[] }>('list_models')
-          models = raw.data.map((m) => m.id)
-          if (models.length > 0 && !models.includes(modelName)) {
-            modelName = models[0]
-          }
-        } catch {
-          // Не критично
-        }
+        void reloadModels()
         /* Сохранённые права применяем к ядру при старте, иначе UI показывает
            одно, а сессия живёт с ApprovalPolicy::OnDangerous по умолчанию. */
         try {
@@ -1747,6 +1875,7 @@
         <nav class="settings-nav">
           <button class="settings-nav-item" class:active={settingsTab === 'general'} onclick={() => (settingsTab = 'general')}><Icon name="gear" size={14} /> General</button>
           <button class="settings-nav-item" class:active={settingsTab === 'models'} onclick={() => (settingsTab = 'models')}><Icon name="cpu" size={14} /> {t('modelTitle')}</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'providers'} onclick={() => { settingsTab = 'providers'; void loadProviders() }}><Icon name="sliders" size={14} /> {t('provTab')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => { settingsTab = 'plugins'; void loadJsPlugins() }}><Icon name="plug" size={14} /> Plugins</button>
           <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
@@ -2032,6 +2161,7 @@
                     <option value={m}>{m}</option>
                   {/each}
                 </select>
+                <button class="appearance-btn" onclick={() => void reloadModels()} title={t('modelRefresh')}>{t('modelRefresh')}</button>
               </div>
               <div class="settings-row">
                 <div class="settings-label">
@@ -2061,6 +2191,98 @@
                   </button>
                 {/each}
               </div>
+            </div>
+          {:else if settingsTab === 'providers'}
+            <div class="settings-section">
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('provTitle')}</span>
+                  <span class="label-desc">{t('provDesc')}</span>
+                </div>
+                <button class="appearance-btn" onclick={() => void loadProviders()}>{t('modelRefresh')}</button>
+              </div>
+              {#if provState}
+                {#each provState.providers as p (p.id)}
+                  <div class="settings-row">
+                    <div class="settings-label">
+                      <span class="label-title">
+                        {#if p.id === provState.active}<span class="model-current">{t('provActive')}</span>{/if}
+                        {p.label}
+                        <span class="chip">{p.flavor}</span>
+                      </span>
+                      <span class="label-desc">{p.base_url} · {p.models.length} {t('provModelsN')} · {p.needs_key ? (p.has_key ? t('provKeySet') : t('provKeyMissing')) : t('provLocalFree')}</span>
+                      {#if p.key_url}<span class="label-desc">{t('provGetKey')}: {p.key_url}</span>{/if}
+                    </div>
+                  </div>
+                  <div class="settings-row">
+                    <div class="settings-label">
+                      {#if p.needs_key && !p.has_key}
+                        <input
+                          class="settings-number"
+                          style="width:200px"
+                          type="password"
+                          value={provKeys[p.id] ?? ''}
+                          oninput={(e) => (provKeys[p.id] = (e.target as HTMLInputElement).value)}
+                          placeholder={t('provKeyPh')}
+                          aria-label={t('provKeyPh')}
+                        />
+                      {/if}
+                    </div>
+                    {#if p.id !== provState.active}
+                      <button class="appearance-btn" disabled={provBusy} onclick={() => void useProvider(p.id)}>{t('provUse')}</button>
+                    {/if}
+                    <button
+                      class="appearance-btn"
+                      disabled={provFetching !== ''}
+                      onclick={() => void fetchModels({ id: p.id, label: p.label, base_url: '', flavor: p.flavor }, provKeys[p.id] ?? '')}
+                    >{provFetching === p.id ? t('provFetching') : t('provFetch')}</button>
+                    {#if !p.built_in}
+                      <button class="appearance-btn" disabled={provBusy} onclick={() => void deleteProvider(p.id)}>{t('provDelete')}</button>
+                    {/if}
+                  </div>
+                {/each}
+              {/if}
+              {#if provPreview}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{t('provPreviewTitle')} ({provPreview.models.length}) — {provPreview.label}</span>
+                    <span class="label-desc">{provPreview.models.slice(0, 200).map((m) => m.label === m.id ? m.id : `${m.label} (${m.id})`).join(', ')}</span>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"></div>
+                  <button class="appearance-btn" disabled={provBusy} onclick={() => void savePreview()}>{t('provSave')}</button>
+                  <button class="appearance-btn" onclick={() => (provPreview = null)}>{t('provCancel')}</button>
+                </div>
+              {/if}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('provCustomTitle')}</span>
+                </div>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <input class="settings-number" style="width:150px" bind:value={customLabel} placeholder={t('provNamePh')} aria-label={t('provNamePh')} />
+                  <input class="settings-number" style="width:260px" bind:value={customBase} placeholder={t('provBasePh')} aria-label={t('provBasePh')} />
+                  <input class="settings-number" style="width:200px" type="password" bind:value={customKey} placeholder={t('provKeyPh')} aria-label={t('provKeyPh')} />
+                  <select class="settings-select" bind:value={customFlavor}>
+                    <option value="openai">{t('provFlavorOpenAi')}</option>
+                    <option value="anthropic">{t('provFlavorAnthropic')}</option>
+                  </select>
+                </div>
+                <button
+                  class="appearance-btn"
+                  disabled={provFetching !== '' || !customBase.trim()}
+                  onclick={() => void fetchModels({ id: null, label: customLabel.trim() || 'custom', base_url: customBase, flavor: customFlavor }, customKey)}
+                >{provFetching === 'custom-new' ? t('provFetching') : t('provFetch')}</button>
+              </div>
+              {#if provNote}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-desc">{provNote}</span>
+                  </div>
+                </div>
+              {/if}
             </div>
           {:else if settingsTab === 'mcp'}
             <div class="settings-section">

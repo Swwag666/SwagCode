@@ -41,13 +41,14 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FinishReason {
     Stop,
     ToolCalls,
     Length,
     ContentFilter,
     /// Провайдер прислал неизвестное значение — не роняемся, а фиксируем.
+    #[default]
     Unknown,
 }
 

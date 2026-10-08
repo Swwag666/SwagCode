@@ -43,12 +43,21 @@ foreach ($dep in $deps) {
     if ($stored) { $link = Join-Path $stored.FullName "node_modules\$dep" }
   }
   if (-not (Test-Path $link)) { throw "package $dep not found - run pnpm install first" }
-  $target = (Get-Item $link).Target
-  if ($target) { $link = $target | Select-Object -First 1 }
+  $rawTarget = (Get-Item $link).Target | Select-Object -First 1
+  if ($rawTarget) {
+    # pnpm symlinks store a RELATIVE target (e.g. ..\..\node_modules\.pnpm\...),
+    # relative to the link's own directory - not to the caller's CWD.
+    # Using it raw points robocopy at a nonexistent source -> exit 16.
+    if (-not [System.IO.Path]::IsPathRooted($rawTarget)) {
+      $rawTarget = [System.IO.Path]::GetFullPath((Join-Path (Split-Path $link -Parent) $rawTarget))
+    }
+    $link = $rawTarget
+  }
+  if (-not (Test-Path $link)) { throw "package $dep resolved to missing path: $link" }
   $destDep = Join-Path $nm $dep
   if (Test-Path $destDep) { Remove-Item -Recurse -Force $destDep }
   robocopy $link $destDep /E /XD node_modules /NFL /NDL /NJH /NJS | Out-Null
-  if ($LASTEXITCODE -ge 8) { throw "robocopy ${dep}: exit $LASTEXITCODE" }
+  if ($LASTEXITCODE -ge 8) { throw "robocopy ${dep}: exit $LASTEXITCODE (src=$link dst=$destDep)" }
 }
 
 # 3. Native binding: prebuilt download when install left none.

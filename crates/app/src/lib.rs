@@ -15,6 +15,7 @@ pub mod dsh_import;
 pub mod httpapi;
 pub mod jsplugins;
 pub mod mcp;
+pub mod providers;
 pub mod stdio_rpc;
 
 use serde::Serialize;
@@ -26,7 +27,7 @@ use swagcod_core::turn::{
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall, ToolSpec};
-use swagcod_provider::{ChatRequest, Provider, Router, StreamEvent};
+use swagcod_provider::{AnyProvider, ChatRequest, Router, StreamEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
 
@@ -970,8 +971,8 @@ pub(crate) async fn start_turn_core(
     }
 
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
-    // B-7: ключ — сначала .env, затем DPAPI-защищённый blob в store.
-    let provider = Router::from_env_with_key(dpapi_key(&state))
+    // Активный провайдер из настроек (default = .env/DPAPI как раньше).
+    let provider = providers::build_chat_provider(&state)
         .map_err(|e| format!("провайдер: {e}"))?;
 
     let (turn_id, history, session_summary, session_model, cwd, cfg) = {
@@ -1703,7 +1704,7 @@ async fn diff_against_head(
     // а пустая левая сторона diff.
     let head_out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new("git")
+        silent_cmd("git")
             .args(["show", &format!("HEAD:{rel}")])
             .current_dir(&cwd_path)
             .output(),
@@ -2220,7 +2221,7 @@ pub fn subagent_limits(args: &serde_json::Map<String, serde_json::Value>) -> (u3
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     state: &Arc<AppState>,
-    provider: &Router,
+    provider: &AnyProvider,
     call: &ToolCall,
     sid: &str,
     parent_tid: &str,
@@ -2583,7 +2584,7 @@ async fn execute_tool(
             if command.trim().is_empty() {
                 return fail("пустая команда".into());
             }
-            let child = tokio::process::Command::new("cmd")
+            let child = silent_cmd("cmd")
                 .arg("/C")
                 .arg(&command)
                 .current_dir(cwd)
@@ -2609,7 +2610,7 @@ async fn execute_tool(
                 Ok(Err(e)) => fail(format!("запуск: {e}")),
                 Err(_) => {
                     if let Some(pid) = pid {
-                        let _ = tokio::process::Command::new("taskkill")
+                        let _ = silent_cmd("taskkill")
                             .args(["/PID", &pid.to_string(), "/T", "/F"])
                             .output()
                             .await;
@@ -2735,7 +2736,7 @@ async fn run_plugin(
     let fail = |output: String| ToolOutcome { ok: false, output };
     let args = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
     let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-    let mut child = match tokio::process::Command::new(shell)
+    let mut child = match silent_cmd(shell)
         .arg(flag)
         .arg(&plugin.command)
         .current_dir(cwd)
@@ -2766,12 +2767,12 @@ async fn run_plugin(
         Err(_) => {
             if let Some(pid) = pid {
                 if cfg!(windows) {
-                    let _ = tokio::process::Command::new("taskkill")
+                    let _ = silent_cmd("taskkill")
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
                         .output()
                         .await;
                 } else {
-                    let _ = tokio::process::Command::new("kill")
+                    let _ = silent_cmd("kill")
                         .args(["-9", &pid.to_string()])
                         .output()
                         .await;
@@ -3111,10 +3112,10 @@ async fn read_file(
     std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))
 }
 
-/// Список моделей провайдера.
+/// Список моделей АКТИВНОГО провайдера (вкладка провайдеров).
 #[tauri::command]
 async fn list_models(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let provider = Router::from_env_with_key(dpapi_key(&state))
+    let provider = providers::build_chat_provider(&state)
         .map_err(|e| format!("провайдер: {e}"))?;
     provider
         .list_models()
@@ -3135,11 +3136,21 @@ async fn open_in_explorer(
     if !swagcod_fsx::is_within(&root, p) {
         return Err("доступ запрещён".into());
     }
-    tokio::process::Command::new("explorer")
+    silent_cmd("explorer")
         .arg(format!("/select,{}", path))
         .spawn()
         .map_err(|e| format!("explorer: {e}"))?;
     Ok(())
+}
+
+/// Команда без всплывающего консольного окна на Windows
+/// (CREATE_NO_WINDOW). Иначе каждый git/cmd/taskkill моргает
+/// консолью поверх окна приложения.
+fn silent_cmd(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd
 }
 
 /// Короткий идентификатор без зависимостей: наносекунды + монотонный счётчик.
@@ -3175,14 +3186,39 @@ fn run_dsh_import(state: &Arc<AppState>, auto: bool) -> dsh_import::ImportReport
             return report;
         }
     };
+    // DSH-история бывает огромной (сотни файлов, сотни МБ zstd) — импорт
+    // идёт через ОТДЕЛЬНОЕ соединение с базой, а не через state.store.
+    // Иначе Mutex занят весь прогон, весь IPC голодает на нём и окно
+    // висит "не отвечает", хотя импорт по задумке фоновый. Флаг
+    // готовности по-прежнему ставится через общее соединение в конце.
+    let path = match db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            report.errors.push(format!("store: нет пути базы: {e}"));
+            return report;
+        }
+    };
+    match swagcod_core::store::open(&path) {
+        Ok(import_store) => {
+            report = dsh_import::import_dsh_sessions(import_store.as_ref(), &root);
+            // E-9b: конфиги MCP/плагинов — тем же отдельным соединением.
+            let cfg = dsh_import::import_dsh_configs(import_store.as_ref());
+            report.mcp_imported = cfg.mcp_imported;
+            report.mcp_skipped = cfg.mcp_skipped;
+            report.plugin_notes = cfg.plugin_notes;
+        }
+        Err(e) => {
+            report.errors.push(format!("store: не открыл базу для импорта: {e}"));
+            return report;
+        }
+    }
     if let Ok(store) = state.store.lock() {
-        report = dsh_import::import_dsh_sessions(store.as_ref(), &root);
         let _ = store.set_pref(
             "dsh_import_done",
             &format!("sessions={},turns={}", report.sessions, report.turns),
         );
     }
-    if report.sessions > 0 {
+    if report.sessions > 0 || report.resumed > 0 {
         if let Ok(store) = state.store.lock() {
             if let Ok(loaded) = store.load_all() {
                 /* D-121: импортированная история не остаётся в RAM — список
@@ -3198,12 +3234,16 @@ fn run_dsh_import(state: &Arc<AppState>, auto: bool) -> dsh_import::ImportReport
         }
     }
     eprintln!(
-        "dsh-import{}: сессий {}, ходов {}, пропущено {}, ошибок {}",
+        "dsh-import{}: сессий {}, ходов {}, пропущено {}, догружено {}, ошибок {}, mcp {}, mcp-пропусков {}, плагинов-заметок {}",
         if auto { " (авто)" } else { "" },
         report.sessions,
         report.turns,
         report.skipped,
-        report.errors.len()
+        report.resumed,
+        report.errors.len(),
+        report.mcp_imported,
+        report.mcp_skipped.len(),
+        report.plugin_notes.len()
     );
     report
 }
@@ -3221,7 +3261,11 @@ async fn import_dsh_sessions(state: State<'_, Arc<AppState>>) -> Result<serde_js
         "turns": report.turns,
         "messages": report.messages,
         "skipped": report.skipped,
+        "resumed": report.resumed,
         "errors": report.errors,
+        "mcp_imported": report.mcp_imported,
+        "mcp_skipped": report.mcp_skipped,
+        "plugin_notes": report.plugin_notes,
     }))
 }
 
@@ -3768,27 +3812,21 @@ pub fn run() {
                     Err(e) => eprintln!("store: не прочитал сессии: {e}"),
                 }
             }
-            /* E-9: одноразовый автоимпорт сессий DSH. Только в фоне:
-               бюджет старта (bench < 400 мс) не должен зависеть от размера
-               чужой истории. Флаг dsh_import_done ставится даже когда DSH
-               на машине нет — проверять каждый старт незачем. */
+            /* E-9: автоимпорт DSH при старте ВЫРЕЗАН намеренно: сотни файлов
+               и сотни МБ zstd держали Mutex базы весь прогон, весь IPC
+               голодал и окно висело «не отвечает». Ручной триггер —
+               команда import_dsh_sessions (кнопка в настройках). */
             {
-                /* get_pref даёт Option<Option<String>>: flatten обязателен —
-                   без него Some(None) (pref не задан) читался как «уже
-                   сделано», и автоимпорт не стартовал никогда. Поймано
-                   живой приёмкой (D-119). */
-                let need_import = state
-                    .store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.get_pref("dsh_import_done").ok())
-                    .flatten()
-                    .is_none();
-                if need_import {
-                    let st = state.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        run_dsh_import(&st, true);
-                    });
+                // Флаг-пустышка, чтобы UI не предлагал автоимпорт заново.
+                if let Ok(store) = state.store.lock() {
+                    let has = store
+                        .get_pref("dsh_import_done")
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if !has {
+                        let _ = store.set_pref("dsh_import_done", "manual");
+                    }
                 }
             }
             /* E-3: MCP-серверы из prefs поднимаются фоном — старт не ждёт
@@ -3916,6 +3954,12 @@ pub fn run() {
             list_dir,
             read_file,
             list_models,
+            providers::list_provider_presets,
+            providers::providers_state,
+            providers::fetch_provider_models,
+            providers::save_provider,
+            providers::delete_provider,
+            providers::set_active_provider,
             open_in_explorer
         ])
         .run(tauri::generate_context!())
@@ -4744,7 +4788,8 @@ rl.on('line', (l) => {
 
         std::env::set_var("SWAGCOD_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
         std::env::set_var("SWAGCOD_API_KEY", "test-key");
-        let provider = Router::from_env_with_key(None).expect("роутер из env");
+        let provider =
+            AnyProvider::OpenAi(Router::from_env_with_key(None).expect("роутер из env"));
 
         let state = Arc::new(AppState {
             store: std::sync::Mutex::new(swagcod_core::store::open_memory()),

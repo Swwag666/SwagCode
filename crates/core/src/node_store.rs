@@ -62,9 +62,16 @@ impl NodeStore {
     }
 
     fn start(path: &Path) -> StoreResult<Self> {
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
         let script = sidecar_script()?;
         let node = node_binary();
-        let mut child = Command::new(&node)
+        let mut cmd = Command::new(&node);
+        // Без консольного окна: sidecar висит весь сеанс, мигать CMD
+        // при каждом старте приложения незачем.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let mut child = cmd
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

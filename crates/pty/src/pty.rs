@@ -82,6 +82,8 @@ impl PtyHandle {
 
     pub fn kill(&self) {
         // Кроссплатформенно и без лишних зависимостей: системный kill по pid.
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
         let mut cmd = if cfg!(windows) {
             let mut c = std::process::Command::new("taskkill");
             c.args(["/PID", &self.pid.to_string(), "/T", "/F"]);
@@ -91,6 +93,9 @@ impl PtyHandle {
             c.args(["-9", &self.pid.to_string()]);
             c
         };
+        // Без консольного окна при убийстве PTY.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let _ = cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

@@ -38,7 +38,12 @@ pub struct ImportReport {
     pub turns: usize,
     pub messages: usize,
     pub skipped: usize,
+    /// Каркасы от убитых прогонов, которым догрузили недостающие ходы.
+    pub resumed: usize,
     pub errors: Vec<String>,
+    pub mcp_imported: usize,
+    pub mcp_skipped: Vec<String>,
+    pub plugin_notes: Vec<String>,
 }
 
 /// Корень сессий DSH: `~/.dsh/sessions`. None, если DSH на машине нет —
@@ -129,12 +134,21 @@ fn text_of(content: &serde_json::Value, part: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Инжект делегирования («Ты Abyss... Your parent agent id is ...»):
+/// его шлёт родительский агент, а не человек. В историю попадает как
+/// есть (субагент его реально получил), но титлом становиться не должен —
+/// иначе сотни сессий называются «You are Abyss, created by» и неузнаваемы.
+fn is_persona_prompt(text: &str) -> bool {
+    text.to_lowercase().contains("parent agent id")
+}
+
 /// Запись JSONL-лога разбирается как общий Value: у записи `session`
 /// доменные поля (id/cwd/createdAt) лежат НА ВЕРХНЕМ уровне, а у
 /// остальных событий — под `data`. Жёсткая структура ломалась бы и там.
 fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
     let mut s = ParsedSession::default();
     let mut first_user = String::new();
+    let mut first_any = String::new();
     let mut current: Option<ParsedTurn> = None;
 
     for line in text.lines() {
@@ -195,11 +209,27 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
                 });
             }
             "user/message" => {
+                // Оркестрация DSH тоже идёт ролью user: снимки систем-промпта,
+                // notices tool-jobs, компакшн, итоги суб-агентов (на живой базе
+                // таких 5045 из 8296). В чат берём только kind == "user".
+                // Поле старое и опциональное: нет source — считаем пользователем.
+                let is_user = data
+                    .get("source")
+                    .and_then(|s| s.get("kind"))
+                    .and_then(|k| k.as_str())
+                    .map(|k| k == "user")
+                    .unwrap_or(true);
+                if !is_user {
+                    continue;
+                }
                 let text = text_of(data.get("content").unwrap_or(&serde_json::Value::Null), "text");
                 if text.is_empty() {
                     continue;
                 }
-                if first_user.is_empty() {
+                if first_any.is_empty() {
+                    first_any = text.chars().take(60).collect();
+                }
+                if first_user.is_empty() && !is_persona_prompt(&text) {
                     first_user = text.chars().take(60).collect();
                 }
                 if let Some(t) = current.as_mut() {
@@ -258,6 +288,16 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
         }
     }
 
+    // Хвост без turn/end: DSH дописывает лог наживую, и последний ход
+    // живой сессии не закрыт. Ронять весь разговор из-за этого нельзя —
+    // забираем как есть (на живой базе таких файлов 16, из них 8 вообще
+    // без единого turn/end и раньше импортировались ПУСТЫМИ).
+    if let Some(mut t) = current.take() {
+        t.rec.ok = false;
+        t.rec.failure = Some("dsh: open (нет turn/end — лог оборван)".into());
+        s.turns.push(t);
+    }
+
     if s.id.is_empty() {
         return Err("в логе нет записи session".into());
     }
@@ -266,6 +306,9 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
             s.label.clone()
         } else if !first_user.is_empty() {
             first_user
+        } else if !first_any.is_empty() {
+            // Только персона-инжект: лучше он, чем «DSH-сессия».
+            first_any
         } else {
             "DSH-сессия".to_string()
         };
@@ -320,9 +363,53 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
                 continue;
             }
         };
+        if parsed.turns.is_empty() {
+            // Черновик без единого хода (открыли DSH и ничего не спросили) —
+            // сессию-пустышку в базу не кладём, это пропуск, а не перенос.
+            report.skipped += 1;
+            continue;
+        }
         match store.load_session(&parsed.id) {
-            Ok(Some(_)) => {
-                report.skipped += 1;
+            Ok(Some(existing)) => {
+                // Догрузка вместо глухого пропуска: убитый прошлый прогон
+                // оставляет в базе каркас без ходов, и старый код считал его
+                // «уже перенесённым» навсегда. Сверяем id ходов и тащим
+                // только недостающие (save_turn — INSERT OR REPLACE).
+                let have: std::collections::HashSet<&str> = existing
+                    .turns
+                    .iter()
+                    .map(|t| t.id.as_str())
+                    .collect();
+                let missing: Vec<&ParsedTurn> = parsed
+                    .turns
+                    .iter()
+                    .filter(|t| !have.contains(t.rec.id.as_str()))
+                    .collect();
+                if missing.is_empty() {
+                    report.skipped += 1;
+                    continue;
+                }
+                if existing.title == "DSH-сессия" && parsed.title != "DSH-сессия" {
+                    let _ = store.set_session_title(&parsed.id, &parsed.title);
+                }
+                let mut history = existing.history.clone();
+                let mut added = 0;
+                for t in missing {
+                    history.extend(t.msgs.iter().cloned());
+                    match store.save_turn(&parsed.id, &t.rec, &history) {
+                        Ok(()) => {
+                            added += 1;
+                            report.turns += 1;
+                            report.messages += t.msgs.len();
+                        }
+                        Err(e) => {
+                            report.errors.push(format!("{}: save_turn: {e}", file.display()));
+                        }
+                    }
+                }
+                if added > 0 {
+                    report.resumed += 1;
+                }
                 continue;
             }
             Ok(None) => {}
@@ -366,6 +453,340 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
                 }
             }
         }
+    }
+    report
+}
+
+/* ============ E-9b: конфиги MCP и плагинов из DSH ============
+ *
+ * DSH хранит их в `~/.dsh/profiles/<profile>/cordis.patch.yml`:
+ * верхний массив, где записи либо лежат в `insert:`-списках
+ * (MCP-серверы `mcp-*` через dsh-mcp-client), либо идут напрямую
+ * (tool-web, agent-presets, theme-plugin...).
+ *
+ * Перенос честный, а не тихий:
+ * - stdio-MCP → реестр SwagCod (`mcp_servers` в prefs), слияние по
+ *   имени — повторный импорт дублей не плодит;
+ * - не-stdio транспорт (streamable-http) — пропуск с причиной:
+ *   наш клиент умеет только stdio;
+ * - не-MCP записи — прямого аналога в SwagCod нет (наши плагины —
+ *   JS-файлы с swagcod.define), поэтому сырой конфиг кладётся в
+ *   преф `dsh_plugins_raw` для справки, а не выдумывается.
+ */
+
+/// Запись cordis-патча DSH: элемент insert-списка или прямая запись.
+#[derive(Debug, Clone)]
+pub struct DshPluginEntry {
+    pub id: String,
+    pub name: String,
+    pub disabled: bool,
+    pub config: serde_json::Value,
+}
+
+/// Итог переноса конфигов.
+#[derive(Debug, Default)]
+pub struct ConfigReport {
+    pub mcp_imported: usize,
+    pub mcp_skipped: Vec<String>,
+    pub plugin_notes: Vec<String>,
+}
+
+/// Все патчи профилей DSH. Пусто, если DSH на машине нет.
+pub fn dsh_cordis_patches() -> Vec<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return Vec::new();
+    }
+    let profiles = PathBuf::from(home).join(".dsh").join("profiles");
+    let Ok(dirs) = std::fs::read_dir(&profiles) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for d in dirs.flatten() {
+        let f = d.path().join("cordis.patch.yml");
+        if f.is_file() {
+            out.push(f);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn yaml_key<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    m.get(serde_yaml::Value::String(key.to_string()))
+}
+
+fn yaml_scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::Null => None,
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {
+    match v {
+        serde_yaml::Value::Null => serde_json::Value::Null,
+        serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::from(i)
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::from(u)
+            } else if let Some(f) = n.as_f64() {
+                serde_json::Value::from(f)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        serde_yaml::Value::String(s) => serde_json::Value::String(s.clone()),
+        serde_yaml::Value::Sequence(arr) => {
+            serde_json::Value::Array(arr.iter().map(yaml_to_json).collect())
+        }
+        serde_yaml::Value::Mapping(m) => {
+            let mut obj = serde_json::Map::new();
+            for (k, val) in m.iter() {
+                let key = yaml_scalar_to_string(k).unwrap_or_else(|| "?".to_string());
+                obj.insert(key, yaml_to_json(val));
+            }
+            serde_json::Value::Object(obj)
+        }
+        serde_yaml::Value::Tagged(t) => yaml_to_json(&t.value),
+    }
+}
+
+fn parse_patch_entry(v: &serde_yaml::Value) -> Option<DshPluginEntry> {
+    let serde_yaml::Value::Mapping(m) = v else {
+        return None;
+    };
+    let id = yaml_key(m, "id").and_then(yaml_scalar_to_string)?;
+    if id.is_empty() {
+        return None;
+    }
+    let name = yaml_key(m, "name")
+        .and_then(yaml_scalar_to_string)
+        .unwrap_or_else(|| id.clone());
+    let disabled = yaml_key(m, "disabled")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    let config = yaml_key(m, "config")
+        .map(yaml_to_json)
+        .unwrap_or(serde_json::Value::Null);
+    Some(DshPluginEntry {
+        id,
+        name,
+        disabled,
+        config,
+    })
+}
+
+/// Разобрать один cordis.patch.yml: insert-списки + прямые записи.
+pub fn parse_cordis_patch(text: &str) -> Result<Vec<DshPluginEntry>, String> {
+    let v: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| format!("yaml: {e}"))?;
+    let serde_yaml::Value::Sequence(items) = &v else {
+        return Err("корень патча — не массив".into());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if let serde_yaml::Value::Mapping(m) = item {
+            if let Some(serde_yaml::Value::Sequence(arr)) = yaml_key(m, "insert") {
+                for e in arr {
+                    if let Some(en) = parse_patch_entry(e) {
+                        out.push(en);
+                    }
+                }
+                continue;
+            }
+            if let Some(en) = parse_patch_entry(item) {
+                out.push(en);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn json_scalar_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        _ => v.to_string(),
+    }
+}
+
+/// Запись DSH → конфиг MCP-сервера SwagCod. Ошибка — честная причина
+/// пропуска (чужой транспорт, нет команды), а не тихий дроп.
+pub fn mcp_from_entry(
+    e: &DshPluginEntry,
+) -> Result<crate::mcp::McpServerConfig, String> {
+    if !e.id.starts_with("mcp-") {
+        return Err(format!("{}: не MCP-запись", e.id));
+    }
+    let transport = e
+        .config
+        .get("transport")
+        .and_then(|t| t.as_str())
+        .unwrap_or("stdio");
+    if transport != "stdio" {
+        return Err(format!(
+            "{}: транспорт {transport} не поддерживается (только stdio)",
+            e.id
+        ));
+    }
+    let command = e
+        .config
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if command.is_empty() {
+        return Err(format!("{}: нет command", e.id));
+    }
+    let name = e
+        .config
+        .get("serverName")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| e.id.trim_start_matches("mcp-").to_string());
+    let args = e
+        .config
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().map(json_scalar_to_string).collect())
+        .unwrap_or_default();
+    let env = e
+        .config
+        .get("env")
+        .and_then(|e| e.as_object())
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_scalar_to_string(v)))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(crate::mcp::McpServerConfig {
+        name,
+        command,
+        args,
+        env,
+        enabled: !e.disabled,
+    })
+}
+
+/// Слияние с реестром без дублей (чистая функция — тестируется).
+/// Возвращает (реестр, импортировано, имена-дубли).
+pub fn merge_mcp_configs(
+    mut existing: Vec<crate::mcp::McpServerConfig>,
+    incoming: Vec<crate::mcp::McpServerConfig>,
+) -> (Vec<crate::mcp::McpServerConfig>, usize, Vec<String>) {
+    let mut imported = 0;
+    let mut dups = Vec::new();
+    for cfg in incoming {
+        if existing.iter().any(|e| e.name == cfg.name) {
+            dups.push(cfg.name);
+        } else {
+            existing.push(cfg);
+            imported += 1;
+        }
+    }
+    (existing, imported, dups)
+}
+
+/// Перенести конфиги MCP/плагинов из всех профилей DSH в prefs.
+/// Идемпотентно: повторный прогон никого не дублирует.
+pub fn import_dsh_configs(store: &dyn Store) -> ConfigReport {
+    let mut report = ConfigReport::default();
+    let files = dsh_cordis_patches();
+    if files.is_empty() {
+        return report; // DSH нет — тихо, это норма
+    }
+    let mut entries = Vec::new();
+    for f in &files {
+        match std::fs::read_to_string(f) {
+            Ok(text) => match parse_cordis_patch(&text) {
+                Ok(mut e) => entries.append(&mut e),
+                Err(e) => report
+                    .mcp_skipped
+                    .push(format!("{}: {e}", f.display())),
+            },
+            Err(e) => report
+                .mcp_skipped
+                .push(format!("{}: чтение: {e}", f.display())),
+        }
+    }
+    let mut incoming = Vec::new();
+    let mut raws = serde_json::Map::new();
+    for e in &entries {
+        match mcp_from_entry(e) {
+            Ok(cfg) => {
+                if e.config.get("cwd").and_then(|c| c.as_str()).is_some() {
+                    report.plugin_notes.push(format!(
+                        "mcp {}: cwd в SwagCod не поддерживается — если сервер не поднимется, смотри его рабочий каталог в DSH",
+                        cfg.name
+                    ));
+                }
+                incoming.push(cfg);
+            }
+            Err(reason) => {
+                if e.id.starts_with("mcp-") {
+                    report.mcp_skipped.push(reason);
+                } else {
+                    // Конфиг плагина DSH без аналога у нас — сохраняем
+                    // сырьём в преф для справки, а не выдумываем маппинг.
+                    raws.insert(
+                        e.id.clone(),
+                        serde_json::json!({
+                            "name": e.name,
+                            "disabled": e.disabled,
+                            "config": e.config,
+                        }),
+                    );
+                    report.plugin_notes.push(format!(
+                        "{}: прямого аналога в SwagCod нет, конфиг сохранён в преф dsh_plugins_raw",
+                        e.id
+                    ));
+                }
+            }
+        }
+    }
+    if !raws.is_empty() {
+        if let Err(e) = store.set_pref(
+            "dsh_plugins_raw",
+            &serde_json::Value::Object(raws).to_string(),
+        ) {
+            report
+                .plugin_notes
+                .push(format!("dsh_plugins_raw не записан: {e}"));
+        }
+    }
+    let existing: Vec<crate::mcp::McpServerConfig> = store
+        .get_pref("mcp_servers")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let (merged, imported, dups) = merge_mcp_configs(existing, incoming);
+    report.mcp_imported = imported;
+    for d in dups {
+        report
+            .mcp_skipped
+            .push(format!("mcp {d}: уже есть в реестре"));
+    }
+    match serde_json::to_string(&merged) {
+        Ok(s) => {
+            if let Err(e) = store.set_pref("mcp_servers", &s) {
+                report
+                    .mcp_skipped
+                    .push(format!("mcp_servers не записан: {e}"));
+            }
+        }
+        Err(e) => report
+            .mcp_skipped
+            .push(format!("mcp_servers не сериализован: {e}")),
     }
     report
 }
@@ -517,5 +938,294 @@ mod tests {
         let r = import_dsh_sessions(store.as_ref(), &bogus);
         assert_eq!(r.sessions, 0);
         assert!(r.errors.is_empty());
+    }
+
+    /// Хвост без turn/end (живая сессия, лог оборван) — ход забираем как
+    /// есть, а не роняем весь разговор. 8 файлов живой базы без единого
+    /// turn/end раньше импортировались ПУСТЫМИ.
+    #[test]
+    fn trailing_open_turn_is_flushed() {
+        let log: String = sample_log()
+            .lines()
+            .filter(|l| !l.contains(r#""type":"turn/end""#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = parse_session_log(&log).unwrap();
+        assert_eq!(p.turns.len(), 1);
+        assert!(!p.turns[0].rec.ok);
+        assert!(p.turns[0].rec.failure.as_deref().unwrap().contains("open"));
+        assert_eq!(p.turns[0].rec.content, "Запускаю проверку.");
+        assert_eq!(p.turns[0].msgs.len(), 2);
+    }
+
+    /// Оркестрационный мусор ролью user (снимки систем-промпта, notices)
+    /// в чат не лезет. Без source (старые логи) — считаем пользователем.
+    #[test]
+    fn plugin_user_messages_ignored() {
+        let mut log = sample_log();
+        log.push_str(r#"
+{"type":"user/message","seq":9,"time":1791037650500,"data":{"content":[{"type":"text","text":"Current DSH file policy: danger-full-access"}],"source":{"kind":"plugin","plugin":"tool-jobs"},"role":"user"}}"#);
+        let p = parse_session_log(&log).unwrap();
+        assert_eq!(p.turns.len(), 1);
+        // Мусор вне хода и так не попадал бы в msgs; проверяем напрямую:
+        // титл-фолбэк и первое сообщение — от настоящего пользователя.
+        assert_eq!(p.title, "Правка платежей");
+        assert_eq!(p.turns[0].msgs.len(), 2);
+        assert_eq!(p.turns[0].msgs[0].content, "почини оплату");
+    }
+
+    /// Черновик без ходов сессию-пустышку не создаёт: пропуск, а не перенос.
+    #[test]
+    fn empty_session_is_skipped_not_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "swagcod-dsh-empty-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ses = dir.join("sessions").join("--D-proj--").join("session-empt");
+        std::fs::create_dir_all(&ses).unwrap();
+        let log = r#"{"type":"session","version":3,"id":"session-empt","createdAt":1791037650240,"cwd":"D:\\proj"}"#.to_string();
+        let packed = compress_frames(&[&log]);
+        std::fs::write(ses.join("session.v3.jsonl.zstd"), &packed).unwrap();
+
+        let store = swagcod_core::store::open_memory();
+        let r = import_dsh_sessions(store.as_ref(), &dir.join("sessions"));
+        assert_eq!(r.sessions, 0);
+        assert_eq!(r.skipped, 1);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(store.load_all().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Догрузка: убитый прогон оставил каркас (сессия без ходов) — повтор
+    /// тащит недостающее, а не считает «уже перенесено».
+    fn two_turn_log() -> String {
+        let mut log = sample_log();
+        log.push_str(r#"
+{"type":"turn/start","seq":9,"time":1791037650500,"data":{"turn":2}}
+{"type":"user/message","seq":10,"time":1791037650510,"data":{"content":[{"type":"text","text":"а теперь тесты"}],"source":{"kind":"user"},"role":"user"}}
+{"type":"assistant/message","seq":11,"time":1791037650520,"data":{"turn":2,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"Гоняю тесты."}]}}}
+{"type":"turn/end","seq":12,"time":1791037650600,"data":{"turn":2,"reason":{"kind":"completed"}}}"#);
+        log
+    }
+
+    #[test]
+    fn resume_backfills_missing_turns() {
+        let dir = std::env::temp_dir().join(format!(
+            "swagcod-dsh-resume-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ses = dir.join("sessions").join("--D-proj--").join("session-aaaa");
+        std::fs::create_dir_all(&ses).unwrap();
+        let f = ses.join("session.v3.jsonl.zstd");
+
+        // Прогон 1 оборван на первом ходе (в базе каркас + 1 ход).
+        let packed = compress_frames(&[&sample_log()]);
+        std::fs::write(&f, &packed).unwrap();
+        let store = swagcod_core::store::open_memory();
+        let r1 = import_dsh_sessions(store.as_ref(), &dir.join("sessions"));
+        assert_eq!(r1.sessions, 1);
+
+        // DSH дописала второй ход. Прогон 2 догружает только его.
+        let packed = compress_frames(&[&two_turn_log()]);
+        std::fs::write(&f, &packed).unwrap();
+        let r2 = import_dsh_sessions(store.as_ref(), &dir.join("sessions"));
+        assert_eq!(r2.sessions, 0);
+        assert_eq!(r2.skipped, 0);
+        assert_eq!(r2.resumed, 1);
+        assert_eq!(r2.turns, 1);
+        assert_eq!(r2.messages, 2);
+        assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+
+        let s = store.load_session("session-aaaa").unwrap().unwrap();
+        assert_eq!(s.turns.len(), 2);
+        assert_eq!(s.history.len(), 4);
+        assert_eq!(s.history[2].content, "а теперь тесты");
+        assert_eq!(s.history[3].content, "Гоняю тесты.");
+
+        // Прогон 3: всё на месте — честный пропуск.
+        let r3 = import_dsh_sessions(store.as_ref(), &dir.join("sessions"));
+        assert_eq!(r3.resumed, 0);
+        assert_eq!(r3.skipped, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Титл пропускает персона-инжект делегирования и берёт первую
+    /// настоящую реплику; инжект — только запасной вариант.
+    #[test]
+    fn title_skips_persona_prompt() {
+        let log = [
+            r#"{"type":"session","version":3,"id":"session-pp","createdAt":1791037650240,"cwd":"D:\\proj"}"#,
+            r#"{"type":"turn/start","seq":1,"time":1791037650280,"data":{"turn":1}}"#,
+            r#"{"type":"user/message","seq":2,"time":1791037650290,"data":{"content":[{"type":"text","text":"Ты Abyss. Your parent agent id is \"session-1\". Выдай полный разбор."}],"source":{"kind":"user"},"role":"user"}}"#,
+            r#"{"type":"user/message","seq":3,"time":1791037650300,"data":{"content":[{"type":"text","text":"продолжи работу за прошлым агентом"}],"source":{"kind":"user"},"role":"user"}}"#,
+            r#"{"type":"turn/end","seq":4,"time":1791037650400,"data":{"turn":1,"reason":{"kind":"completed"}}}"#,
+        ]
+        .join("\n");
+        let p = parse_session_log(&log).unwrap();
+        assert_eq!(p.title, "продолжи работу за прошлым агентом");
+        // Обе реплики в истории — инжект реально был получен.
+        assert_eq!(p.turns[0].msgs.len(), 2);
+    }
+
+    /// Срез реального cordis.patch.yml: insert-список MCP + прямая запись.
+    fn sample_patch() -> &'static str {
+        r#"
+- insert:
+    - id: mcp-codebase-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: codebase-memory
+        transport: stdio
+        command: C:/Users/norw/.local/bin/codebase-memory-mcp.exe
+        args: []
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+    - id: mcp-ida-pro
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ida-pro
+        transport: streamable-http
+        url: http://127.0.0.1:13337/mcp
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  disabled: false
+  config:
+    search: false
+    fetch: true
+    fetchTimeoutMs: 60000
+"#
+    }
+
+    #[test]
+    fn parses_patch_inserts_and_direct_entries() {
+        let entries = parse_cordis_patch(sample_patch()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, "mcp-codebase-memory");
+        assert_eq!(entries[1].id, "mcp-ida-pro");
+        assert_eq!(entries[2].id, "tool-web");
+        assert!(!entries[2].disabled);
+        assert_eq!(
+            entries[2].config.get("fetch").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parses_empty_patch_to_nothing() {
+        let entries = parse_cordis_patch("[]").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn maps_stdio_mcp_entry() {
+        let entries = parse_cordis_patch(sample_patch()).unwrap();
+        let cfg = mcp_from_entry(&entries[0]).unwrap();
+        assert_eq!(cfg.name, "codebase-memory");
+        assert_eq!(
+            cfg.command,
+            "C:/Users/norw/.local/bin/codebase-memory-mcp.exe"
+        );
+        assert!(cfg.args.is_empty());
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn rejects_http_transport_with_reason() {
+        let entries = parse_cordis_patch(sample_patch()).unwrap();
+        let err = mcp_from_entry(&entries[1]).unwrap_err();
+        assert!(err.contains("streamable-http"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_mcp_entry() {
+        let entries = parse_cordis_patch(sample_patch()).unwrap();
+        let err = mcp_from_entry(&entries[2]).unwrap_err();
+        assert!(err.contains("не MCP"), "{err}");
+    }
+
+    #[test]
+    fn merge_mcp_dedups_by_name() {
+        use crate::mcp::McpServerConfig;
+        let mk = |name: &str| McpServerConfig {
+            name: name.to_string(),
+            command: "srv".to_string(),
+            args: vec![],
+            env: Default::default(),
+            enabled: true,
+        };
+        let existing = vec![mk("a")];
+        let (merged, imported, dups) = merge_mcp_configs(existing, vec![mk("a"), mk("b")]);
+        assert_eq!(imported, 1);
+        assert_eq!(dups, vec!["a".to_string()]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn config_import_moves_stdio_and_stashes_plugins() {
+        let dir = std::env::temp_dir().join(format!(
+            "swagcod-dsh-cfg-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let prof = dir.join(".dsh").join("profiles").join("desktop");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(prof.join("cordis.patch.yml"), sample_patch()).unwrap();
+
+        // Подменяем HOME точечно: dsh_cordis_patches читает USERPROFILE/HOME.
+        let old_profile = std::env::var_os("USERPROFILE");
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("USERPROFILE", &dir);
+        std::env::set_var("HOME", &dir);
+        let store = swagcod_core::store::open_memory();
+        let r = import_dsh_configs(store.as_ref());
+        if let Some(v) = old_profile.as_ref() {
+            std::env::set_var("USERPROFILE", v);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+        if let Some(v) = old_home.as_ref() {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(r.mcp_imported, 1, "report: {r:?}");
+        assert!(r.mcp_skipped.iter().any(|s| s.contains("ida-pro")));
+        assert!(r.plugin_notes.iter().any(|s| s.contains("tool-web")));
+
+        // Реестр записан, сырьё плагинов — в префе.
+        let raw = store.get_pref("mcp_servers").unwrap().unwrap();
+        let cfgs: Vec<crate::mcp::McpServerConfig> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].name, "codebase-memory");
+        let raws = store.get_pref("dsh_plugins_raw").unwrap().unwrap();
+        assert!(raws.contains("tool-web"));
+
+        // Повтор — без дублей.
+        std::env::set_var("USERPROFILE", &dir);
+        std::env::set_var("HOME", &dir);
+        let r2 = import_dsh_configs(store.as_ref());
+        if let Some(v) = old_profile.as_ref() {
+            std::env::set_var("USERPROFILE", v);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+        if let Some(v) = old_home.as_ref() {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(r2.mcp_imported, 0);
+        let raw2 = store.get_pref("mcp_servers").unwrap().unwrap();
+        let cfgs2: Vec<crate::mcp::McpServerConfig> = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(cfgs2.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
