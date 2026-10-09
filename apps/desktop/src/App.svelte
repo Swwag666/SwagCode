@@ -17,6 +17,7 @@
   import Terminal from './components/Terminal.svelte'
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
+  import CommandRules from './components/CommandRules.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
@@ -653,6 +654,8 @@
     } catch {
       httpApi = null // старое ядро без HTTP API
     }
+    // F-3: списки команд обновляем вместе с остальной безопасностью.
+    void loadCmdRules()
     try {
       const list = await invoke<{ id: string; approval_policy?: string | null }[]>('list_sessions')
       const cur = list.find((s) => s.id === currentSession)
@@ -842,6 +845,50 @@
   function fmtLogTime(ms: number): string {
     const d = new Date(ms)
     return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`
+  }
+
+  /* ── F-3: allow/deny-списки команд ────────────────────────────────────────
+     Движок, дефолты и порядок (deny > allow > политика) живут в ядре
+     (core::rules); prefs-ключи cmd_allow / cmd_deny читаются на каждый ход,
+     поэтому сохранение действует сразу. UI только показывает строки. */
+  interface CmdRules {
+    allow: string[]
+    deny: string[]
+    allow_defaults: string[]
+    deny_defaults: string[]
+    errors: string[]
+    active: number
+  }
+  let cmdRules = $state<CmdRules | null>(null)
+  let cmdRulesBusy = $state(false)
+  let cmdRulesStatus = $state<string | null>(null)
+  let cmdRulesTimer: ReturnType<typeof setTimeout> | null = null
+
+  async function loadCmdRules(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      cmdRules = await invoke<CmdRules>('cmd_rules_load')
+    } catch {
+      cmdRules = null // ядро без F-3: секцию не показываем
+    }
+  }
+
+  async function saveCmdRules(allow: string[], deny: string[]): Promise<void> {
+    cmdRulesBusy = true
+    if (cmdRulesTimer) clearTimeout(cmdRulesTimer)
+    try {
+      cmdRules = await invoke<CmdRules>('cmd_rules_save', { allow, deny })
+      cmdRulesStatus =
+        cmdRules.active > 0
+          ? t('cmdRulesSaved').replace('{n}', String(cmdRules.active))
+          : t('cmdRulesEmpty')
+    } catch (e) {
+      // Битый regex ядро отклоняет целиком: список не сохранён, текст остался.
+      cmdRulesStatus = String(e)
+    } finally {
+      cmdRulesBusy = false
+      cmdRulesTimer = setTimeout(() => (cmdRulesStatus = null), 5000)
+    }
   }
 
   /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
@@ -2263,6 +2310,28 @@
                   {/each}
                 </select>
               </div>
+              {#if cmdRules}
+                <div class="settings-row rules-row">
+                  <CommandRules
+                    title={t('cmdRulesTitle')}
+                    desc={t('cmdRulesDesc')}
+                    allowLabel={t('cmdAllowLabel')}
+                    denyLabel={t('cmdDenyLabel')}
+                    allowHint={t('cmdAllowHint')}
+                    denyHint={t('cmdDenyHint')}
+                    saveLabel={t('cmdRulesSave')}
+                    resetLabel={t('cmdRulesReset')}
+                    savedLabel={t('cmdRulesBusy')}
+                    allow={cmdRules.allow}
+                    deny={cmdRules.deny}
+                    allowDefaults={cmdRules.allow_defaults}
+                    denyDefaults={cmdRules.deny_defaults}
+                    busy={cmdRulesBusy}
+                    status={cmdRulesStatus}
+                    onSave={(a, d) => void saveCmdRules(a, d)}
+                  />
+                </div>
+              {/if}
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('approvalLogTitle')}</span>
@@ -4236,6 +4305,13 @@
   }
 
   /* B-7/B-8: вкладка «Безопасность» в настройках */
+  /* F-3: редактор списков команд занимает всю ширину ряда — две колонки
+     regex-строк в половину ширины нечитаемы. */
+  .rules-row {
+    display: block;
+    padding-top: 14px;
+  }
+
   .dpapi-controls {
     display: flex;
     gap: 8px;

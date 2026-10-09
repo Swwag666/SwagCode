@@ -997,6 +997,15 @@ pub(crate) async fn start_turn_core(
     // Активный провайдер из настроек (default = .env/DPAPI как раньше).
     let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
 
+    /* F-3: allow/deny-списки команд читаются из prefs на каждый ход —
+    правка списка в настройках действует сразу, без перезапуска. */
+    let cmd_rules = state
+        .store
+        .lock()
+        .map(|s| load_command_rules(s.as_ref()))
+        // Отравленный мьютекс не должен снимать запреты: дефолты F-3.
+        .unwrap_or_else(|_| swagcod_core::rules::CommandRules::defaults());
+
     let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
@@ -1026,6 +1035,8 @@ pub(crate) async fn start_turn_core(
         if let Some(p) = session.approval_policy {
             cfg.approval_policy = p;
         }
+        // F-3: списки команд — свои на каждый ход (свежие из prefs).
+        cfg.rules = cmd_rules;
         (
             turn_id.to_string(),
             session.history.clone(),
@@ -1306,6 +1317,32 @@ pub(crate) async fn start_turn_core(
                     }
                     app_state.approvals.lock().await.remove(&call_id);
                     step = machine.on_approval(decision);
+                }
+                /* F-3: вызов запрещён deny-списком. Диалога нет — решение
+                принято правилом заранее. В журнал пишем actor=system:
+                автоматический отказ должен быть виден в аудите наравне с
+                человеческими, иначе «кто запретил» останется загадкой. */
+                TurnStep::Blocked { call, reason } => {
+                    bus.publish(EventKind::ToolResult {
+                        turn: tid.clone(),
+                        call_id: call.id.clone(),
+                        ok: false,
+                        output: truncate_output(&reason),
+                        elapsed_ms: 0,
+                    });
+                    if let Ok(store) = app_state.store.lock() {
+                        let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
+                            session_id: sid.clone(),
+                            turn_id: tid.to_string(),
+                            call_id: call.id.clone(),
+                            tool: call.name.clone(),
+                            summary: describe_call(&call),
+                            decision: "denied".into(),
+                            actor: "system".into(),
+                            decided_ms: swagcod_core::bus::now_ms(),
+                        });
+                    }
+                    step = machine.on_blocked(&reason);
                 }
                 TurnStep::ExecuteTool { call } => {
                     let started = std::time::Instant::now();
@@ -2908,6 +2945,114 @@ fn approval_log(
         .map_err(|e| e.to_string())
 }
 
+/* ── F-3: allow/deny-списки команд ──────────────────────────────────────────
+ * Движок живёт в `core::rules` (deny > allow > политика), здесь — хранение
+ * в prefs (по правилу на строку) и команды для UI. Списки читаются на
+ * каждый ход, поэтому правка действует без перезапуска приложения. */
+
+/// Prefs-ключ allow-списка: совпавший вызов исполняется без диалога.
+pub const CMD_ALLOW_PREF: &str = "cmd_allow";
+/// Prefs-ключ deny-списка: совпавший вызов отклоняется без диалога.
+pub const CMD_DENY_PREF: &str = "cmd_deny";
+
+/// Строки правил из prefs. Отсутствующий pref — не «пустой список», а
+/// дефолты соответствующего списка: сохранённый allow не должен молча
+/// отменять встроенные запреты.
+fn pref_rule_lines(
+    store: &dyn swagcod_core::store::Store,
+    key: &str,
+    defaults: &[&str],
+) -> Vec<String> {
+    match store.get_pref(key).ok().flatten() {
+        Some(raw) => swagcod_core::rules::lines_from_pref(&raw),
+        None => defaults.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+/// Собрать списки хода из store.
+pub(crate) fn load_command_rules(
+    store: &dyn swagcod_core::store::Store,
+) -> swagcod_core::rules::CommandRules {
+    use swagcod_core::rules::{CommandRules, DEFAULT_ALLOW, DEFAULT_DENY};
+    CommandRules::from_lines(
+        pref_rule_lines(store, CMD_ALLOW_PREF, DEFAULT_ALLOW),
+        pref_rule_lines(store, CMD_DENY_PREF, DEFAULT_DENY),
+    )
+}
+
+/// Нормализовать ввод пользователя: trim, без пустых строк. Комментарии
+/// (`#`) сохраняем — их просто не собираем в правила.
+fn clean_rule_lines(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Состояние списков для UI: действующие строки, дефолты для кнопки сброса
+/// и честный список битых regex.
+#[derive(Serialize, Clone)]
+pub struct CommandRulesDto {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub allow_defaults: Vec<String>,
+    pub deny_defaults: Vec<String>,
+    pub errors: Vec<String>,
+    /// Сколько правил реально собрано (битые строки не в счёт).
+    pub active: usize,
+}
+
+fn rules_dto(store: &dyn swagcod_core::store::Store) -> CommandRulesDto {
+    let allow = pref_rule_lines(store, CMD_ALLOW_PREF, swagcod_core::rules::DEFAULT_ALLOW);
+    let deny = pref_rule_lines(store, CMD_DENY_PREF, swagcod_core::rules::DEFAULT_DENY);
+    let built = swagcod_core::rules::CommandRules::from_lines(allow.clone(), deny.clone());
+    CommandRulesDto {
+        allow,
+        deny,
+        allow_defaults: swagcod_core::rules::DEFAULT_ALLOW
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        deny_defaults: swagcod_core::rules::DEFAULT_DENY
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        errors: built.errors().to_vec(),
+        active: built.len(),
+    }
+}
+
+/// Прочитать действующие списки команд (вкладка «Безопасность»).
+#[tauri::command]
+fn cmd_rules_load(state: State<'_, Arc<AppState>>) -> Result<CommandRulesDto, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    Ok(rules_dto(store.as_ref()))
+}
+
+/// Сохранить списки. Битый regex отклоняется ЦЕЛИКОМ: правило, которое
+/// молча не собралось, выглядит как работающий запрет и обманывает человека.
+#[tauri::command]
+fn cmd_rules_save(
+    state: State<'_, Arc<AppState>>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+) -> Result<CommandRulesDto, String> {
+    let allow = clean_rule_lines(&allow);
+    let deny = clean_rule_lines(&deny);
+    let built = swagcod_core::rules::CommandRules::from_lines(allow.clone(), deny.clone());
+    if !built.errors().is_empty() {
+        return Err(format!("битый regex: {}", built.errors().join("; ")));
+    }
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_pref(CMD_ALLOW_PREF, &allow.join("\n"))
+        .map_err(|e| e.to_string())?;
+    store
+        .set_pref(CMD_DENY_PREF, &deny.join("\n"))
+        .map_err(|e| e.to_string())?;
+    Ok(rules_dto(store.as_ref()))
+}
+
 /// Положить ключ провайдера под DPAPI: в store уходит только шифроблоб.
 #[tauri::command]
 fn save_protected_key(state: State<'_, Arc<AppState>>, key: String) -> Result<(), String> {
@@ -4245,6 +4390,8 @@ pub fn run() {
             set_approval_policy,
             set_session_approval_policy,
             approval_log,
+            cmd_rules_load,
+            cmd_rules_save,
             save_protected_key,
             clear_protected_key,
             get_diagnostics,
@@ -5450,5 +5597,80 @@ rl.on('line', (l) => {
         std::env::remove_var("SWAGCOD_BASE_URL");
         std::env::remove_var("SWAGCOD_API_KEY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- F-3: allow/deny-списки команд (движок — в core::rules) ----
+
+    #[test]
+    fn command_rules_use_defaults_when_prefs_absent() {
+        use swagcod_core::rules::RuleVerdict;
+        let store = swagcod_core::store::open_memory();
+        let r = load_command_rules(store.as_ref());
+        assert!(matches!(r.verdict("rm -rf /"), RuleVerdict::Deny { .. }));
+        assert!(matches!(r.verdict("git status"), RuleVerdict::Allow { .. }));
+        // Не запрещённое и не одобренное — решает политика.
+        assert_eq!(r.verdict("git push origin main"), RuleVerdict::Pass);
+    }
+
+    #[test]
+    fn command_rules_pref_overrides_only_its_own_list() {
+        use swagcod_core::rules::RuleVerdict;
+        let store = swagcod_core::store::open_memory();
+        store
+            .set_pref(CMD_ALLOW_PREF, "^npm test\n# комментарий")
+            .unwrap();
+        let r = load_command_rules(store.as_ref());
+        // Свой allow заменил дефолтный: git status больше не авто-одобрен.
+        assert_eq!(r.verdict("git status"), RuleVerdict::Pass);
+        assert!(matches!(r.verdict("npm test"), RuleVerdict::Allow { .. }));
+        // Deny без pref остался дефолтным — списки независимы (fail-closed).
+        assert!(matches!(r.verdict("shutdown /s"), RuleVerdict::Deny { .. }));
+        assert!(r.errors().is_empty(), "комментарий — не битый regex");
+    }
+
+    #[test]
+    fn empty_pref_means_no_rules_in_that_list() {
+        use swagcod_core::rules::RuleVerdict;
+        let store = swagcod_core::store::open_memory();
+        store.set_pref(CMD_DENY_PREF, "").unwrap();
+        let r = load_command_rules(store.as_ref());
+        // Пустой textarea — осознанное решение пользователя, не дефолты.
+        assert_eq!(r.verdict("rm -rf /"), RuleVerdict::Pass);
+        assert!(matches!(r.verdict("git status"), RuleVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn rules_dto_reports_lines_defaults_and_active_count() {
+        let store = swagcod_core::store::open_memory();
+        let dto = rules_dto(store.as_ref());
+        assert_eq!(
+            dto.allow.len(),
+            swagcod_core::rules::DEFAULT_ALLOW.len(),
+            "без prefs UI видит дефолты"
+        );
+        assert_eq!(dto.deny.len(), swagcod_core::rules::DEFAULT_DENY.len());
+        assert!(dto.errors.is_empty());
+        assert_eq!(dto.active, dto.allow.len() + dto.deny.len());
+
+        store
+            .set_pref(CMD_ALLOW_PREF, "^npm (test|run lint)")
+            .unwrap();
+        let dto = rules_dto(store.as_ref());
+        assert_eq!(dto.allow, vec!["^npm (test|run lint)".to_string()]);
+        assert_eq!(dto.active, 1 + dto.deny.len());
+    }
+
+    #[test]
+    fn clean_rule_lines_trims_blanks_and_keeps_comments() {
+        let out = clean_rule_lines(&[
+            "  ^git status ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "# пояснение".to_string(),
+        ]);
+        assert_eq!(
+            out,
+            vec!["^git status".to_string(), "# пояснение".to_string()]
+        );
     }
 }

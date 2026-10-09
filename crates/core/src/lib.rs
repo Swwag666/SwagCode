@@ -14,6 +14,7 @@
 pub mod bus;
 pub mod context;
 pub mod node_store;
+pub mod rules;
 pub mod semantic;
 pub mod session;
 pub mod store;
@@ -21,6 +22,7 @@ pub mod tasks;
 pub mod turn;
 
 pub use bus::{Bus, BusError, Event, EventKind};
+pub use rules::{CommandRules, RuleVerdict};
 pub use session::{Session, SessionId, SessionStatus, TurnId, TurnRecord};
 pub use turn::{
     builtin_tool_specs, ApprovalDecision, ApprovalPolicy, ToolOutcome, TurnConfig, TurnMachine,

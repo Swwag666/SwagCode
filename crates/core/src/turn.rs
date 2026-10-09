@@ -16,6 +16,7 @@ use swagcod_provider::sse::StreamEvent;
 use swagcod_provider::types::{ChatMessage, Role, ToolCall, ToolSpec};
 
 use crate::bus::now_ms;
+use crate::rules::{rule_subject, CommandRules, RuleVerdict};
 use crate::session::{TurnId, TurnRecord};
 
 /// Максимум итераций «модель → тулзы» внутри одного хода.
@@ -181,6 +182,11 @@ pub struct TurnConfig {
     pub approval_policy: ApprovalPolicy,
     /// Таймаут одного вызова тулза.
     pub tool_timeout: Duration,
+    /// F-3: allow/deny-списки команд. Проверяются РАНЬШЕ политики:
+    /// `deny` отменяет вызов независимо от allow-списка и от политики
+    /// (даже `Never` не исполнит запрещённое), `allow` исполняет вызов
+    /// без диалога.
+    pub rules: CommandRules,
 }
 
 impl Default for TurnConfig {
@@ -190,6 +196,7 @@ impl Default for TurnConfig {
             approval_policy: ApprovalPolicy::OnDangerous,
             // Долго, но не бесконечно: зависший тулз не должен вешать ход.
             tool_timeout: Duration::from_secs(120),
+            rules: CommandRules::defaults(),
         }
     }
 }
@@ -283,6 +290,11 @@ pub enum TurnStep {
     /// Вызов требует решения человека: драйвер показывает диалог и вернёт
     /// ответ через [`TurnMachine::on_approval`].
     AwaitApproval { call: ToolCall },
+    /// F-3: вызов запрещён deny-списком — диалога нет, решение уже принято
+    /// правилом. Драйвер публикует отказ (и пишет его в журнал
+    /// подтверждений с actor=system) и возвращает ход через
+    /// [`TurnMachine::on_blocked`].
+    Blocked { call: ToolCall, reason: String },
     /// Выполнить вызов и вернуть результат через [`TurnMachine::on_tool_result`].
     ExecuteTool { call: ToolCall },
     /// Ход закончен; отчёт берётся [`TurnMachine::report`].
@@ -371,6 +383,25 @@ impl TurnMachine {
         }
     }
 
+    /// F-3: вызов, запрещённый deny-списком, закрывается сообщением `tool`
+    /// с текстом отказа — история остаётся валидной для следующего запроса.
+    /// `executed_calls` не растёт: вызов не исполнялся.
+    pub fn on_blocked(&mut self, reason: &str) -> TurnStep {
+        let Some(call) = self.pending.first().cloned() else {
+            return TurnStep::Finish {
+                outcome: TurnOutcome::Failed,
+            };
+        };
+        self.close_call(
+            &call,
+            ToolOutcome {
+                ok: false,
+                output: reason.to_string(),
+            },
+        );
+        self.after_queue()
+    }
+
     /// Результат выполнения вызова, стоявшего первым в очереди.
     pub fn on_tool_result(&mut self, outcome: ToolOutcome) -> TurnStep {
         let Some(call) = self.pending.first().cloned() else {
@@ -442,10 +473,25 @@ impl TurnMachine {
                 outcome: TurnOutcome::Completed,
             };
         };
-        if self.config.approval_policy.requires_approval(&call.name) {
-            TurnStep::AwaitApproval { call }
-        } else {
-            TurnStep::ExecuteTool { call }
+        /* F-3: списки команд проверяются РАНЬШЕ политики — deny > allow >
+        политика. Запрещённый вызов не доходит до диалога: решение человек
+        принял заранее, записав правило. */
+        match self.config.rules.verdict_for(&call) {
+            RuleVerdict::Deny { rule } => TurnStep::Blocked {
+                reason: format!(
+                    "вызов отклонён deny-списком (правило {rule}): {}",
+                    rule_subject(&call)
+                ),
+                call,
+            },
+            RuleVerdict::Allow { .. } => TurnStep::ExecuteTool { call },
+            RuleVerdict::Pass => {
+                if self.config.approval_policy.requires_approval(&call.name) {
+                    TurnStep::AwaitApproval { call }
+                } else {
+                    TurnStep::ExecuteTool { call }
+                }
+            }
         }
     }
 }
@@ -1118,5 +1164,148 @@ mod tests {
         let props = spec.parameters["properties"].as_object().unwrap();
         assert!(props.contains_key("model"));
         assert!(!required.iter().any(|v| v == "model"));
+    }
+
+    // ---- F-3: allow/deny-списки команд в машине хода ----
+
+    fn acc_bash(id: &str, cmd: &str) -> StreamAccumulator {
+        StreamAccumulator {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": cmd })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_config_carries_default_rules() {
+        let c = TurnConfig::default();
+        assert!(
+            !c.rules.is_empty(),
+            "дефолты F-3 обязаны быть в конфигурации хода"
+        );
+        assert!(matches!(
+            c.rules.verdict("rm -rf /"),
+            crate::rules::RuleVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn deny_rule_blocks_call_even_under_never_policy() {
+        /* Список запретов сильнее политики: `Never` означает «не спрашивать»,
+        а не «исполнять всё». */
+        let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_bash("c1", "rm -rf /"));
+        let reason = match step {
+            TurnStep::Blocked { reason, .. } => reason,
+            other => panic!("ожидали Blocked, получили {other:?}"),
+        };
+        assert!(reason.contains("deny-списком"), "{reason}");
+        assert!(
+            reason.contains("rm -rf /"),
+            "модель должна видеть команду: {reason}"
+        );
+        let step = m.on_blocked(&reason);
+        match step {
+            TurnStep::RequestModel { history } => {
+                assert_eq!(history[2].role, Role::Tool);
+                assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
+                assert!(history[2].content.contains("deny-списком"));
+            }
+            other => panic!("после блокировки ждём новый запрос модели: {other:?}"),
+        }
+        // Заблокированный вызов не считается исполненным.
+        assert_eq!(m.report(TurnOutcome::Completed, 1).tool_calls, 0);
+    }
+
+    #[test]
+    fn allow_rule_skips_dialog_even_under_always_policy() {
+        let cfg = TurnConfig {
+            approval_policy: ApprovalPolicy::Always,
+            ..Default::default()
+        };
+        let (mut m, _) = TurnMachine::new(cfg, vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_bash("c1", "git status --short"));
+        assert!(
+            matches!(step, TurnStep::ExecuteTool { .. }),
+            "read-only команда из allow-списка исполняется без диалога: {step:?}"
+        );
+    }
+
+    #[test]
+    fn deny_wins_over_user_allow_rule() {
+        let cfg = TurnConfig {
+            approval_policy: ApprovalPolicy::Never,
+            rules: CommandRules::from_lines(
+                vec![r"^git\b".to_string()],
+                vec![r"git\s+push\b.*--force".to_string()],
+            ),
+            ..Default::default()
+        };
+        let (mut m, _) = TurnMachine::new(cfg, vec![ChatMessage::user("go")]);
+        // Обычный git — allow, без диалога.
+        assert!(matches!(
+            m.on_stream(acc_bash("c1", "git status")),
+            TurnStep::ExecuteTool { .. }
+        ));
+        let _ = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: "".into(),
+        });
+        // Force-push — deny, несмотря на allow `^git\b` и политику Never.
+        let step = m.on_stream(acc_bash("c2", "git push --force origin main"));
+        assert!(
+            matches!(step, TurnStep::Blocked { .. }),
+            "deny обязан победить allow: {step:?}"
+        );
+    }
+
+    #[test]
+    fn blocked_queue_continues_with_next_call() {
+        /* Очередь из двух вызовов: запрещённый закрывается отказом, ход
+        продолжается вторым — инвариант «каждый tool_calls закрыт tool». */
+        let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
+        let acc = StreamAccumulator {
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "command": "shutdown /s" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "read".into(),
+                    arguments: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let step = m.on_stream(acc);
+        assert!(matches!(step, TurnStep::Blocked { .. }));
+        let step = m.on_blocked("нельзя");
+        match step {
+            TurnStep::ExecuteTool { call } => assert_eq!(call.id, "c2"),
+            other => panic!("второй вызов должен исполниться: {other:?}"),
+        }
+        let _ = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: "body".into(),
+        });
+        let tools: Vec<_> = m
+            .history()
+            .iter()
+            .filter(|msg| msg.role == Role::Tool)
+            .collect();
+        assert_eq!(tools.len(), 2, "оба вызова закрыты: {tools:?}");
+        assert_eq!(tools[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(tools[1].tool_call_id.as_deref(), Some("c2"));
     }
 }
