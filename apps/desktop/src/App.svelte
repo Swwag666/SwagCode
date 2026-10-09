@@ -777,6 +777,17 @@
     }
   }
 
+  /* F-1: отмена задачи из таблицы телеметрии. Команда task_cancel честная:
+     отменяет только queued, выполняющуюся отклоняет текстом ошибки. */
+  async function cancelTask(id: string): Promise<void> {
+    try {
+      await invoke('task_cancel', { id })
+      await refreshTelemetry()
+    } catch (e) {
+      flashStatus(String(e))
+    }
+  }
+
   function flashStatus(msg: string): void {
     dpapiStatus = msg
     setTimeout(() => (dpapiStatus = null), 2500)
@@ -2472,7 +2483,7 @@
                 <div class="approval-scroll">
                   <table class="approval-table">
                     <thead>
-                      <tr><th>id</th><th>kind</th><th>{t('taskColState')}</th><th>{t('taskColAttempts')}</th><th>{t('taskColNext')}</th><th>{t('taskColLog')}</th></tr>
+                      <tr><th>id</th><th>kind</th><th>{t('taskColState')}</th><th>{t('taskColAttempts')}</th><th>{t('taskColNext')}</th><th>{t('taskColLog')}</th><th></th></tr>
                     </thead>
                     <tbody>
                       {#each telTasks as task (task.id)}
@@ -2483,6 +2494,13 @@
                           <td>{task.attempts}</td>
                           <td class="log-time">{task.next_try_ms ? new Date(task.next_try_ms).toLocaleString() : '—'}</td>
                           <td class="tel-err">{task.last_error}</td>
+                          <td>
+                            {#if task.state === 'queued'}
+                              <button class="step-btn text-btn" onclick={() => void cancelTask(task.id)}>{t('taskCancel')}</button>
+                            {:else}
+                              —
+                            {/if}
+                          </td>
                         </tr>
                       {/each}
                     </tbody>
