@@ -133,7 +133,11 @@ pub fn local_embedding(text: &str) -> Vec<f32> {
         let idx = (h.finish() % LOCAL_EMBED_DIM as u64) as usize;
         vec[idx] += 1.0 + (*n as f64).ln() as f32;
     }
-    let norm = vec.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    let norm = vec
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
     if norm > 0.0 {
         for x in vec.iter_mut() {
             *x = (*x as f64 / norm) as f32;
@@ -236,7 +240,9 @@ impl SemanticIndex {
     /// Вектора разных эмбеддеров несравнимы: при смене маркера индекс
     /// обязан быть перестроен с нуля (см. [`SemanticIndex::clear_all`]).
     pub fn embedder(&self) -> Result<Option<String>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = 'embedder'")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM meta WHERE key = 'embedder'")?;
         Ok(stmt.query_row([], |r| r.get::<_, String>(0)).ok())
     }
 
@@ -251,7 +257,8 @@ impl SemanticIndex {
 
     /// Полная очистка кэша (смена эмбеддера — вектора несовместимы).
     pub fn clear_all(&self) -> Result<(), rusqlite::Error> {
-        self.conn.execute_batch("DELETE FROM chunks; DELETE FROM files;")
+        self.conn
+            .execute_batch("DELETE FROM chunks; DELETE FROM files;")
     }
 
     /// Хэши всех проиндексированных файлов: snapshot для дешёвого
@@ -293,18 +300,25 @@ impl SemanticIndex {
 
     /// Удалить файл из индекса.
     pub fn remove_file(&self, path: &str) -> Result<(), rusqlite::Error> {
-        self.conn.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
-        self.conn.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])?;
         Ok(())
     }
 
     /// Вычистить файлы, которых больше нет в рабочей директории.
     /// Возвращает число удалённых записей.
-    pub fn prune_missing(&self, present: &std::collections::HashSet<String>) -> Result<usize, rusqlite::Error> {
+    pub fn prune_missing(
+        &self,
+        present: &std::collections::HashSet<String>,
+    ) -> Result<usize, rusqlite::Error> {
         let stale: Vec<String> = {
             let mut stmt = self.conn.prepare("SELECT path FROM files")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.filter_map(|p| p.ok()).filter(|p| !present.contains(p)).collect()
+            rows.filter_map(|p| p.ok())
+                .filter(|p| !present.contains(p))
+                .collect()
         };
         for p in &stale {
             self.remove_file(p)?;
@@ -348,7 +362,12 @@ impl SemanticIndex {
             if score <= 0.0 {
                 continue;
             }
-            hits.push(Hit { path, start: start as u32, end: end as u32, score });
+            hits.push(Hit {
+                path,
+                start: start as u32,
+                end: end as u32,
+                score,
+            });
             if hits.len() > top_k * 4 {
                 // Держим список коротким: частичная сортировка вместо полного склада.
                 hits.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -422,7 +441,11 @@ mod tests {
         let b = local_embedding("fn approval_policy_journal() { /* x */ }");
         assert_eq!(a, b);
         assert_eq!(a.len(), LOCAL_EMBED_DIM);
-        let norm: f64 = a.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+        let norm: f64 = a
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "L2-нормировка: {norm}");
     }
 
@@ -456,8 +479,13 @@ mod tests {
         assert_eq!(ix.embedder().unwrap(), None);
         ix.set_embedder("local:v1").unwrap();
         assert_eq!(ix.embedder().unwrap().as_deref(), Some("local:v1"));
-        let c = Chunk { start: 1, end: 2, text: "x".into() };
-        ix.upsert_file("a.rs", "h", &[(c, sample_vec(0.5))]).unwrap();
+        let c = Chunk {
+            start: 1,
+            end: 2,
+            text: "x".into(),
+        };
+        ix.upsert_file("a.rs", "h", &[(c, sample_vec(0.5))])
+            .unwrap();
         assert_eq!(ix.stats().unwrap(), (1, 1));
         ix.clear_all().unwrap();
         assert_eq!(ix.stats().unwrap(), (0, 0));
@@ -474,11 +502,24 @@ mod tests {
     #[test]
     fn index_roundtrip_search_and_prune() {
         let ix = SemanticIndex::in_memory().unwrap();
-        let c1 = Chunk { start: 1, end: 40, text: "a".into() };
-        let c2 = Chunk { start: 36, end: 75, text: "b".into() };
-        ix.upsert_file("src/a.rs", "h1", &[(c1.clone(), sample_vec(0.9)), (c2.clone(), sample_vec(0.1))])
+        let c1 = Chunk {
+            start: 1,
+            end: 40,
+            text: "a".into(),
+        };
+        let c2 = Chunk {
+            start: 36,
+            end: 75,
+            text: "b".into(),
+        };
+        ix.upsert_file(
+            "src/a.rs",
+            "h1",
+            &[(c1.clone(), sample_vec(0.9)), (c2.clone(), sample_vec(0.1))],
+        )
+        .unwrap();
+        ix.upsert_file("src/b.rs", "h2", &[(c1.clone(), sample_vec(0.5))])
             .unwrap();
-        ix.upsert_file("src/b.rs", "h2", &[(c1.clone(), sample_vec(0.5))]).unwrap();
         assert_eq!(ix.stats().unwrap(), (2, 3));
 
         let hits = ix.search(&sample_vec(0.9), 2).unwrap();
@@ -503,9 +544,29 @@ mod tests {
     #[test]
     fn upsert_replaces_old_chunks() {
         let ix = SemanticIndex::in_memory().unwrap();
-        let c = Chunk { start: 1, end: 40, text: "a".into() };
-        ix.upsert_file("f.rs", "h1", &[(c.clone(), sample_vec(0.9)), (Chunk { start: 36, end: 70, text: "b".into() }, sample_vec(0.4))]).unwrap();
-        ix.upsert_file("f.rs", "h2", &[(c, sample_vec(0.2))]).unwrap();
+        let c = Chunk {
+            start: 1,
+            end: 40,
+            text: "a".into(),
+        };
+        ix.upsert_file(
+            "f.rs",
+            "h1",
+            &[
+                (c.clone(), sample_vec(0.9)),
+                (
+                    Chunk {
+                        start: 36,
+                        end: 70,
+                        text: "b".into(),
+                    },
+                    sample_vec(0.4),
+                ),
+            ],
+        )
+        .unwrap();
+        ix.upsert_file("f.rs", "h2", &[(c, sample_vec(0.2))])
+            .unwrap();
         assert_eq!(ix.stats().unwrap(), (1, 1));
         assert_eq!(ix.file_hashes().unwrap()["f.rs"], "h2");
     }

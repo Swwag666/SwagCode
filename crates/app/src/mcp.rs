@@ -84,7 +84,8 @@ pub async fn connect_with_timeout(
             init_timeout,
         )
         .await?;
-    if let Err(e) = crate::stdio_rpc::unwrap_response(&init, &format!("mcp {} initialize", cfg.name))
+    if let Err(e) =
+        crate::stdio_rpc::unwrap_response(&init, &format!("mcp {} initialize", cfg.name))
     {
         conn.kill().await;
         return Err(e);
@@ -102,7 +103,9 @@ pub fn tools_from_response(resp: &Value, server: &str) -> Result<Vec<McpTool>, S
     if let Some(err) = resp.get("error") {
         return Err(format!(
             "mcp {server}: {}",
-            err.get("message").and_then(|m| m.as_str()).unwrap_or("tools/list error")
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("tools/list error")
         ));
     }
     let Some(arr) = resp.pointer("/result/tools").and_then(|v| v.as_array()) else {
@@ -132,7 +135,11 @@ pub fn tools_from_response(resp: &Value, server: &str) -> Result<Vec<McpTool>, S
 
 pub async fn list_tools(conn: &Conn, server: &str) -> Result<Vec<McpTool>, String> {
     let resp = conn
-        .request("tools/list", json!({}), Duration::from_millis(MCP_INIT_TIMEOUT_MS))
+        .request(
+            "tools/list",
+            json!({}),
+            Duration::from_millis(MCP_INIT_TIMEOUT_MS),
+        )
         .await?;
     tools_from_response(&resp, server)
 }
@@ -140,7 +147,10 @@ pub async fn list_tools(conn: &Conn, server: &str) -> Result<Vec<McpTool>, Strin
 /// Чистый разбор результата tools/call: (is_error, текст). Из content
 /// берутся только text-части: изображения/ресурсы — вторая очередь.
 pub fn text_from_call_result(result: &Value) -> (bool, String) {
-    let is_err = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_err = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let text = result
         .get("content")
         .and_then(|c| c.as_array())
@@ -165,12 +175,18 @@ pub async fn call_tool(
     timeout: Duration,
 ) -> Result<String, String> {
     let resp = conn
-        .request("tools/call", json!({"name": tool, "arguments": args}), timeout)
+        .request(
+            "tools/call",
+            json!({"name": tool, "arguments": args}),
+            timeout,
+        )
         .await?;
     if let Some(err) = resp.get("error") {
         return Err(format!(
             "mcp: {}",
-            err.get("message").and_then(|m| m.as_str()).unwrap_or("tools/call error")
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("tools/call error")
         ));
     }
     let result = resp.get("result").cloned().unwrap_or(Value::Null);
@@ -329,8 +345,7 @@ mod tests {
         let cfg2: McpServerConfig = serde_json::from_str(&back).unwrap();
         assert_eq!(cfg2.name, "echo");
         // Массив конфигов — формат prefs.
-        let list: Vec<McpServerConfig> =
-            serde_json::from_str(&format!("[{raw}]")).unwrap();
+        let list: Vec<McpServerConfig> = serde_json::from_str(&format!("[{raw}]")).unwrap();
         assert_eq!(list.len(), 1);
     }
 
@@ -355,7 +370,8 @@ mod tests {
 
     #[test]
     fn tools_from_response_propagates_error() {
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "нет такого"}});
+        let resp =
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "нет такого"}});
         let e = tools_from_response(&resp, "srv").unwrap_err();
         assert!(e.contains("нет такого"), "{e}");
         let no_result = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
@@ -452,9 +468,14 @@ rl.on('line', (line) => {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp:fake:echo");
 
-        let out = call_tool(&conn, "echo", json!({"text": "привет"}), Duration::from_secs(10))
-            .await
-            .expect("tools/call");
+        let out = call_tool(
+            &conn,
+            "echo",
+            json!({"text": "привет"}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("tools/call");
         assert_eq!(out, "echo:привет");
 
         // isError:true — честная ошибка с текстом сервера.
@@ -518,6 +539,9 @@ rl.on('line', (line) => {
         off.command = "node".into();
         off.enabled = false;
         assert_eq!(reg.connect_server(&off).await, 0);
-        assert!(reg.status().iter().any(|s| s.name == "off" && s.state == "отключён"));
+        assert!(reg
+            .status()
+            .iter()
+            .any(|s| s.name == "off" && s.state == "отключён"));
     }
 }

@@ -112,7 +112,10 @@ impl Router {
         } else {
             OpenAiProvider::new(&base, &key)?
         };
-        let mut endpoints = vec![RouterEndpoint { provider: primary, model: None }];
+        let mut endpoints = vec![RouterEndpoint {
+            provider: primary,
+            model: None,
+        }];
         if let Ok(spec) = std::env::var("SWAGCOD_FALLBACKS") {
             for (base, key, model) in parse_fallbacks(&spec) {
                 let provider = if key.is_empty() {
@@ -238,8 +241,7 @@ impl Provider for Router {
                     Ok((mut erx, ehandle)) => {
                         // Ждём первое событие: Error до контента = эндпоинт
                         // лежит/отказал, можно переключаться без потерь.
-                        let first =
-                            tokio::time::timeout(FIRST_EVENT_TIMEOUT, erx.recv()).await;
+                        let first = tokio::time::timeout(FIRST_EVENT_TIMEOUT, erx.recv()).await;
                         match first {
                             Ok(Some(StreamEvent::Error(m))) => {
                                 last_error = m;
@@ -376,8 +378,14 @@ mod tests {
         let dead = OpenAiProvider::new_open("http://127.0.0.1:9/v1").unwrap();
         let good = OpenAiProvider::new_open(&good_base).unwrap();
         let router = Router::new(vec![
-            RouterEndpoint { provider: dead, model: None },
-            RouterEndpoint { provider: good, model: Some("local-model".into()) },
+            RouterEndpoint {
+                provider: dead,
+                model: None,
+            },
+            RouterEndpoint {
+                provider: good,
+                model: Some("local-model".into()),
+            },
         ])
         .unwrap();
 
@@ -395,7 +403,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(got_error.is_none(), "живой эндпоинт не должен дать ошибку: {got_error:?}");
+        assert!(
+            got_error.is_none(),
+            "живой эндпоинт не должен дать ошибку: {got_error:?}"
+        );
         assert_eq!(got_content.as_deref(), Some("привет"));
     }
 
@@ -404,8 +415,14 @@ mod tests {
         let dead1 = OpenAiProvider::new_open("http://127.0.0.1:9/v1").unwrap();
         let dead2 = OpenAiProvider::new_open("http://127.0.0.1:9/v2").unwrap();
         let router = Router::new(vec![
-            RouterEndpoint { provider: dead1, model: None },
-            RouterEndpoint { provider: dead2, model: None },
+            RouterEndpoint {
+                provider: dead1,
+                model: None,
+            },
+            RouterEndpoint {
+                provider: dead2,
+                model: None,
+            },
         ])
         .unwrap();
         let req = ChatRequest::new("m", vec![crate::types::ChatMessage::user("hi")]);
@@ -431,8 +448,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];
-                let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf))
-                    .await;
+                let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
                 let resp = format!("HTTP/1.1 {status} ERR\r\ncontent-length: 4\r\n\r\noops");
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;

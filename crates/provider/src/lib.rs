@@ -23,30 +23,30 @@ B-6: [`Provider`] — trait (stream, list_models), [`OpenAiProvider`] —
 пустым ключом), [`Router`] — fallback-цепочка с backoff и jitter.
 */
 
+pub mod presets;
 pub mod sse;
 pub mod types;
-pub mod presets;
 
-#[cfg(feature = "http")]
-pub mod http;
-#[cfg(feature = "http")]
-pub mod router;
 #[cfg(feature = "http")]
 pub mod anthropic;
 #[cfg(feature = "http")]
 pub mod any;
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "http")]
+pub mod router;
 
+pub use presets::{find_preset, ProviderFlavor, ProviderPreset, PRESETS};
 pub use sse::{SseParser, StreamEvent};
 pub use types::{ChatMessage, ChatRequest, Role, ToolCall, ToolSpec};
-pub use presets::{find_preset, ProviderFlavor, ProviderPreset, PRESETS};
 
+#[cfg(feature = "http")]
+pub use anthropic::{anthropic_body, AnthropicError, AnthropicProvider, ANTHROPIC_VERSION};
+#[cfg(feature = "http")]
+pub use any::AnyProvider;
 #[cfg(feature = "http")]
 pub use http::{parse_embeddings, OpenAiProvider, ProviderError};
 #[cfg(feature = "http")]
 pub use router::{
     backoff_delay, embeddings_model, parse_fallbacks, Provider, Router, RouterEndpoint,
 };
-#[cfg(feature = "http")]
-pub use anthropic::{anthropic_body, AnthropicError, AnthropicProvider, ANTHROPIC_VERSION};
-#[cfg(feature = "http")]
-pub use any::AnyProvider;

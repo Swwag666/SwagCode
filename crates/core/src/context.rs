@@ -114,7 +114,10 @@ pub fn should_compact(est_tokens: u32, ctx_tokens: u32) -> bool {
 /// Граница хода — сообщение `Role::User`. Рез всегда по этой границе,
 /// поэтому инвариант машины (assistant с tool_calls закрыт tool-ответами)
 /// не разрывается: срезанный хвост всегда начинается с user.
-pub fn split_history(history: &[ChatMessage], keep_turns: usize) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+pub fn split_history(
+    history: &[ChatMessage],
+    keep_turns: usize,
+) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
     let starts: Vec<usize> = history
         .iter()
         .enumerate()
@@ -231,7 +234,10 @@ mod tests {
         assert_eq!(chars_per_token("fable-ultra-promax", Some(json)), 5.0);
         // Мусор игнорируется, ход не падает.
         assert_eq!(chars_per_token("deepseek-chat", Some("не json")), 3.5);
-        assert_eq!(chars_per_token("deepseek-chat", Some(r#"{"deepseek": 0.01}"#)), 3.5);
+        assert_eq!(
+            chars_per_token("deepseek-chat", Some(r#"{"deepseek": 0.01}"#)),
+            3.5
+        );
     }
 
     #[test]
@@ -280,7 +286,10 @@ mod tests {
         let p2 = summarizer_prompt("", &old);
         assert_eq!(p1, p2, "сборка промпта обязана быть детерминированной");
         assert!(p1.contains("задача 1"));
-        assert!(!p1.contains("задача 4"), "свежие ходы в свёртку не попадают");
+        assert!(
+            !p1.contains("задача 4"),
+            "свежие ходы в свёртку не попадают"
+        );
         let p3 = summarizer_prompt("прошлая сводка", &old);
         assert!(p3.contains("прошлая сводка"));
     }

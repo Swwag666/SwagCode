@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn turn_record_parent_wire_compat() {
         /* E-6: старые журналы без parent_turn_id читаются как ходы верхнего
-           уровня (serde-default), а дочерние сериализуются с полем. */
+        уровня (serde-default), а дочерние сериализуются с полем. */
         let old = r#"{"id":"t1","started_ms":1,"ended_ms":null,"content":"","reasoning":"","tool_calls":[],"est_input_tokens":0,"est_output_tokens":0,"ok":true,"failure":null}"#;
         let rec: TurnRecord = serde_json::from_str(old).unwrap();
         assert_eq!(rec.parent_turn_id, None);

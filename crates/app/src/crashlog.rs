@@ -82,7 +82,12 @@ mod tests {
 
     #[test]
     fn render_contains_all_parts() {
-        let text = render(1234, "everything broke", Some("src/lib.rs:10:5"), "stack here");
+        let text = render(
+            1234,
+            "everything broke",
+            Some("src/lib.rs:10:5"),
+            "stack here",
+        );
         assert!(text.contains("payload: everything broke"));
         assert!(text.contains("location: src/lib.rs:10:5"));
         assert!(text.contains("stack here"));
@@ -98,11 +103,16 @@ mod tests {
 
     #[test]
     fn write_to_creates_file_in_dir() {
-        let dir = std::env::temp_dir().join(format!("swagcod-crashlog-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("swagcod-crashlog-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = write_to(&dir, 42, "boom", Some("a.rs:1:1"), "frames").unwrap();
         assert!(path.exists());
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("crash-42-"));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("crash-42-"));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("payload: boom"));
         std::fs::remove_dir_all(&dir).unwrap();

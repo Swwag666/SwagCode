@@ -55,8 +55,9 @@ pub enum ApprovalPolicy {
 impl ApprovalPolicy {
     /// Имена тулзов, которые всегда требуют подтверждения при
     /// [`ApprovalPolicy::OnDangerous`].
-    pub const DANGEROUS: &'static [&'static str] =
-        &["bash", "pwsh", "shell", "write", "edit", "delete", "remove", "patch"];
+    pub const DANGEROUS: &'static [&'static str] = &[
+        "bash", "pwsh", "shell", "write", "edit", "delete", "remove", "patch",
+    ];
 
     /// Встроенные имена тулзов (B-5). Всё, что не здесь, — плагин:
     /// внешняя команда не должна исполняться молча, поэтому при
@@ -690,7 +691,9 @@ mod tests {
     #[test]
     fn semantic_search_is_builtin_and_safe() {
         assert!(!ApprovalPolicy::OnDangerous.requires_approval("semantic_search"));
-        assert!(builtin_tool_specs().iter().any(|s| s.name == "semantic_search"));
+        assert!(builtin_tool_specs()
+            .iter()
+            .any(|s| s.name == "semantic_search"));
         let spec = builtin_tool_specs()
             .into_iter()
             .find(|s| s.name == "semantic_search")
@@ -942,7 +945,12 @@ mod tests {
         let (mut m, step) = TurnMachine::new(TurnConfig::default(), vec![ChatMessage::user("hi")]);
         assert!(matches!(step, TurnStep::RequestModel { ref history } if history.len() == 1));
         let step = m.on_stream(acc_text("привет"));
-        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::Completed });
+        assert_eq!(
+            step,
+            TurnStep::Finish {
+                outcome: TurnOutcome::Completed
+            }
+        );
         let rep = m.report(TurnOutcome::Completed, 1);
         assert_eq!(rep.content, "привет");
         assert_eq!(rep.iterations, 1);
@@ -974,7 +982,12 @@ mod tests {
             other => panic!("ожидали RequestModel, получили {other:?}"),
         }
         let step = m.on_stream(acc_text("done"));
-        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::Completed });
+        assert_eq!(
+            step,
+            TurnStep::Finish {
+                outcome: TurnOutcome::Completed
+            }
+        );
         let rep = m.report(TurnOutcome::Completed, 2);
         assert_eq!(rep.iterations, 2);
         assert_eq!(rep.tool_calls, 1);
@@ -1041,7 +1054,12 @@ mod tests {
             ok: true,
             output: "x".into(),
         });
-        assert_eq!(step, TurnStep::Finish { outcome: TurnOutcome::IterationLimit });
+        assert_eq!(
+            step,
+            TurnStep::Finish {
+                outcome: TurnOutcome::IterationLimit
+            }
+        );
     }
 
     #[test]
@@ -1049,7 +1067,10 @@ mod tests {
         let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
         let _ = m.on_stream(acc_tool("c1", "read"));
         let big = "z".repeat(MAX_TOOL_OUTPUT_BYTES * 3);
-        let _ = m.on_tool_result(ToolOutcome { ok: true, output: big });
+        let _ = m.on_tool_result(ToolOutcome {
+            ok: true,
+            output: big,
+        });
         let tool_msg = m.history().iter().find(|m| m.role == Role::Tool).unwrap();
         assert!(
             tool_msg.content.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
@@ -1084,7 +1105,7 @@ mod tests {
     #[test]
     fn subagent_is_builtin_and_safe() {
         /* E-6: внутри ветки только read-only инструменты, поэтому сам
-           `subagent` не опасен и подтверждений не требует. */
+        `subagent` не опасен и подтверждений не требует. */
         assert!(!ApprovalPolicy::OnDangerous.requires_approval("subagent"));
         let spec = builtin_tool_specs()
             .into_iter()

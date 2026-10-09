@@ -21,7 +21,9 @@ pub mod stdio_rpc;
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
 use swagcod_core::session::{Session, SessionId, TurnRecord};
-use swagcod_core::tasks::{task_backoff_ms, Task, TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_QUEUED};
+use swagcod_core::tasks::{
+    task_backoff_ms, Task, TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_QUEUED,
+};
 use swagcod_core::turn::{
     builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
     ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
@@ -60,8 +62,12 @@ pub struct AppState {
     pub watches: Mutex<std::collections::HashMap<String, swagcod_fsx::WatchHandle>>,
     /// B-4: кэш индексов файлов с TTL — поиск не должен обходить репозиторий
     /// на каждое нажатие клавиши.
-    pub indexes:
-        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<swagcod_fsx::FileIndex>)>>,
+    pub indexes: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (std::time::Instant, std::sync::Arc<swagcod_fsx::FileIndex>),
+        >,
+    >,
     /// B-5: зарегистрированные внешние инструменты (плагины). Модель видит
     /// их в одном списке со встроенными; исполнение — через shell команду,
     /// аргументы JSON-ом в stdin. Не-встроенное имя при OnDangerous всегда
@@ -439,11 +445,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
 /// Санитизация имени файла фона: только безопасные символы, без путей.
 fn sanitize_bg_name(name: &str) -> Result<String, String> {
-    let file_name = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let file_name = name.rsplit(['/', '\\']).next().unwrap_or_default().trim();
     let clean: String = file_name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -523,7 +525,8 @@ async fn transcript_events(
     rehydrate_session(state, session);
 
     let mut user_texts: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut tool_outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_outputs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for m in &session.history {
         match m.role {
             Role::User => user_texts.push_back(m.content.clone()),
@@ -541,7 +544,7 @@ async fn transcript_events(
         let tid = turn.id.as_str().to_string();
         let ts = turn.started_ms;
         /* E-6: parent в turn_started — ветки суб-агентов видны и в истории,
-           а не только в живом стриме (wire-формат тот же, поле опционально). */
+        а не только в живом стриме (wire-формат тот же, поле опционально). */
         out.push(json!({
             "seq": 0, "ts_ms": ts,
             "kind": { "kind": "turn_started", "data": {
@@ -644,8 +647,8 @@ pub(crate) async fn list_sessions_core(state: &AppState) -> Vec<SessionBrief> {
         .map(|s| {
             let mut b = SessionBrief::from(s);
             /* D-121: «лёгкая» сессия имеет пустой журнал — цифры сайдбара
-               берутся из meta-снимка. У живой (регидратированной) сессии
-               журнал свежее снимка — тогда верим памяти. */
+            берутся из meta-снимка. У живой (регидратированной) сессии
+            журнал свежее снимка — тогда верим памяти. */
             if b.turns == 0 {
                 if let Some(m) = meta.as_ref().and_then(|m| m.get(&b.id)) {
                     b.turns = m.turns;
@@ -695,7 +698,7 @@ async fn create_session(
         m.insert(brief.id.clone(), meta_of(&session));
     }
     /* B-1: сессия сразу уходит в store — перезапуск не потеряет даже
-       сессию без единого хода. */
+    сессию без единого хода. */
     if let Ok(store) = state.store.lock() {
         if let Err(e) = store.create_session(&session) {
             eprintln!("store: сессия не записана: {e}");
@@ -731,7 +734,9 @@ fn db_path() -> Result<std::path::PathBuf, String> {
     let base = std::env::var("LOCALAPPDATA")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "не удалось определить локальный профиль".to_string())?;
-    Ok(std::path::PathBuf::from(base).join("SwagCod").join("swagcod.db"))
+    Ok(std::path::PathBuf::from(base)
+        .join("SwagCod")
+        .join("swagcod.db"))
 }
 
 /// B-1: удаление сессии из памяти и из store — закрытие давнего stub в UI.
@@ -741,9 +746,7 @@ async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> 
     {
         let sessions = state.sessions.lock().await;
         match sessions.iter().find(|s| s.id.to_string() == session_id) {
-            Some(s) if s.status.is_busy() => {
-                return Err("нельзя удалить сессию: идёт ход".into())
-            }
+            Some(s) if s.status.is_busy() => return Err("нельзя удалить сессию: идёт ход".into()),
             None => return Err(format!("сессия {session_id} не найдена")),
             Some(_) => {}
         }
@@ -780,9 +783,9 @@ fn set_pref(state: State<'_, Arc<AppState>>, key: String, value: String) -> Resu
 }
 
 /* B-2: терминал на настоящем PTY (plan B-2). Команды тонкие: spawn, write,
-   resize, kill. Вывод уходит не через них, а через шину событиями
-   pty_output с уже разобранными ANSI-операциями: разборка живёт в Rust,
-   WebView только рисует. */
+resize, kill. Вывод уходит не через них, а через шину событиями
+pty_output с уже разобранными ANSI-операциями: разборка живёт в Rust,
+WebView только рисует. */
 
 /// Поднять PTY в cwd сессии. Shell — по желанию, иначе COMSPEC/SHELL.
 #[tauri::command]
@@ -818,9 +821,15 @@ async fn pty_spawn(
         .spawn(move || {
             let mut parser = swagcod_pty::AnsiParser::new();
             let mut sink = swagcod_pty::VecSink::default();
-            let flush = |parser: &mut swagcod_pty::AnsiParser, sink: &mut swagcod_pty::VecSink, bus: &Bus, did: &str| {
-                let ops: Vec<serde_json::Value> =
-                    sink.0.iter().filter_map(|o| serde_json::to_value(o).ok()).collect();
+            let flush = |parser: &mut swagcod_pty::AnsiParser,
+                         sink: &mut swagcod_pty::VecSink,
+                         bus: &Bus,
+                         did: &str| {
+                let ops: Vec<serde_json::Value> = sink
+                    .0
+                    .iter()
+                    .filter_map(|o| serde_json::to_value(o).ok())
+                    .collect();
                 if !ops.is_empty() {
                     bus.publish(EventKind::PtyOutput {
                         pty: did.to_string(),
@@ -839,7 +848,10 @@ async fn pty_spawn(
                     swagcod_pty::PtyMsg::Exit(code) => {
                         parser.finish(&mut sink);
                         flush(&mut parser, &mut sink, &bus, &did);
-                        bus.publish(EventKind::PtyExit { pty: did.clone(), code });
+                        bus.publish(EventKind::PtyExit {
+                            pty: did.clone(),
+                            code,
+                        });
                         break;
                     }
                 }
@@ -859,12 +871,18 @@ fn pty_write(state: State<'_, Arc<AppState>>, pty_id: String, text: String) -> R
 }
 
 #[tauri::command]
-fn pty_resize(state: State<'_, Arc<AppState>>, pty_id: String, cols: u16, rows: u16) -> Result<(), String> {
+fn pty_resize(
+    state: State<'_, Arc<AppState>>,
+    pty_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
     let h = state
         .ptys
         .get(&pty_id)
         .ok_or_else(|| format!("pty {pty_id} не найден"))?;
-    h.resize(cols.max(8), rows.max(4)).map_err(|e| e.to_string())
+    h.resize(cols.max(8), rows.max(4))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -892,7 +910,10 @@ fn render_attachments(paths: &[String]) -> String {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") {
+        if matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+        ) {
             out.push_str(&format!(
                 "\n\n---\nВложение {name}: не прикреплено — картинки пока не поддерживаются (текстовый провайдер)."
             ));
@@ -907,7 +928,9 @@ fn render_attachments(paths: &[String]) -> String {
             }
             Ok(_) => match std::fs::read_to_string(p) {
                 Ok(text) => {
-                    out.push_str(&format!("\n\n---\nВложение: {name} ({p})\n```\n{text}\n```"));
+                    out.push_str(&format!(
+                        "\n\n---\nВложение: {name} ({p})\n```\n{text}\n```"
+                    ));
                 }
                 Err(_) => {
                     out.push_str(&format!(
@@ -950,7 +973,7 @@ async fn start_turn(
 }
 
 /* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
-   loopback REST API. Поведение идентично: та же машина хода, та же шина. */
+loopback REST API. Поведение идентично: та же машина хода, та же шина. */
 pub(crate) async fn start_turn_core(
     state: Arc<AppState>,
     session_id: String,
@@ -960,7 +983,7 @@ pub(crate) async fn start_turn_core(
     attachments: Option<Vec<String>>,
 ) -> Result<String, String> {
     /* Скрепка: вложения подшиваются к тексту одним сообщением — история
-       и контекст видят их как часть реплики пользователя. */
+    и контекст видят их как часть реплики пользователя. */
     let mut message = message.trim().to_string();
     if let Some(paths) = attachments.as_ref().filter(|a| !a.is_empty()) {
         message.push_str(&render_attachments(paths));
@@ -972,8 +995,7 @@ pub(crate) async fn start_turn_core(
 
     // C1-фикс: создаём провайдер ДО мутации статуса сессии.
     // Активный провайдер из настроек (default = .env/DPAPI как раньше).
-    let provider = providers::build_chat_provider(&state)
-        .map_err(|e| format!("провайдер: {e}"))?;
+    let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
 
     let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
@@ -987,7 +1009,7 @@ pub(crate) async fn start_turn_core(
         }
 
         /* D-121: второй потребитель полной сессии — ход. История грузится
-           из базы лениво: в покое RAM не держит чужие транскрипты. */
+        из базы лениво: в покое RAM не держит чужие транскрипты. */
         rehydrate_session(&state, session);
 
         let ok = session.push_user_message(&message);
@@ -1018,11 +1040,7 @@ pub(crate) async fn start_turn_core(
     let effective_model = model.unwrap_or(session_model);
     // Тулзы уходят в каждом запросе: без определений модель не может их вызвать.
     // B-5: встроенные плюс зарегистрированные плагины — модель видит один список.
-    let plugins: Vec<PluginTool> = state
-        .plugins
-        .lock()
-        .map(|p| p.clone())
-        .unwrap_or_default();
+    let plugins: Vec<PluginTool> = state.plugins.lock().map(|p| p.clone()).unwrap_or_default();
     let mut specs = builtin_tool_specs();
     specs.extend(plugins.iter().map(|p| ToolSpec {
         name: p.name.clone(),
@@ -1030,7 +1048,7 @@ pub(crate) async fn start_turn_core(
         parameters: p.parameters.clone(),
     }));
     /* E-3: инструменты MCP-серверов видны модели одним списком с
-       встроенными и плагинами B-5. */
+    встроенными и плагинами B-5. */
     {
         let reg = state.mcp.lock().await;
         specs.extend(reg.tools.iter().map(|t| ToolSpec {
@@ -1047,8 +1065,9 @@ pub(crate) async fn start_turn_core(
             parameters: t.parameters.clone(),
         }));
     }
-    let tool_wire: Vec<serde_json::Value> =
-        ChatRequest::new(&effective_model, Vec::new()).with_tools(&specs).tools;
+    let tool_wire: Vec<serde_json::Value> = ChatRequest::new(&effective_model, Vec::new())
+        .with_tools(&specs)
+        .tools;
     let temperature = temperature.map(|t| t as f32);
 
     let bus = state.bus.clone();
@@ -1063,19 +1082,19 @@ pub(crate) async fn start_turn_core(
         let cwd = std::path::PathBuf::from(&cwd);
         let tool_timeout = cfg.tool_timeout;
         /* TurnStarted обязан уходить в шину ПЕРВЫМ: фронт строит по нему
-           карту turn→session, и без неё стрим либо терялся, либо (раньше)
-           сваливался в активный чат — отсюда росли «слияния» чатов. */
+        карту turn→session, и без неё стрим либо терялся, либо (раньше)
+        сваливался в активный чат — отсюда росли «слияния» чатов. */
         bus.publish(EventKind::TurnStarted {
             turn: tid.clone(),
             session: swagcod_core::SessionId::new(&sid),
             parent: None,
         });
         /* E-2: в начале каждого хода фоном освежаем семантический индекс.
-           Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
-           репозитория и не толкаются в одной базе. */
+        Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
+        репозитория и не толкаются в одной базе. */
         spawn_semantic_index(app_state.clone(), cwd.clone(), false);
         /* B-8: watchdog получает запись о живом ходе. Время — now_ms из
-           шины: диагностика и журнал живут на одних часах. */
+        шины: диагностика и журнал живут на одних часах. */
         if let Ok(mut activity) = app_state.turn_activity.lock() {
             let now = swagcod_core::bus::now_ms();
             activity.insert(
@@ -1091,8 +1110,8 @@ pub(crate) async fn start_turn_core(
         }
 
         /* B-3: контекст — калиброванный счёт, компакция сайд-запросом и
-           память проекта. Всё до старта машины: машина получает уже
-           подготовленную историю. */
+        память проекта. Всё до старта машины: машина получает уже
+        подготовленную историю. */
         use swagcod_core::context;
         let calib = app_state
             .store
@@ -1119,8 +1138,7 @@ pub(crate) async fn start_turn_core(
                     .filter(|m| !m.trim().is_empty())
                     .unwrap_or_else(|| effective_model.clone());
                 let prompt = context::summarizer_prompt(&summary, &old);
-                let sum_req =
-                    ChatRequest::new(&sum_model, vec![ChatMessage::user(prompt)]);
+                let sum_req = ChatRequest::new(&sum_model, vec![ChatMessage::user(prompt)]);
                 match provider.stream(sum_req) {
                     Ok((mut srx, shandle)) => {
                         let mut text = String::new();
@@ -1138,7 +1156,9 @@ pub(crate) async fn start_turn_core(
                             history = recent;
                             {
                                 let mut sessions = app_state.sessions.lock().await;
-                                if let Some(s) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
+                                if let Some(s) =
+                                    sessions.iter_mut().find(|s| s.id.to_string() == sid)
+                                {
                                     s.summary = summary.clone();
                                     s.history = history.clone();
                                     // D-121: после сжатия контекст стал легче —
@@ -1172,8 +1192,8 @@ pub(crate) async fn start_turn_core(
             }
         }
         // Память проекта инжектится в system-промпт каждого запроса хода.
-        let memory_md = std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md"))
-            .unwrap_or_default();
+        let memory_md =
+            std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md")).unwrap_or_default();
         let system_msg = context::system_prompt(&summary, &memory_md);
 
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
@@ -1229,8 +1249,8 @@ pub(crate) async fn start_turn_core(
                         // должна выглядеть для watchdog как зависание.
                         touch_turn(&app_state, &turn, None);
                         /* E-8: латентность провайдера — время до первого
-                           события стрима. Одна точка на запрос, fire-and-
-                           forget: телеметрия не должна ломать ход. */
+                        события стрима. Одна точка на запрос, fire-and-
+                        forget: телеметрия не должна ломать ход. */
                         if !latency_recorded {
                             latency_recorded = true;
                             let ms = stream_started.elapsed().as_secs_f64() * 1000.0;
@@ -1280,7 +1300,10 @@ pub(crate) async fn start_turn_core(
                             }
                             StreamEvent::Done { .. } => {}
                             StreamEvent::Error(msg) => stream_error = Some(msg.clone()),
-                            StreamEvent::Usage { input_tokens, output_tokens } => {
+                            StreamEvent::Usage {
+                                input_tokens,
+                                output_tokens,
+                            } => {
                                 last_usage = Some((*input_tokens, *output_tokens));
                             }
                         }
@@ -1325,7 +1348,7 @@ pub(crate) async fn start_turn_core(
                     let actor = if res.is_ok() { "user" } else { "system" };
                     let decision = res.unwrap_or(ApprovalDecision::Denied);
                     /* B-7: журнал подтверждений — кто, что, когда. actor=system
-                       означает решение без человека (канал потерян). */
+                    означает решение без человека (канал потерян). */
                     if let Ok(store) = app_state.store.lock() {
                         let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
                             session_id: sid.clone(),
@@ -1348,10 +1371,10 @@ pub(crate) async fn start_turn_core(
                 TurnStep::ExecuteTool { call } => {
                     let started = std::time::Instant::now();
                     /* E-2: semantic_search исполняется здесь, а не в
-                       execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
-                       и сеть, а execute_tool остаётся чистой и тестируемой.
-                       E-3: то же для mcp:* — вызов идёт в живой
-                       stdio-процесс сервера из реестра AppState. */
+                    execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
+                    и сеть, а execute_tool остаётся чистой и тестируемой.
+                    E-3: то же для mcp:* — вызов идёт в живой
+                    stdio-процесс сервера из реестра AppState. */
                     let tool_outcome = if call.name == "semantic_search" {
                         run_semantic_search(&app_state, &call, &cwd).await
                     } else if call.name.starts_with(mcp::MCP_PREFIX) {
@@ -1360,8 +1383,8 @@ pub(crate) async fn start_turn_core(
                         run_js_call(&app_state, &call).await
                     } else if call.name == "subagent" {
                         /* E-6: ветка суб-агента — собственный стрим и история;
-                           снимок истории сессии нужен её save_turn (messages
-                           заменяются целиком). */
+                        снимок истории сессии нужен её save_turn (messages
+                        заменяются целиком). */
                         run_subagent(
                             &app_state,
                             &provider,
@@ -1424,8 +1447,8 @@ pub(crate) async fn start_turn_core(
             .flat_map(|m| m.tool_calls.clone())
             .collect();
         /* B-3: счёт токенов — точный usage от провайдера, когда он его
-           отдаёт, иначе калиброванная оценка. Честный ноль в журнале больше
-           не живёт. */
+        отдаёт, иначе калиброванная оценка. Честный ноль в журнале больше
+        не живёт. */
         let (est_in, est_out) = match last_usage {
             Some((i, o)) => (i, o),
             None => (
@@ -1449,7 +1472,7 @@ pub(crate) async fn start_turn_core(
                 };
                 session.current_turn = None;
                 /* B-1: ход и снимок истории уходят в store одной транзакцией
-                   прямо здесь, в конце хода. */
+                прямо здесь, в конце хода. */
                 if let Ok(store) = app_state.store.lock() {
                     if let Err(e) = store.save_turn(&sid, &record, &session.history) {
                         eprintln!("store: ход не записан: {e}");
@@ -1660,7 +1683,10 @@ async fn search_files(
                     .map_err(|e| e.to_string())?,
             );
             if let Ok(mut m) = state.indexes.lock() {
-                m.insert(session_id.clone(), (std::time::Instant::now(), built.clone()));
+                m.insert(
+                    session_id.clone(),
+                    (std::time::Instant::now(), built.clone()),
+                );
             }
             built
         }
@@ -1724,8 +1750,8 @@ async fn diff_against_head(
 }
 
 /* B-5: слой плагинов. Регистрация внешнего инструмента: spec для модели
-   плюс команда для исполнения. Имя не должно пересекаться со встроенными:
-   иначе плагин смог бы затенить read/write и обойти их семантику. */
+плюс команда для исполнения. Имя не должно пересекаться со встроенными:
+иначе плагин смог бы затенить read/write и обойти их семантику. */
 
 #[tauri::command]
 fn register_plugin_tool(
@@ -1817,7 +1843,9 @@ fn semantic_path() -> Result<std::path::PathBuf, String> {
     let base = std::env::var("LOCALAPPDATA")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "не удалось определить локальный профиль".to_string())?;
-    Ok(std::path::PathBuf::from(base).join("SwagCod").join("embeddings.db"))
+    Ok(std::path::PathBuf::from(base)
+        .join("SwagCod")
+        .join("embeddings.db"))
 }
 
 /// Лениво открыть индекс и применить синхронную операцию.
@@ -1826,7 +1854,10 @@ fn with_semantic<R>(
     state: &AppState,
     f: impl FnOnce(&swagcod_core::semantic::SemanticIndex) -> R,
 ) -> Result<R, String> {
-    let mut guard = state.semantic.lock().map_err(|e| format!("semantic: {e}"))?;
+    let mut guard = state
+        .semantic
+        .lock()
+        .map_err(|e| format!("semantic: {e}"))?;
     if guard.is_none() {
         let path = semantic_path()?;
         *guard = Some(
@@ -2166,7 +2197,10 @@ async fn run_semantic_search(
             out.push_str("```\n");
         }
     }
-    ToolOutcome { ok: true, output: out }
+    ToolOutcome {
+        ok: true,
+        output: out,
+    }
 }
 
 /* ── E-6: суб-агент — изолированная ветка дерева ходов ─────────────────────
@@ -2181,7 +2215,14 @@ async fn run_semantic_search(
 /// Инструменты внутри суб-агента: только read-only. write/bash/patch не
 /// входят, поэтому ветка физически не способна на опасные операции —
 /// подтверждений из суб-агента не бывает ни при какой политике.
-pub const SUBAGENT_SAFE_TOOLS: &[&str] = &["read", "list", "grep", "glob", "fetch_url", "semantic_search"];
+pub const SUBAGENT_SAFE_TOOLS: &[&str] = &[
+    "read",
+    "list",
+    "grep",
+    "glob",
+    "fetch_url",
+    "semantic_search",
+];
 
 /// Предел раундов (запросов модели) ветки по умолчанию.
 pub const SUBAGENT_MAX_ROUNDS: u32 = 6;
@@ -2278,7 +2319,7 @@ async fn run_subagent(
     let bus = state.bus.clone();
 
     /* TurnStarted ветки уходит в шину первым — фронт строит карту
-       turn→session и для дочерних ходов, иначе стрим ветки потерялся бы. */
+    turn→session и для дочерних ходов, иначе стрим ветки потерялся бы. */
     bus.publish(EventKind::TurnStarted {
         turn: child_tid.clone(),
         session: swagcod_core::SessionId::new(sid),
@@ -2310,8 +2351,9 @@ async fn run_subagent(
         .into_iter()
         .filter(|s| SUBAGENT_SAFE_TOOLS.contains(&s.name.as_str()))
         .collect();
-    let tool_wire: Vec<serde_json::Value> =
-        ChatRequest::new(&model, Vec::new()).with_tools(&specs).tools;
+    let tool_wire: Vec<serde_json::Value> = ChatRequest::new(&model, Vec::new())
+        .with_tools(&specs)
+        .tools;
     let cpt = swagcod_core::context::chars_per_token(&model, None);
 
     let mut est_in: u64 = 0;
@@ -2400,7 +2442,7 @@ async fn run_subagent(
         for tc in &acc.tool_calls {
             all_tools.push(tc.clone());
             /* Защита в глубину: даже если модель «выдумала» опасный инструмент,
-               ветка его не исполнит — честный отказ вместо исполнения. */
+            ветка его не исполнит — честный отказ вместо исполнения. */
             let out = if tc.name == "semantic_search" {
                 run_semantic_search(state, tc, cwd).await
             } else if SUBAGENT_SAFE_TOOLS.contains(&tc.name.as_str()) {
@@ -2462,7 +2504,7 @@ async fn run_subagent(
         parent_turn_id: Some(parent_turn),
     };
     /* Дочерний ход — в стор и в живую сессию: ветка видна в траектории
-       сразу, не дожидаясь конца родительского хода. */
+    сразу, не дожидаясь конца родительского хода. */
     if let Ok(store) = state.store.lock() {
         let _ = store.save_turn(sid, &child, session_history);
     }
@@ -2522,7 +2564,10 @@ async fn execute_tool(
                 return fail("файл больше 1 МБ, читайте частями".into());
             }
             match std::fs::read_to_string(&path) {
-                Ok(s) => ToolOutcome { ok: true, output: s },
+                Ok(s) => ToolOutcome {
+                    ok: true,
+                    output: s,
+                },
                 Err(e) => fail(format!("read: {e}")),
             }
         }
@@ -2570,8 +2615,8 @@ async fn execute_tool(
             }
         }
         /* B-3: память проекта. Заметка дописывается в .swagcod/MEMORY.md
-           внутри cwd сессии — песочница та же, подтверждение не требуется:
-           это блокнот агента, а не изменение кода пользователя. */
+        внутри cwd сессии — песочница та же, подтверждение не требуется:
+        это блокнот агента, а не изменение кода пользователя. */
         "memory_append" => {
             let text = arg_str(call, "text");
             if text.trim().is_empty() {
@@ -2584,7 +2629,11 @@ async fn execute_tool(
             let path = dir.join("MEMORY.md");
             use std::io::Write as _;
             let entry = format!("\n## {}\n{}\n", swagcod_core::bus::now_ms(), text.trim());
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 Ok(mut f) => match f.write_all(entry.as_bytes()) {
                     Ok(()) => ToolOutcome {
                         ok: true,
@@ -2639,7 +2688,7 @@ async fn execute_tool(
             }
         }
         /* B-5: grep/glob/patch/fetch_url. Чистая логика живёт в fsx::tools,
-           здесь только песочница cwd и оформление результата. */
+        здесь только песочница cwd и оформление результата. */
         "grep" => {
             let pattern = arg_str(call, "pattern");
             if pattern.is_empty() {
@@ -2653,7 +2702,11 @@ async fn execute_tool(
                 .unwrap_or(2) as usize;
             match swagcod_fsx::tools::grep_files(
                 cwd,
-                if sub.is_empty() { None } else { Some(sub.as_str()) },
+                if sub.is_empty() {
+                    None
+                } else {
+                    Some(sub.as_str())
+                },
                 &pattern,
                 context,
             ) {
@@ -2676,7 +2729,11 @@ async fn execute_tool(
             let sub = arg_str(call, "path");
             match swagcod_fsx::tools::glob_files(
                 cwd,
-                if sub.is_empty() { None } else { Some(sub.as_str()) },
+                if sub.is_empty() {
+                    None
+                } else {
+                    Some(sub.as_str())
+                },
                 &pattern,
             ) {
                 Ok(files) if files.is_empty() => ToolOutcome {
@@ -2724,14 +2781,17 @@ async fn execute_tool(
             }
             let fetch_timeout = timeout.min(std::time::Duration::from_secs(30));
             match swagcod_fsx::tools::fetch_url(&url, fetch_timeout).await {
-                Ok(text) => ToolOutcome { ok: true, output: text },
+                Ok(text) => ToolOutcome {
+                    ok: true,
+                    output: text,
+                },
                 Err(e) => fail(format!("fetch_url: {e}")),
             }
         }
         other => {
             /* B-5: слой плагинов. Не-встроенное имя ищется в реестре;
-               подтверждение уже пройдено (политика считает неизвестные
-               имена опасными), здесь только исполнение. */
+            подтверждение уже пройдено (политика считает неизвестные
+            имена опасными), здесь только исполнение. */
             match plugins.iter().find(|p| p.name == other) {
                 None => fail(format!("неизвестный инструмент: {other}")),
                 Some(plugin) => run_plugin(plugin, call, cwd, timeout).await,
@@ -2751,7 +2811,11 @@ async fn run_plugin(
     use tokio::io::AsyncWriteExt;
     let fail = |output: String| ToolOutcome { ok: false, output };
     let args = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
     let mut child = match silent_cmd(shell)
         .arg(flag)
         .arg(&plugin.command)
@@ -2836,7 +2900,11 @@ pub(crate) async fn respond_approval_core(
 /// Ключ провайдера из DPAPI-blob в store. Env имеет приоритет: если
 /// SWAGCOD_API_KEY задан, blob даже не расшифровывается.
 fn dpapi_key(state: &AppState) -> Option<String> {
-    if !std::env::var("SWAGCOD_API_KEY").unwrap_or_default().trim().is_empty() {
+    if !std::env::var("SWAGCOD_API_KEY")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         return None;
     }
     let blob = state
@@ -2909,14 +2977,18 @@ fn save_protected_key(state: State<'_, Arc<AppState>>, key: String) -> Result<()
     }
     let blob = dpapi::protect_hex(key.trim())?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.set_pref("api_key_dpapi", &blob).map_err(|e| e.to_string())
+    store
+        .set_pref("api_key_dpapi", &blob)
+        .map_err(|e| e.to_string())
 }
 
 /// Забыть DPAPI-ключ (env-ключ продолжает работать).
 #[tauri::command]
 fn clear_protected_key(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.set_pref("api_key_dpapi", "").map_err(|e| e.to_string())
+    store
+        .set_pref("api_key_dpapi", "")
+        .map_err(|e| e.to_string())
 }
 
 /* ── B-8: стабильность под наблюдением ──────────────────────────────────────
@@ -3131,12 +3203,140 @@ async fn read_file(
 /// Список моделей АКТИВНОГО провайдера (вкладка провайдеров).
 #[tauri::command]
 async fn list_models(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let provider = providers::build_chat_provider(&state)
-        .map_err(|e| format!("провайдер: {e}"))?;
+    let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
     provider
         .list_models()
         .await
         .map_err(|e| format!("модели: {e}"))
+}
+
+/* ── Обновления (rev37): GitHub Releases + tauri-plugin-updater. ────────
+
+Схема та же, что в DSH Phone: манифест latest.json на
+releases/latest/download, артефакты подписаны minisign (приватный
+ключ вне репозитория — профиль пользователя ~/.swagcod-updater и
+секреты CI). update_check не валит команду при сетевой ошибке —
+ошибка приходит полем, UI показывает её честно. Перед установкой
+гасим свои node-процессы (sidecar хранилища, хост плагинов, MCP):
+работающий node.exe заблокирован на запись, и NSIS не смог бы его
+перезаписать — урок dsh-phone (os error 5). */
+
+/// Результат проверки обновлений. `current` заполнен всегда — UI
+/// показывает «у вас x.y.z», даже когда проверка ничего не нашла.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    /// Версия из релиза (если обновление есть).
+    pub version: Option<String>,
+    /// Текущая версия приложения.
+    pub current: String,
+    pub notes: Option<String>,
+    /// Причина, по которой проверить не удалось. Ошибка сети — не повод
+    /// валить команду: UI показывает её текстом вместо тихого «обновлений нет».
+    pub error: Option<String>,
+}
+
+/// Проверить GitHub Releases на новую версию (манифест latest.json).
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let current = app.package_info().version.to_string();
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("updater не собрался: {e}"))?;
+    match updater.check().await {
+        Ok(Some(u)) => Ok(UpdateInfo {
+            available: true,
+            version: Some(u.version.clone()),
+            current,
+            notes: u.body.clone(),
+            error: None,
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            current,
+            notes: None,
+            error: None,
+        }),
+        Err(e) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            current,
+            notes: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+/// Скачать и поставить обновление, шля прогресс событием `update-progress`.
+/// Живые ходы — честный отказ: рвать траекторию посреди стрима нельзя.
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let state = app.state::<Arc<AppState>>();
+
+    if !state.turns.lock().await.is_empty() {
+        return Err("обновление: есть активные ходы — дождитесь завершения и повторите".into());
+    }
+
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("updater не собрался: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("проверка обновлений: {e}"))?
+        .ok_or_else(|| "нет доступного обновления".to_string())?;
+    let version = update.version.clone();
+
+    // Гасим node-процессы до установки: MCP-соединения, хост плагинов,
+    // sidecar хранилища. Их exe заблокированы на запись для NSIS.
+    state.mcp.lock().await.shutdown().await;
+    if let Some(host) = state.js_host.lock().ok().and_then(|g| g.clone()) {
+        host.kill().await;
+    }
+    if let Ok(mut store) = state.store.lock() {
+        store.shutdown();
+    }
+
+    let h = app.clone();
+    let mut downloaded: u64 = 0;
+    let mut total: Option<u64> = None;
+    update
+        .download_and_install(
+            move |chunk, len| {
+                downloaded += chunk as u64;
+                if let Some(t) = len {
+                    total = Some(t);
+                }
+                let percent = total
+                    .filter(|t| *t > 0)
+                    .map(|t| ((downloaded * 100) / t).min(100));
+                let _ = h.emit(
+                    "update-progress",
+                    serde_json::json!({
+                        "downloaded": downloaded,
+                        "total": total,
+                        "percent": percent,
+                    }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("установка обновления: {e}"))?;
+
+    Ok(version)
+}
+
+/// Перезапуск после установки. request_restart, а не restart: первый идёт
+/// через RunEvent::Exit и потому срабатывает надёжно из любого потока.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.request_restart();
 }
 
 /// Открыть файл в проводнике (безопасно: путь отдельным аргументом).
@@ -3224,7 +3424,9 @@ fn run_dsh_import(state: &Arc<AppState>, auto: bool) -> dsh_import::ImportReport
             report.plugin_notes = cfg.plugin_notes;
         }
         Err(e) => {
-            report.errors.push(format!("store: не открыл базу для импорта: {e}"));
+            report
+                .errors
+                .push(format!("store: не открыл базу для импорта: {e}"));
             return report;
         }
     }
@@ -3238,7 +3440,7 @@ fn run_dsh_import(state: &Arc<AppState>, auto: bool) -> dsh_import::ImportReport
         if let Ok(store) = state.store.lock() {
             if let Ok(loaded) = store.load_all() {
                 /* D-121: импортированная история не остаётся в RAM — список
-                   переустанавливается «лёгким», цифры уходят в meta. */
+                переустанавливается «лёгким», цифры уходят в meta. */
                 let (light, meta) = light_sessions(loaded);
                 if let Ok(mut m) = state.session_meta.lock() {
                     *m = meta;
@@ -3402,8 +3604,10 @@ async fn mcp_add(
 /// E-3: убрать сервер из реестра и убить его процесс.
 #[tauri::command]
 async fn mcp_remove(state: State<'_, Arc<AppState>>, name: String) -> Result<(), String> {
-    let cfgs: Vec<mcp::McpServerConfig> =
-        mcp_configs(&state).into_iter().filter(|c| c.name != name).collect();
+    let cfgs: Vec<mcp::McpServerConfig> = mcp_configs(&state)
+        .into_iter()
+        .filter(|c| c.name != name)
+        .collect();
     save_mcp_configs(&state, &cfgs)?;
     state.mcp.lock().await.disconnect(&name).await;
     Ok(())
@@ -3454,11 +3658,7 @@ async fn run_js_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
     if short.is_empty() || short.contains(':') {
         return fail(format!("js: неверное имя инструмента: {}", call.name));
     }
-    let host = state
-        .js_host
-        .lock()
-        .ok()
-        .and_then(|h| h.clone());
+    let host = state.js_host.lock().ok().and_then(|h| h.clone());
     let Some(host) = host else {
         return fail("js: sidecar плагинов не запущен (перезагрузите в настройках Plugins)".into());
     };
@@ -3495,7 +3695,11 @@ async fn js_plugins_list(state: State<'_, Arc<AppState>>) -> Result<serde_json::
                 .collect()
         })
         .unwrap_or_default();
-    let errors = state.js_errors.lock().map(|e| e.clone()).unwrap_or_default();
+    let errors = state
+        .js_errors
+        .lock()
+        .map(|e| e.clone())
+        .unwrap_or_default();
     let dir = host
         .as_ref()
         .map(|h| h.dir.clone())
@@ -3578,7 +3782,12 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                     (TASK_FAILED, e, task.attempts, 0)
                 } else {
                     let delay = task_backoff_ms(task.attempts);
-                    (TASK_QUEUED, e, task.attempts, swagcod_core::bus::now_ms() + delay)
+                    (
+                        TASK_QUEUED,
+                        e,
+                        task.attempts,
+                        swagcod_core::bus::now_ms() + delay,
+                    )
                 }
             }
         };
@@ -3596,8 +3805,8 @@ async fn run_due_tasks(state: &Arc<AppState>) {
 }
 
 /* E-8: сэмплер телеметрии — точка раз в минуту, хранение 30 дней.
-   Стоимость прохода: несколько атомарных чтений и по одному INSERT на
-   метрику; prune — индексированный DELETE, обычно по нулю строк. */
+Стоимость прохода: несколько атомарных чтений и по одному INSERT на
+метрику; prune — индексированный DELETE, обычно по нулю строк. */
 pub const METRICS_SAMPLE_MS: u64 = 60_000;
 pub const METRICS_RETENTION_MS: u64 = 30 * 24 * 3_600_000;
 
@@ -3606,11 +3815,15 @@ pub fn sample_metrics(state: &AppState) -> Vec<(&'static str, f64)> {
     let mut rows: Vec<(&'static str, f64)> = vec![
         (
             "lagging_events",
-            state.lagging_events.load(std::sync::atomic::Ordering::Relaxed) as f64,
+            state
+                .lagging_events
+                .load(std::sync::atomic::Ordering::Relaxed) as f64,
         ),
         (
             "lagging_dropped",
-            state.lagging_dropped.load(std::sync::atomic::Ordering::Relaxed) as f64,
+            state
+                .lagging_dropped
+                .load(std::sync::atomic::Ordering::Relaxed) as f64,
         ),
         ("bus_seq", state.bus.seq() as f64),
         ("bus_subscribers", state.bus.subscriber_count() as f64),
@@ -3682,7 +3895,11 @@ async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, 
             }
         }
         "git_fetch" => {
-            let cwd = task.payload.get("cwd").and_then(|v| v.as_str()).unwrap_or_default();
+            let cwd = task
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if cwd.trim().is_empty() {
                 return Err("git_fetch: в payload нет cwd".into());
             }
@@ -3710,7 +3927,11 @@ async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, 
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let path = task.payload.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            let path = task
+                .payload
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if sid.is_empty() || path.trim().is_empty() {
                 return Err("journal_export: в payload нужны session_id и path".into());
             }
@@ -3721,7 +3942,12 @@ async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, 
                 return Err("journal_export: разрешены только .jsonl/.json/.txt".into());
             }
             let events = transcript_events(state, sid).await?;
-            let body: String = events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+            let body: String = events
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
             tokio::fs::write(path, body)
                 .await
                 .map_err(|e| format!("journal_export: {e}"))?;
@@ -3782,7 +4008,7 @@ async fn task_add(
 
 pub fn run() {
     /* B-8: panic-hook ставится ДО всего остального, чтобы поймать даже
-       панику инициализации. Лог — на диске, телеметрии нет. */
+    панику инициализации. Лог — на диске, телеметрии нет. */
     crashlog::install_hook();
     let _ = start_ms();
 
@@ -3792,6 +4018,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
@@ -3802,7 +4030,7 @@ pub fn run() {
         .setup(|app| {
             let mut state = AppState::default();
             /* B-1: файловая база в локальном профиле и сидирование сессий
-               из неё — история переживает перезапуск приложения. */
+            из неё — история переживает перезапуск приложения. */
             match db_path() {
                 Ok(path) => match swagcod_core::store::open(&path) {
                     Ok(store) => state.store = std::sync::Mutex::new(store),
@@ -3815,9 +4043,9 @@ pub fn run() {
                 match store.load_all() {
                     Ok(loaded) => {
                         /* D-121: бюджет памяти — в RAM живёт «лёгкий» список
-                           (история и журнал остаются в базе), цифры сайдбара
-                           уезжают в session_meta. Старт с 69 импортированными
-                           сессиями без этого стоил 68 МБ приватной памяти. */
+                        (история и журнал остаются в базе), цифры сайдбара
+                        уезжают в session_meta. Старт с 69 импортированными
+                        сессиями без этого стоил 68 МБ приватной памяти. */
                         let (light, meta) = light_sessions(loaded);
                         if let Ok(mut m) = state.session_meta.lock() {
                             *m = meta;
@@ -3829,24 +4057,20 @@ pub fn run() {
                 }
             }
             /* E-9: автоимпорт DSH при старте ВЫРЕЗАН намеренно: сотни файлов
-               и сотни МБ zstd держали Mutex базы весь прогон, весь IPC
-               голодал и окно висело «не отвечает». Ручной триггер —
-               команда import_dsh_sessions (кнопка в настройках). */
+            и сотни МБ zstd держали Mutex базы весь прогон, весь IPC
+            голодал и окно висело «не отвечает». Ручной триггер —
+            команда import_dsh_sessions (кнопка в настройках). */
             {
                 // Флаг-пустышка, чтобы UI не предлагал автоимпорт заново.
                 if let Ok(store) = state.store.lock() {
-                    let has = store
-                        .get_pref("dsh_import_done")
-                        .ok()
-                        .flatten()
-                        .is_some();
+                    let has = store.get_pref("dsh_import_done").ok().flatten().is_some();
                     if !has {
                         let _ = store.set_pref("dsh_import_done", "manual");
                     }
                 }
             }
             /* E-3: MCP-серверы из prefs поднимаются фоном — старт не ждёт
-               рукопожатий внешних процессов. Статусы видны в настройках. */
+            рукопожатий внешних процессов. Статусы видны в настройках. */
             {
                 let st = state.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3857,7 +4081,7 @@ pub fn run() {
                 });
             }
             /* E-4: sidecar JS-плагинов тоже стартует фоном — бюджет старта
-               не ждёт node-процесс и чтение каталога. */
+            не ждёт node-процесс и чтение каталога. */
             {
                 let st = state.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3865,10 +4089,10 @@ pub fn run() {
                 });
             }
             /* E-5: tasks — восстановить сирот после краша (running →
-               queued), вычистить старые done, сидировать периодическую
-               переиндексацию (первый старт через сутки: стартовую
-               индексацию уже делает триггер E-2). Сид идемпотентен:
-               INSERT OR IGNORE, отменённая задача не воскрешается. */
+            queued), вычистить старые done, сидировать периодическую
+            переиндексацию (первый старт через сутки: стартовую
+            индексацию уже делает триггер E-2). Сид идемпотентен:
+            INSERT OR IGNORE, отменённая задача не воскрешается. */
             {
                 if let Ok(g) = state.store.lock() {
                     let _ = g.tasks_recover_running();
@@ -3889,14 +4113,14 @@ pub fn run() {
                 tauri::async_runtime::spawn(tasks_worker(st));
             }
             /* E-8: сэмплер телеметрии — точка раз в минуту с первого тика
-               (interval стартует сразу), хранение 30 дней. */
+            (interval стартует сразу), хранение 30 дней. */
             {
                 let st = state.clone();
                 tauri::async_runtime::spawn(metrics_worker(st));
             }
             /* E-7: loopback REST API стартует, только если порт явно задан
-               (env SWAGCOD_HTTP_PORT или prefs http_api_port). По
-               умолчанию API выключен — поверхности нет. */
+            (env SWAGCOD_HTTP_PORT или prefs http_api_port). По
+            умолчанию API выключен — поверхности нет. */
             if let Some(port) = httpapi::configured_port(&state) {
                 let st = state.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3976,7 +4200,10 @@ pub fn run() {
             providers::save_provider,
             providers::delete_provider,
             providers::set_active_provider,
-            open_in_explorer
+            open_in_explorer,
+            update_check,
+            update_install,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить SwagCod");
@@ -3991,21 +4218,68 @@ mod tests {
         use serde_json::json;
         let parent = "pro-model";
         // Явная модель ветки — едет она.
-        let args = json!({"prompt": "x", "model": "cheap-flash"}).as_object().cloned().unwrap();
+        let args = json!({"prompt": "x", "model": "cheap-flash"})
+            .as_object()
+            .cloned()
+            .unwrap();
         assert_eq!(subagent_model(&args, parent), "cheap-flash");
         // Пробелы по краям режутся.
-        let args = json!({"prompt": "x", "model": "  cheap-flash  "}).as_object().cloned().unwrap();
+        let args = json!({"prompt": "x", "model": "  cheap-flash  "})
+            .as_object()
+            .cloned()
+            .unwrap();
         assert_eq!(subagent_model(&args, parent), "cheap-flash");
         // Нет/пусто/пробелы — модель родителя.
         let args = json!({"prompt": "x"}).as_object().cloned().unwrap();
         assert_eq!(subagent_model(&args, parent), parent);
-        let args = json!({"prompt": "x", "model": ""}).as_object().cloned().unwrap();
+        let args = json!({"prompt": "x", "model": ""})
+            .as_object()
+            .cloned()
+            .unwrap();
         assert_eq!(subagent_model(&args, parent), parent);
-        let args = json!({"prompt": "x", "model": "   "}).as_object().cloned().unwrap();
+        let args = json!({"prompt": "x", "model": "   "})
+            .as_object()
+            .cloned()
+            .unwrap();
         assert_eq!(subagent_model(&args, parent), parent);
         // Не строка — тоже родитель, а не паника.
-        let args = json!({"prompt": "x", "model": 42}).as_object().cloned().unwrap();
+        let args = json!({"prompt": "x", "model": 42})
+            .as_object()
+            .cloned()
+            .unwrap();
         assert_eq!(subagent_model(&args, parent), parent);
+    }
+
+    #[test]
+    fn updater_config_is_wired() {
+        // Контракт автообновления (rev37): endpoint смотрит в наш репозиторий,
+        // публичный ключ minisign вшит, артефакты апдейтера включены. Тест
+        // ловит потерю pubkey/endpoint ДО публикации релиза — урок
+        // dsh-phone (tests/updater_release.rs).
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json — валидный JSON");
+        let up = &conf["plugins"]["updater"];
+        let eps = up["endpoints"]
+            .as_array()
+            .expect("updater endpoints — массив");
+        assert!(
+            eps.iter().any(|e| e.as_str()
+                == Some(
+                    "https://github.com/Swwag666/SwagCode/releases/latest/download/latest.json"
+                )),
+            "endpoint автообновления смотрит в releases Swwag666/SwagCode"
+        );
+        let pubkey = up["pubkey"].as_str().unwrap_or("");
+        assert!(pubkey.len() > 50, "публичный ключ подписи вшит в конфиг");
+        assert_eq!(
+            conf["bundle"]["createUpdaterArtifacts"],
+            serde_json::json!(true),
+            "бандлер обязан подписывать артефакты апдейтера"
+        );
+        assert_eq!(conf["bundle"]["targets"][0], serde_json::json!("nsis"));
+        // Ресурсы бандла: node.exe и sidecar едут в установщик (E-1).
+        assert!(conf["bundle"]["resources"]["../../vendor/node/node.exe"].is_string());
+        assert!(conf["bundle"]["resources"]["../../vendor/sidecar"].is_string());
     }
 
     #[test]
@@ -4031,8 +4305,14 @@ mod tests {
         assert!(out.contains("Вложение: note.txt"), "{out}");
         assert!(out.contains("```\nсодержимое\n```"), "{out}");
         // Бинарный, слишком большой и отсутствующий — честные пометки, не тишина.
-        assert!(out.contains("data.bin: не прикреплено — бинарный файл"), "{out}");
-        assert!(out.contains("big.log: не прикреплено — файл больше"), "{out}");
+        assert!(
+            out.contains("data.bin: не прикреплено — бинарный файл"),
+            "{out}"
+        );
+        assert!(
+            out.contains("big.log: не прикреплено — файл больше"),
+            "{out}"
+        );
         assert!(out.contains("missing.txt: не прикреплено —"), "{out}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4069,12 +4349,16 @@ mod tests {
         let state = Arc::new(AppState::default());
 
         let indexed = index_workspace(&state, &dir).await.unwrap();
-        assert_eq!(indexed, 2, "png не кандидат, два .rs обязаны проиндексироваться");
+        assert_eq!(
+            indexed, 2,
+            "png не кандидат, два .rs обязаны проиндексироваться"
+        );
 
         // Кулдаун свежего старта гасит фоновый respawn внутри run_semantic_search.
-        state
-            .semantic_last_ms
-            .store(swagcod_core::bus::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        state.semantic_last_ms.store(
+            swagcod_core::bus::now_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let call = ToolCall {
             id: "call-sem-1".into(),
@@ -4086,8 +4370,16 @@ mod tests {
         };
         let out = run_semantic_search(&state, &call, &dir).await;
         assert!(out.ok, "{}", out.output);
-        assert!(out.output.contains("payments.rs"), "поиск не попал в payments.rs:\n{}", out.output);
-        assert!(out.output.contains("лексический"), "локальный индекс обязан маркироваться:\n{}", out.output);
+        assert!(
+            out.output.contains("payments.rs"),
+            "поиск не попал в payments.rs:\n{}",
+            out.output
+        );
+        assert!(
+            out.output.contains("лексический"),
+            "локальный индекс обязан маркироваться:\n{}",
+            out.output
+        );
 
         // Повторный прогон ничего не переиндексирует: хэши совпали.
         let again = index_workspace(&state, &dir).await.unwrap();
@@ -4096,10 +4388,17 @@ mod tests {
         let empty = ToolCall {
             id: "call-sem-2".into(),
             name: "semantic_search".into(),
-            arguments: serde_json::json!({"query": "   "}).as_object().unwrap().clone(),
+            arguments: serde_json::json!({"query": "   "})
+                .as_object()
+                .unwrap()
+                .clone(),
         };
         let out = run_semantic_search(&state, &empty, &dir).await;
-        assert!(!out.ok && out.output.contains("пустой запрос"), "{}", out.output);
+        assert!(
+            !out.ok && out.output.contains("пустой запрос"),
+            "{}",
+            out.output
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4268,10 +4567,16 @@ mod tests {
             &[],
         )
         .await;
-        assert!(out.ok && out.output == "ok", "относительный путь внутри cwd: {out:?}");
+        assert!(
+            out.ok && out.output == "ok",
+            "относительный путь внутри cwd: {out:?}"
+        );
 
         let out = execute_tool(
-            &call("write", serde_json::json!({"path": "../../evil.txt", "content": "x"})),
+            &call(
+                "write",
+                serde_json::json!({"path": "../../evil.txt", "content": "x"}),
+            ),
             &dir,
             timeout,
             &[],
@@ -4305,7 +4610,11 @@ mod tests {
     async fn execute_tool_grep_glob_patch_roundtrip() {
         let dir = std::env::temp_dir().join(format!("swagcod-b5-{}", short_id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src").join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        std::fs::write(
+            dir.join("src").join("a.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("b.txt"), "needle here\n").unwrap();
         let timeout = std::time::Duration::from_secs(5);
 
@@ -4316,7 +4625,10 @@ mod tests {
             &[],
         )
         .await;
-        assert!(out.ok && out.output.contains("b.txt:1") || out.output.contains("b.txt"), "{out:?}");
+        assert!(
+            out.ok && out.output.contains("b.txt:1") || out.output.contains("b.txt"),
+            "{out:?}"
+        );
         assert!(out.output.contains("needle here"), "{out:?}");
 
         let out = execute_tool(
@@ -4361,7 +4673,10 @@ mod tests {
     #[tokio::test]
     async fn execute_tool_fetch_url_rejects_non_http() {
         let out = execute_tool(
-            &call("fetch_url", serde_json::json!({"url": "file:///etc/passwd"})),
+            &call(
+                "fetch_url",
+                serde_json::json!({"url": "file:///etc/passwd"}),
+            ),
             std::path::Path::new("."),
             std::time::Duration::from_secs(5),
             &[],
@@ -4435,7 +4750,10 @@ mod tests {
     fn watchdog_threshold_boundary_is_inclusive() {
         let now = 500_000u64;
         let exactly = vec![("t".to_string(), now - QUIET_TURN_MS, false, None)];
-        assert_eq!(quiet_turns_to_warn(&exactly, now, QUIET_TURN_MS, QUIET_REWARN_MS).len(), 1);
+        assert_eq!(
+            quiet_turns_to_warn(&exactly, now, QUIET_TURN_MS, QUIET_REWARN_MS).len(),
+            1
+        );
         let just_under = vec![("t".to_string(), now - QUIET_TURN_MS + 1, false, None)];
         assert!(quiet_turns_to_warn(&just_under, now, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
     }
@@ -4448,8 +4766,12 @@ mod tests {
             store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
             ..Default::default()
         };
-        state.lagging_events.store(7, std::sync::atomic::Ordering::Relaxed);
-        state.lagging_dropped.store(2, std::sync::atomic::Ordering::Relaxed);
+        state
+            .lagging_events
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        state
+            .lagging_dropped
+            .store(2, std::sync::atomic::Ordering::Relaxed);
         state.turn_activity.lock().unwrap().insert(
             "t-wait".into(),
             TurnActivity {
@@ -4505,7 +4827,11 @@ mod tests {
         assert!(!state.turn_activity.lock().unwrap()["t1"].waiting_human);
         // Чужой ход не создаёт запись из воздуха.
         touch_turn(&state, "t-missing", None);
-        assert!(!state.turn_activity.lock().unwrap().contains_key("t-missing"));
+        assert!(!state
+            .turn_activity
+            .lock()
+            .unwrap()
+            .contains_key("t-missing"));
     }
 
     #[test]
@@ -4524,11 +4850,7 @@ mod tests {
         let sid = "s-lazy-1";
         {
             let store = state.store.lock().unwrap();
-            let mut s = Session::new(
-                SessionId::new(sid),
-                "C:\\tmp".to_string(),
-                "m".to_string(),
-            );
+            let mut s = Session::new(SessionId::new(sid), "C:\\tmp".to_string(), "m".to_string());
             s.created_ms = 1000;
             store.create_session(&s).unwrap();
             let rec = TurnRecord {
@@ -4545,7 +4867,11 @@ mod tests {
                 parent_turn_id: None,
             };
             store
-                .save_turn(sid, &rec, &[ChatMessage::user("ау"), ChatMessage::assistant("привет")])
+                .save_turn(
+                    sid,
+                    &rec,
+                    &[ChatMessage::user("ау"), ChatMessage::assistant("привет")],
+                )
                 .unwrap();
         }
 
@@ -4576,8 +4902,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_mcp_call_routes_to_live_server() {
         /* E-3: диспетчерный уровень — ToolCall с именем mcp:<server>:<tool>
-           уходит в живой stdio-процесс и возвращается ToolOutcome. */
-        let Some(node) = mcp::tests_node() else { return };
+        уходит в живой stdio-процесс и возвращается ToolOutcome. */
+        let Some(node) = mcp::tests_node() else {
+            return;
+        };
         let dir = std::env::temp_dir().join(format!("swagcod-mcp-rt-{}", short_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("srv.js");
@@ -4651,7 +4979,7 @@ rl.on('line', (l) => {
         std::fs::create_dir_all(&dir).unwrap();
 
         /* Живая сессия для journal_export: задача покрывает rehydrate-путь
-           и запись wire-журнала B-8. */
+        и запись wire-журнала B-8. */
         let sid = "task-sess";
         let mut s = Session::new(
             SessionId::new(sid),
@@ -4676,8 +5004,13 @@ rl.on('line', (l) => {
             let g = state.store.lock().unwrap();
             g.create_session(&s).unwrap();
             g.save_turn(sid, &s.turns[0], &s.history).unwrap();
-            g.task_enqueue(&Task::new("t-unknown", "no_such_kind", serde_json::json!({}), 0))
-                .unwrap();
+            g.task_enqueue(&Task::new(
+                "t-unknown",
+                "no_such_kind",
+                serde_json::json!({}),
+                0,
+            ))
+            .unwrap();
             g.task_enqueue(&Task::new(
                 "t-export",
                 "journal_export",
@@ -4703,7 +5036,11 @@ rl.on('line', (l) => {
             // Успех: журнал записан, задача done, сообщение в last_error.
             let export = g.task_get("t-export").unwrap().unwrap();
             assert_eq!(export.state, TASK_DONE, "{export:?}");
-            assert!(export.last_error.contains("событий"), "{:?}", export.last_error);
+            assert!(
+                export.last_error.contains("событий"),
+                "{:?}",
+                export.last_error
+            );
             let body = std::fs::read_to_string(&out_path).unwrap();
             assert!(
                 body.contains(sid) && body.contains("turn_started"),
@@ -4714,7 +5051,10 @@ rl.on('line', (l) => {
             let unknown = g.task_get("t-unknown").unwrap().unwrap();
             assert_eq!(unknown.state, TASK_QUEUED);
             assert_eq!(unknown.attempts, 1);
-            assert!(unknown.last_error.contains("неизвестный вид"), "{unknown:?}");
+            assert!(
+                unknown.last_error.contains("неизвестный вид"),
+                "{unknown:?}"
+            );
             assert!(unknown.next_try_ms > 0, "следующая попытка назначена");
 
             // git_fetch на каталоге без репозитория — честная ошибка.
@@ -4738,8 +5078,7 @@ rl.on('line', (l) => {
             let g = state.store.lock().unwrap();
             let t = g.task_get("t-unknown").unwrap().unwrap();
             assert_eq!(
-                t.state,
-                TASK_FAILED,
+                t.state, TASK_FAILED,
                 "терминал после {TASKS_MAX_ATTEMPTS} попыток: {t:?}"
             );
             assert!(t.attempts >= TASKS_MAX_ATTEMPTS);
@@ -4782,7 +5121,10 @@ rl.on('line', (l) => {
             );
         }
         for bad in ["write", "bash", "patch", "edit"] {
-            assert!(!SUBAGENT_SAFE_TOOLS.contains(&bad), "{bad} просочился в whitelist");
+            assert!(
+                !SUBAGENT_SAFE_TOOLS.contains(&bad),
+                "{bad} просочился в whitelist"
+            );
         }
     }
 
@@ -4793,16 +5135,18 @@ rl.on('line', (l) => {
         use tokio::net::TcpListener;
 
         /* Фейк OpenAI-совместимого SSE-провайдера. Ответы по номеру
-           запроса: 1 → tool_call read, 2 → финальный текст,
-           3 → tool_call read (фаза предела раундов), 4 → tool_call bash
-           (фаза отказа опасного инструмента), 5 → финальный текст. */
+        запроса: 1 → tool_call read, 2 → финальный текст,
+        3 → tool_call read (фаза предела раундов), 4 → tool_call bash
+        (фаза отказа опасного инструмента), 5 → финальный текст. */
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
         let srv_hits = hits.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let n = srv_hits.fetch_add(1, Ordering::SeqCst) + 1;
                 tokio::spawn(async move {
                     let mut buf = [0u8; 16384];
@@ -4826,8 +5170,7 @@ rl.on('line', (l) => {
 
         std::env::set_var("SWAGCOD_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
         std::env::set_var("SWAGCOD_API_KEY", "test-key");
-        let provider =
-            AnyProvider::OpenAi(Router::from_env_with_key(None).expect("роутер из env"));
+        let provider = AnyProvider::OpenAi(Router::from_env_with_key(None).expect("роутер из env"));
 
         let state = Arc::new(AppState {
             store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
@@ -4861,13 +5204,26 @@ rl.on('line', (l) => {
             .clone(),
         };
         let out = run_subagent(
-            &state, &provider, &call, sid, "parent-1", "test-model", None,
-            &dir, "", std::time::Duration::from_secs(5), &[],
+            &state,
+            &provider,
+            &call,
+            sid,
+            "parent-1",
+            "test-model",
+            None,
+            &dir,
+            "",
+            std::time::Duration::from_secs(5),
+            &[],
         )
         .await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("ОТЧЁТ ВЕТКИ"), "{}", out.output);
-        assert!(out.output.contains("[суб-агент parent-1-sub-"), "{}", out.output);
+        assert!(
+            out.output.contains("[суб-агент parent-1-sub-"),
+            "{}",
+            out.output
+        );
 
         {
             let g = state.store.lock().unwrap();
@@ -4901,8 +5257,17 @@ rl.on('line', (l) => {
                 .clone(),
         };
         let out_b = run_subagent(
-            &state, &provider, &call_b, sid, "parent-2", "test-model", None,
-            &dir, "", std::time::Duration::from_secs(5), &[],
+            &state,
+            &provider,
+            &call_b,
+            sid,
+            "parent-2",
+            "test-model",
+            None,
+            &dir,
+            "",
+            std::time::Duration::from_secs(5),
+            &[],
         )
         .await;
         assert!(!out_b.ok);
@@ -4919,8 +5284,17 @@ rl.on('line', (l) => {
                 .clone(),
         };
         let out_c = run_subagent(
-            &state, &provider, &call_c, sid, "parent-3", "test-model", None,
-            &dir, "", std::time::Duration::from_secs(5), &[],
+            &state,
+            &provider,
+            &call_c,
+            sid,
+            "parent-3",
+            "test-model",
+            None,
+            &dir,
+            "",
+            std::time::Duration::from_secs(5),
+            &[],
         )
         .await;
         assert!(out_c.ok, "{}", out_c.output);
@@ -4930,15 +5304,27 @@ rl.on('line', (l) => {
             let g = state.store.lock().unwrap();
             let loaded = g.load_session(sid).unwrap().unwrap();
             assert_eq!(loaded.turns.len(), 3);
-            let c = loaded.turns.iter().find(|t| t.id.as_str().starts_with("parent-3-sub-")).unwrap();
+            let c = loaded
+                .turns
+                .iter()
+                .find(|t| t.id.as_str().starts_with("parent-3-sub-"))
+                .unwrap();
             assert_eq!(c.tool_calls.len(), 1);
             assert_eq!(c.tool_calls[0].name, "bash");
             assert_eq!(c.content, "ГОТОВО");
-            let b = loaded.turns.iter().find(|t| t.id.as_str().starts_with("parent-2-sub-")).unwrap();
+            let b = loaded
+                .turns
+                .iter()
+                .find(|t| t.id.as_str().starts_with("parent-2-sub-"))
+                .unwrap();
             assert!(!b.ok);
             assert!(b.failure.as_deref().unwrap().contains("предел раундов"));
         }
-        assert_eq!(hits.load(Ordering::SeqCst), 5, "ровно пять запросов к провайдеру");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            5,
+            "ровно пять запросов к провайдеру"
+        );
 
         std::env::remove_var("SWAGCOD_BASE_URL");
         std::env::remove_var("SWAGCOD_API_KEY");

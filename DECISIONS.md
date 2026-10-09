@@ -3428,3 +3428,98 @@ RSS/family справочно вне бюджета (D-013, семья WebView2)
 перезапущено, sidecar на месте. bench-out/startup.json в коммите. README
 обновлён: бейджи rev36/368 тестов, строка «Провайдеры», model-аргумент
 суб-агента, ручной DSH-импорт, бюджетные числа 347664/356000 и 69.2 мс.
+
+## Ревизия 37 — установщик NSIS и автообновление по GitHub Releases
+
+**D-143. Версия 0.2.0 и установщик.** Версия поднята 0.1.0 → 0.2.0 во
+всех трёх местах (workspace Cargo.toml, tauri.conf.json, package.json);
+repository в workspace.package исправлен на настоящий
+Swwag666/SwagCode. tauri.conf: `createUpdaterArtifacts: true`, NSIS —
+installMode currentUser (без админа, ставится в %LOCALAPPDATA%),
+языки English/Russian с селектором, webviewInstallMode
+downloadBootstrapper (WebView2 докачается сам). Ресурсы бандла везут
+`vendor/node/node.exe` и `vendor/sidecar/` РЯДОМ с exe — ровно туда,
+куда уже смотрят node_binary()/sidecar_file() из E-1 (кандидат
+«рядом с exe (бандл)»), поэтому резолв путей не менялся. Иконки —
+существующий полный набор crates/app/icons.
+
+**D-144. Автообновление — схема DSH Phone один в один.**
+tauri-plugin-updater + tauri-plugin-process. Endpoint —
+`https://github.com/Swwag666/SwagCode/releases/latest/download/latest.json`,
+подпись minisign обязательна: публичный ключ вшит в tauri.conf,
+приватный живёт ВНЕ репозитория (профиль `~/.swagcod-updater`:
+swagcod-updater.key + password.txt; в CI — секреты
+TAURI_SIGNING_PRIVATE_KEY / …_PASSWORD). Команды:
+- `update_check` → UpdateInfo {available, version, current, notes,
+  error}: ошибка сети приходит ПОЛЕМ, а не падением команды — UI
+  показывает её текстом вместо тихого «обновлений нет»;
+- `update_install`: честный отказ при живых ходах (рвать траекторию
+  посреди стрима нельзя); перед установкой гасятся MCP-соединения,
+  хост JS-плагинов и sidecar хранилища — работающий node.exe
+  заблокирован на запись, NSIS не смог бы его перезаписать (урок
+  dsh-phone, os error 5); прогресс — tauri-событие `update-progress`
+  {downloaded, total, percent};
+- `restart_app` → request_restart (идёт через RunEvent::Exit, надёжен
+  из любого потока).
+Контракт Store дополнен `shutdown()` (default no-op — rusqlite
+останавливать нечего; NodeStore гасит child как в Drop). UI:
+Настройки → General → строка «Обновления» (кнопка «Проверить», версия,
+прогресс %, «Перезапустить сейчас»); listen('update-progress')
+подписан только на время скачивания. Config-тест
+`updater_config_is_wired` (include_str! tauri.conf.json): endpoint,
+pubkey, createUpdaterArtifacts, ресурсы бандла — ловит потерю ключа
+или endpoint ДО публикации релиза (урок dsh-phone
+tests/updater_release.rs).
+
+**D-145. Релизный инструмент.** `tools/build-release.ps1` (ASCII-only,
+PS 5.1): останавливает приложение и sidecar-процессы, грузит ключ из
+профиля, собирает фронтенд vite-шимом (pnpm на этой машине сломан —
+ERR_PNPM_IGNORED_BUILDS), гоняет `tauri build` с оверрайдом
+`tools/tauri-nobuild.json` (beforeBuildCommand="" — тот же pnpm),
+раскладывает в `releases/`: SwagCod-setup.exe + .sig + портативный
+SwagCod.exe (и обновляет корневой). `-Latest` собирает latest.json
+(version/notes/pub_date/platforms.windows-x86_64{signature,url}),
+UTF-8 БЕЗ BOM — Set-Content в PS 5.1 пишет BOM, а updater ожидает
+чистый JSON (урок dsh-phone). `.github/workflows/release.yml`: пуш
+тега `v*` → гейты (fmt, test --locked, clippy -D warnings,
+svelte-check, vitest) → vendor (fetch-node + bundle-sidecar, как в
+ci.yml) → tauri-action@v1 (projectPath crates/app, releaseDraft:
+false — у черновика /latest/ не резолвится) с секретами подписи;
+publish сразу, автообновление подхватит без участия человека.
+`releases/` в .gitignore — артефакты уезжают в GitHub Releases, не в
+репозиторий.
+
+**Честное ограничение:** updater ходит в репозиторий АНОНИМНО. Пока
+Swwag666/SwagCode приватный, releases/latest/download/… отдаёт 404, и
+«Проверить обновления» показывает честную сетевую ошибку. Чтобы
+обновления долетали до всех пользователей, репозиторий (или хотя бы
+его релизы) должен стать публичным — это решение владельца, код к
+нему готов.
+
+**Гейты ревизии 37:** app 83 (+1 updater_config_is_wired), core 97,
+provider 46, pty 43, fsx 20+1 — всего Rust 289; clippy -D warnings 0;
+cargo fmt чистый; svelte-check 0/0; vitest 80 (всего 369); бандл
+351227/356000.
+
+**Сборка релиза и приёмка установщика:** `tools/build-release.ps1 -Sign
+-Latest`: release-сборка 8m08s, NSIS `SwagCod_0.2.0_x64-setup.exe`
+29.49 MiB + подпись .sig + latest.json + портативный SwagCod.exe
+12.82 MB — всё в `releases/` (gitignore). Живая приёмка: тихая
+установка `/S` → `%LOCALAPPDATA%\SwagCod` (currentUser, без админа):
+swagcod-app.exe + node.exe 88.5 MB + sidecar/ рядом — пользовательские
+данные (swagcod.db, embeddings.db) живут в этом же каталоге, поэтому
+портативная и установленная копии разделяют одну базу. Запуск
+установленной копии: PID 23544, оба node-сайдкара (store-server,
+plugin-server) поднялись из установочного каталога своим node.exe —
+резолв «рядом с exe» из E-1 сработал без изменений. Деинсталл `/S`:
+программные файлы удалены, пользовательские данные (swagcod.db 45.9 MB,
+embeddings.db 186.8 MB, backgrounds/) честно остались. cargo fmt --all
+перед гейтами подмёл накопившийся дрейф форматирования (~20 файлов,
+только форматирование — тесты после него зелёные).
+
+**Деплой + bench (rev37):** портативный SwagCod.exe 0.2.0 в корне
+обновлён скриптом сборки; холодный старт 66.3 мс медиана (61.3–327.2)
+— IN BUDGET; our private 12.0 МБ — IN BUDGET; RSS/family справочно вне
+бюджета (D-013, семья WebView2); приложение перезапущено, PID 8116.
+exe вырос до 12.82 МБ (+0.6 МБ — updater/process-плагины).
+bench-out/startup.json в коммите.

@@ -1,0 +1,84 @@
+name: Release
+
+# Сборка и публикация на таг. Автообновление в приложении читает
+# releases/latest/download/latest.json, поэтому релиз публикуется сразу
+# (releaseDraft: false) — у черновика адрес /latest/ не резолвится.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Таг релиза, например v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm до setup-node: кэш node-зависимостей требует установленный pnpm
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # vendor для ресурсов бандлера: node.exe + плоский sidecar (E-1).
+      # Тот же путь, что в ci.yml: prebuilt better-sqlite3 под pinned ABI.
+      - name: fetch node + bundle sidecar
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch-node.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/bundle-sidecar.ps1
+
+      # Гейты до публикации: автообновление затянет релиз на машины
+      # пользователей само, спрашивать не будет.
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Clippy (fail on warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: svelte-check
+        working-directory: apps/desktop
+        run: pnpm run check
+      - name: vitest
+        working-directory: apps/desktop
+        run: pnpm run test
+
+      # tauri-action сам собирает NSIS-бандл, подписывает артефакты
+      # апдейтера и кладёт в релиз setup.exe + .sig + latest.json.
+      # Подпись — из секретов: приватный ключ не попадает в репозиторий
+      # никогда (схема DSH Phone, rev37).
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/app
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "SwagCod __VERSION__"
+          releaseBody: |
+            SwagCod __VERSION__
+
+            Windows x64: `SwagCod_<version>_x64-setup.exe` ниже.
+            Установленные приложения подхватят эту версию сами
+            (Настройки → General → «Обновления»).
+          releaseDraft: false
+          prerelease: false

@@ -53,7 +53,11 @@ pub fn configured_port(state: &AppState) -> Option<u16> {
 /// (модуль dpapi честно отказывает) — тогда и API недоступен.
 pub fn api_token(state: &AppState) -> Option<String> {
     let store = state.store.lock().ok()?;
-    let blob = store.get_pref(TOKEN_PREF).ok().flatten().unwrap_or_default();
+    let blob = store
+        .get_pref(TOKEN_PREF)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if !blob.trim().is_empty() {
         if let Ok(t) = crate::dpapi::unprotect_hex(blob.trim()) {
             return Some(t);
@@ -114,15 +118,20 @@ pub fn parse_head(head: &str) -> Result<(String, String, Option<usize>, Option<S
     let mut content_length: Option<usize> = None;
     let mut auth: Option<String> = None;
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         match k.trim().to_ascii_lowercase().as_str() {
             "content-length" => {
                 if content_length.is_some() {
                     // Двойной Content-Length — признак smuggling: отказ.
                     return Err("двойной Content-Length".into());
                 }
-                content_length =
-                    Some(v.trim().parse::<usize>().map_err(|_| "Content-Length не число")?);
+                content_length = Some(
+                    v.trim()
+                        .parse::<usize>()
+                        .map_err(|_| "Content-Length не число")?,
+                );
             }
             "authorization" => auth = Some(v.trim().to_string()),
             _ => {}
@@ -147,7 +156,9 @@ fn json_error(msg: &str) -> String {
 /// Проверка Bearer-токена.
 fn authorized(auth: Option<&str>, token: &str) -> bool {
     let Some(v) = auth else { return false };
-    let Some((scheme, tok)) = v.split_once(' ') else { return false };
+    let Some((scheme, tok)) = v.split_once(' ') else {
+        return false;
+    };
     scheme.eq_ignore_ascii_case("bearer") && ct_eq(tok.trim(), token)
 }
 
@@ -169,7 +180,9 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
 /// эфемерном порту без env/DPAPI.
 pub async fn serve_on(listener: TcpListener, state: Arc<AppState>, token: String) {
     loop {
-        let Ok((sock, _peer)) = listener.accept().await else { break };
+        let Ok((sock, _peer)) = listener.accept().await else {
+            break;
+        };
         let st = state.clone();
         let tk = token.clone();
         tokio::spawn(async move {
@@ -193,7 +206,11 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             break p;
         }
         if buf.len() > HEAD_LIMIT {
-            return Some(response(400, "Bad Request", &json_error("заголовки слишком большие")));
+            return Some(response(
+                400,
+                "Bad Request",
+                &json_error("заголовки слишком большие"),
+            ));
         }
         let n = sock.read(&mut tmp).await.ok()?;
         if n == 0 {
@@ -211,12 +228,20 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
     let mut body = buf[head_end + 4..].to_vec();
     if let Some(cl) = content_length {
         if cl > BODY_LIMIT {
-            return Some(response(400, "Bad Request", &json_error("тело больше 1 МБ")));
+            return Some(response(
+                400,
+                "Bad Request",
+                &json_error("тело больше 1 МБ"),
+            ));
         }
         while body.len() < cl {
             let n = sock.read(&mut tmp).await.ok()?;
             if n == 0 {
-                return Some(response(400, "Bad Request", &json_error("тело не дочитано")));
+                return Some(response(
+                    400,
+                    "Bad Request",
+                    &json_error("тело не дочитано"),
+                ));
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -250,7 +275,11 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             let v: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Some(response(400, "Bad Request", &json_error(&format!("json: {e}"))))
+                    return Some(response(
+                        400,
+                        "Bad Request",
+                        &json_error(&format!("json: {e}")),
+                    ))
                 }
             };
             let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
@@ -258,7 +287,11 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             let model = v.get("model").and_then(|x| x.as_str()).map(String::from);
             let temperature = v.get("temperature").and_then(|x| x.as_f64());
             if session_id.trim().is_empty() {
-                return Some(response(400, "Bad Request", &json_error("нужен session_id")));
+                return Some(response(
+                    400,
+                    "Bad Request",
+                    &json_error("нужен session_id"),
+                ));
             }
             match crate::start_turn_core(
                 state.clone(),
@@ -282,7 +315,11 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             let v: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Some(response(400, "Bad Request", &json_error(&format!("json: {e}"))))
+                    return Some(response(
+                        400,
+                        "Bad Request",
+                        &json_error(&format!("json: {e}")),
+                    ))
                 }
             };
             let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
@@ -352,7 +389,8 @@ mod tests {
     #[test]
     fn parse_head_get_post_and_errors() {
         let (m, p, cl, auth) =
-            parse_head("GET /v1/sessions?x=1 HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer t").unwrap();
+            parse_head("GET /v1/sessions?x=1 HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer t")
+                .unwrap();
         assert_eq!(m, "GET");
         assert_eq!(p, "/v1/sessions");
         assert_eq!(cl, None);
@@ -366,7 +404,9 @@ mod tests {
         assert!(parse_head("").is_err());
         assert!(parse_head("GET").is_err());
         // Двойной Content-Length — smuggling-признак, отказ.
-        assert!(parse_head("POST /x HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 2\r\n").is_err());
+        assert!(
+            parse_head("POST /x HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 2\r\n").is_err()
+        );
         assert!(parse_head("POST /x HTTP/1.1\r\nContent-Length: abc\r\n").is_err());
     }
 
@@ -453,7 +493,11 @@ mod tests {
             let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             sock.write_all(raw.as_bytes()).await.unwrap();
             let mut out = Vec::new();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_to_end(&mut out)).await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sock.read_to_end(&mut out),
+            )
+            .await;
             String::from_utf8_lossy(&out).to_string()
         }
         let auth = "authorization: Bearer test-token\r\n";
@@ -481,7 +525,11 @@ mod tests {
         assert!(r.contains("\"version\""), "{r}");
 
         // Сессии: пустой список, но 200.
-        let r = req(port, &format!("GET /v1/sessions HTTP/1.1\r\nhost: x\r\n{auth}\r\n")).await;
+        let r = req(
+            port,
+            &format!("GET /v1/sessions HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+        .await;
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         assert!(r.contains("[]"), "{r}");
 
@@ -524,7 +572,11 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 400"), "{r}");
 
         // Неизвестный путь — 404 (с токеном!).
-        let r = req(port, &format!("GET /nope HTTP/1.1\r\nhost: x\r\n{auth}\r\n")).await;
+        let r = req(
+            port,
+            &format!("GET /nope HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+        .await;
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
 
         // SSE: событие шины доезжает до подписчика data-кадром.

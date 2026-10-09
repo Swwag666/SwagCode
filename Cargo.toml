@@ -9,11 +9,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
-repository = "https://github.com/swagcod/swagcod"
+repository = "https://github.com/Swwag666/SwagCode"
 
 # D-011: core не должен зависеть от tauri. tauri живёт только в crates/app.
 [workspace.dependencies]

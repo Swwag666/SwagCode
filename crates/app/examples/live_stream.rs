@@ -14,7 +14,11 @@ async fn main() {
         }
     };
 
-    println!("провайдер: {} (эндпоинтов: {})", provider.name(), provider.len());
+    println!(
+        "провайдер: {} (эндпоинтов: {})",
+        provider.name(),
+        provider.len()
+    );
 
     let request = ChatRequest::new(
         std::env::var("SWAGCOD_MODEL").unwrap_or_else(|_| "fable-ultra-promax".into()),

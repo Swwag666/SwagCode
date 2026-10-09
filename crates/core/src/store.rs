@@ -149,14 +149,23 @@ pub trait Store: Send {
     fn load_all(&self) -> StoreResult<Vec<Session>>;
     fn load_session(&self, id: &str) -> StoreResult<Option<Session>>;
     /// Ход плюс снимок истории пишутся одной транзакцией.
-    fn save_turn(&self, session_id: &str, turn: &TurnRecord, history: &[ChatMessage]) -> StoreResult<()>;
+    fn save_turn(
+        &self,
+        session_id: &str,
+        turn: &TurnRecord,
+        history: &[ChatMessage],
+    ) -> StoreResult<()>;
     fn get_pref(&self, key: &str) -> StoreResult<Option<String>>;
     fn set_pref(&self, key: &str, value: &str) -> StoreResult<()>;
     /// B-7: per-session политика подтверждений (None = глобальная).
     fn set_session_policy(&self, id: &str, policy: Option<&str>) -> StoreResult<()>;
     /// B-7: журнал подтверждений.
     fn log_approval(&self, e: &ApprovalEntry) -> StoreResult<()>;
-    fn approval_log(&self, session_id: Option<&str>, limit: usize) -> StoreResult<Vec<ApprovalEntry>>;
+    fn approval_log(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<ApprovalEntry>>;
     /// E-5: очередь фоновых задач. id — ключ дедупликации (INSERT OR
     /// IGNORE): сид периодической задачи идемпотентен, отмена не
     /// воскрешается повторным сидом.
@@ -184,12 +193,22 @@ pub trait Store: Send {
     /// провайдеров). Один INSERT — телеметрия не должна быть дорогой.
     fn metrics_insert(&self, ts_ms: u64, name: &str, value: f64) -> StoreResult<()>;
     /// E-8: выборка по имени с ts_ms, старее-к-новее, с пределом.
-    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>>;
+    fn metrics_query(
+        &self,
+        name: &str,
+        since_ms: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, f64)>>;
     /// E-8: гигиена — удалить точки старше срока.
     fn metrics_prune(&self, before_ms: u64) -> StoreResult<()>;
     /// E-8: токены/день — агрегация оценочных токенов ходов, день UTC:
     /// (day_ms, tokens, turns). Ходы с нулевой оценкой не попадают.
     fn tokens_by_day(&self, since_ms: u64) -> StoreResult<Vec<(u64, u64, u64)>>;
+    /// Обновление (rev37): остановить процесс бэкенда перед установкой
+    /// новой версии — NSIS не перезапишет работающий node.exe. По
+    /// умолчанию нет ничего: бэкендам без внешнего процесса (rusqlite)
+    /// останавливать нечего.
+    fn shutdown(&mut self) {}
 }
 
 /// SQLite-реализация контракта [`Store`].
@@ -229,7 +248,9 @@ impl SqliteStore {
 
     /// Целостность базы: используется краш-тестами после обрыва процесса.
     pub fn integrity_check(&self) -> StoreResult<String> {
-        let ok: String = self.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let ok: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         Ok(ok)
     }
 }
@@ -253,7 +274,7 @@ pub(crate) fn role_from_str(s: &str) -> Role {
 }
 
 /* B-7: политика сессии хранится строкой — теми же значениями, что serde
-   пишет в wire-формат (snake_case), чтобы журнал и конфиг читались одинаково. */
+пишет в wire-формат (snake_case), чтобы журнал и конфиг читались одинаково. */
 pub(crate) fn policy_to_str(p: crate::turn::ApprovalPolicy) -> &'static str {
     match p {
         crate::turn::ApprovalPolicy::Always => "always",
@@ -272,10 +293,10 @@ pub(crate) fn policy_from_str_opt(s: Option<String>) -> Option<crate::turn::Appr
 }
 
 /* Ревизия 25: выбор хранилища. better-sqlite3 через Node-sidecar —
-   основное хранилище (прямое требование пользователя); встроенный
-   rusqlite — аварийный фолбэк для окружений без Node. SWAGCOD_STORE
-   форсирует выбор: `node` — только sidecar (падение громкое, без
-   тихой подмены), `sqlite` — только встроенный, иначе auto. */
+основное хранилище (прямое требование пользователя); встроенный
+rusqlite — аварийный фолбэк для окружений без Node. SWAGCOD_STORE
+форсирует выбор: `node` — только sidecar (падение громкое, без
+тихой подмены), `sqlite` — только встроенный, иначе auto. */
 
 /// Открыть файловую базу: sidecar, при неудаче (в auto) — rusqlite.
 pub fn open(path: &Path) -> StoreResult<Box<dyn Store>> {
@@ -287,7 +308,9 @@ pub fn open(path: &Path) -> StoreResult<Box<dyn Store>> {
                 if mode == "node" {
                     return Err(e);
                 }
-                eprintln!("store: better-sqlite3 sidecar недоступен, фолбэк на встроенный SQLite: {e}");
+                eprintln!(
+                    "store: better-sqlite3 sidecar недоступен, фолбэк на встроенный SQLite: {e}"
+                );
             }
         }
     }
@@ -328,8 +351,10 @@ impl Store for SqliteStore {
     }
 
     fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()> {
-        self.conn
-            .execute("UPDATE sessions SET title = ?2 WHERE id = ?1", params![id, title])?;
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
         Ok(())
     }
 
@@ -411,7 +436,12 @@ impl Store for SqliteStore {
         Ok(Some(ses))
     }
 
-    fn save_turn(&self, session_id: &str, turn: &TurnRecord, history: &[ChatMessage]) -> StoreResult<()> {
+    fn save_turn(
+        &self,
+        session_id: &str,
+        turn: &TurnRecord,
+        history: &[ChatMessage],
+    ) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         let tools_json = serde_json::to_string(&turn.tool_calls)?;
         tx.execute(
@@ -434,7 +464,10 @@ impl Store for SqliteStore {
         )?;
         // Снимок истории целиком: порядок и содержимое восстанавливаются
         // байт-в-байт, без учёта инкрементальных хвостов.
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages(session_id, ord, role, content, reasoning, tool_call_id, tool_calls_json)
@@ -458,11 +491,11 @@ impl Store for SqliteStore {
     }
 
     fn get_pref(&self, key: &str) -> StoreResult<Option<String>> {
-        let row = self
-            .conn
-            .query_row("SELECT value FROM prefs WHERE key = ?1", params![key], |r| {
-                r.get::<_, String>(0)
-            });
+        let row = self.conn.query_row(
+            "SELECT value FROM prefs WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        );
         match row {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -504,7 +537,11 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn approval_log(&self, session_id: Option<&str>, limit: usize) -> StoreResult<Vec<ApprovalEntry>> {
+    fn approval_log(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<ApprovalEntry>> {
         let limit = limit.clamp(1, 5000) as i64;
         // Два запроса намеренно: у варианта без фильтра LIMIT — ?1,
         // иначе rusqlite считает дырку в нумерации недостающим параметром.
@@ -609,7 +646,8 @@ impl Store for SqliteStore {
 
     fn tasks_list(&self, limit: usize) -> StoreResult<Vec<crate::tasks::Task>> {
         let limit = limit.clamp(1, 1000) as i64;
-        let sql = format!("SELECT {TASK_COLS} FROM tasks ORDER BY created_ms DESC, id DESC LIMIT ?1");
+        let sql =
+            format!("SELECT {TASK_COLS} FROM tasks ORDER BY created_ms DESC, id DESC LIMIT ?1");
         let mut stmt = self.conn.prepare(&sql)?;
         let mapped = stmt.query_map(params![limit], task_from_row)?;
         Ok(mapped.collect::<Result<Vec<_>, _>>()?)
@@ -643,7 +681,12 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>> {
+    fn metrics_query(
+        &self,
+        name: &str,
+        since_ms: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, f64)>> {
         let limit = limit.clamp(1, 10_000) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT ts_ms, value FROM metrics WHERE name = ?1 AND ts_ms >= ?2 ORDER BY ts_ms LIMIT ?3",
@@ -805,10 +848,15 @@ mod tests {
         let ses = sample_session();
         store.create_session(&ses).unwrap();
         let turn = sample_turn(1);
-        store.save_turn(ses.id.as_str(), &turn, &ses.history).unwrap();
+        store
+            .save_turn(ses.id.as_str(), &turn, &ses.history)
+            .unwrap();
 
         let loaded = store.load_session("s-1").unwrap().expect("сессия есть");
-        assert_eq!(serde_json::to_string(&loaded.history).unwrap(), serde_json::to_string(&ses.history).unwrap());
+        assert_eq!(
+            serde_json::to_string(&loaded.history).unwrap(),
+            serde_json::to_string(&ses.history).unwrap()
+        );
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.turns[0], turn);
         assert_eq!(loaded.title, "проба");
@@ -884,7 +932,10 @@ mod tests {
         t4.est_output_tokens = 0;
         store.save_turn("s-1", &t4, &[]).unwrap();
 
-        assert_eq!(store.tokens_by_day(0).unwrap(), vec![(0, 60, 2), (86_400_000, 30, 1)]);
+        assert_eq!(
+            store.tokens_by_day(0).unwrap(),
+            vec![(0, 60, 2), (86_400_000, 30, 1)]
+        );
         // since_ms фильтрует дни.
         assert_eq!(
             store.tokens_by_day(86_400_000).unwrap(),
@@ -900,7 +951,9 @@ mod tests {
         b.created_ms = a.created_ms + 5;
         store.create_session(&a).unwrap();
         store.create_session(&b).unwrap();
-        store.save_turn(a.id.as_str(), &sample_turn(1), &a.history).unwrap();
+        store
+            .save_turn(a.id.as_str(), &sample_turn(1), &a.history)
+            .unwrap();
 
         let all = store.load_all().unwrap();
         assert_eq!(all.len(), 2);
@@ -914,11 +967,19 @@ mod tests {
         // Каскад: ходов и сообщений удалённой сессии в базе не осталось.
         let turns: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM turns WHERE session_id = 's-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = 's-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let msgs: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 's-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 's-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(turns, 0);
         assert_eq!(msgs, 0);
@@ -945,14 +1006,19 @@ mod tests {
             let store = SqliteStore::open(&path).unwrap();
             let ses = sample_session();
             store.create_session(&ses).unwrap();
-            store.save_turn(ses.id.as_str(), &sample_turn(1), &ses.history).unwrap();
+            store
+                .save_turn(ses.id.as_str(), &sample_turn(1), &ses.history)
+                .unwrap();
             // Намеренно не закрываем: соединение уходит без drop-семантики
             // закрытия, как при kill процесса.
             std::mem::forget(store);
         }
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(store.integrity_check().unwrap(), "ok");
-        let loaded = store.load_session("s-1").unwrap().expect("сессия пережила обрыв");
+        let loaded = store
+            .load_session("s-1")
+            .unwrap()
+            .expect("сессия пережила обрыв");
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.history.len(), 3);
         drop(store);
@@ -979,9 +1045,15 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let ses = sample_session();
         store.create_session(&ses).unwrap();
-        store.log_approval(&entry("c1", "approved", "user", 100)).unwrap();
-        store.log_approval(&entry("c2", "denied", "user", 200)).unwrap();
-        store.log_approval(&entry("c3", "denied", "system", 300)).unwrap();
+        store
+            .log_approval(&entry("c1", "approved", "user", 100))
+            .unwrap();
+        store
+            .log_approval(&entry("c2", "denied", "user", 200))
+            .unwrap();
+        store
+            .log_approval(&entry("c3", "denied", "system", 300))
+            .unwrap();
 
         let all = store.approval_log(None, 10).unwrap();
         assert_eq!(all.len(), 3);
@@ -1008,7 +1080,9 @@ mod tests {
             let store = SqliteStore::open(&path).unwrap();
             let ses = sample_session();
             store.create_session(&ses).unwrap();
-            store.log_approval(&entry("c1", "approved", "user", 100)).unwrap();
+            store
+                .log_approval(&entry("c1", "approved", "user", 100))
+                .unwrap();
             store.delete_session("s-1").unwrap();
             let all = store.approval_log(None, 10).unwrap();
             assert_eq!(all.len(), 1, "аудит не исчезает вместе с сессией");

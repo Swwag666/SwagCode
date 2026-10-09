@@ -57,7 +57,10 @@ impl RpcConn {
             Ok(Err(_)) => Err(format!("rpc: процесс завершил соединение ({method})")),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!("rpc: таймаут {method} ({} мс)", timeout.as_millis()))
+                Err(format!(
+                    "rpc: таймаут {method} ({} мс)",
+                    timeout.as_millis()
+                ))
             }
         }
     }
@@ -131,7 +134,10 @@ pub fn spawn(
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let mut child = cmd.spawn().map_err(|e| format!("{label}: запуск: {e}"))?;
-    let stdin = child.stdin.take().ok_or_else(|| format!("{label}: нет stdin"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{label}: нет stdin"))?;
     let stdout = child
         .stdout
         .take()

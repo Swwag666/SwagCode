@@ -9,10 +9,10 @@ MCP-серверы, JS-плагины, суб-агенты, семантичес
 loopback REST API и дашборд телеметрии — в нативном окне с холодным стартом **68 мс**.
 
 [![CI](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml/badge.svg)](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml)
-![tests](https://img.shields.io/badge/tests-368%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-369%20green-brightgreen)
 ![clippy](https://img.shields.io/badge/clippy-0%20warnings-blue)
 ![svelte--check](https://img.shields.io/badge/svelte--check-0%2F0-blueviolet)
-![version](https://img.shields.io/badge/version-0.1.0%20(rev%2036)-orange)
+![version](https://img.shields.io/badge/version-0.2.0%20(rev%2037)-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -106,10 +106,43 @@ cargo build --release -p swagcod-app --features tauri/custom-protocol
 > и покажет ERR_CONNECTION_REFUSED — грабля Tauri v2 (DECISIONS.md §7).
 
 ```powershell
-cargo test --workspace                       # 288 Rust-тестов
+cargo test --workspace                       # 289 Rust-тестов
 pnpm --filter swagcod-desktop test           # 80 TS-тестов
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Установка и обновление
+
+**Просто поставить:** скачай `SwagCod-setup.exe` из
+[Releases](https://github.com/Swwag666/SwagCode/releases) и запусти —
+установка под текущего пользователя (без админа), ярлык в меню Пуск,
+WebView2 докачается сам, node-рантайм и sidecar уже внутри установщика.
+
+**Автообновление:** приложение читает манифест `latest.json` из GitHub
+Releases (`releases/latest/download/latest.json`), сверяет версию и
+подпись minisign, качает новый setup и ставит его. Ручной запуск:
+Настройки → General → «Обновления» → «Проверить»; прогресс загрузки
+честный, в конце — «Перезапустить сейчас». Неподписанный или чужой
+манифест отвергается: подпись обязательна.
+
+**Сборка релиза (для сопровождающих):**
+
+```powershell
+# ключ подписи — один раз (генерится в профиль пользователя, вне репы):
+npx tauri signer generate -w $env:USERPROFILE\.swagcod-updater\swagcod-updater.key
+# релиз локально: setup.exe + .sig + SwagCod.exe + latest.json в releases/
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-release.ps1 -Sign -Latest
+```
+
+Или CI: запушь тег `vX.Y.Z` — workflow `Release` (tauri-action) сам
+соберёт NSIS, подпишет артефакты и опубликует релиз с `latest.json`.
+Нужны секреты репозитория `TAURI_SIGNING_PRIVATE_KEY` и
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (содержимое
+`~/.swagcod-updater/swagcod-updater.key` и `password.txt`).
+
+> ⚠️ Автообновление ходит в репозиторий анонимно: пока репа приватная,
+> `releases/latest/download/...` отдаёт 404 и проверка честно показывает
+> ошибку. Чтобы обновления долетали до всех, релизы должны быть публичными.
 
 ## Конфигурация
 
@@ -135,15 +168,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Бюджеты — числа, не ощущения
 
 Прогон `tools/bench-startup.ps1` против свежего release-бинарника (i5-10400F / 16 ГБ,
-Windows, ревизия 36); закоммичено в `bench-out/startup.json`:
+Windows, ревизия 37); закоммичено в `bench-out/startup.json`:
 
 | Метрика | Цель | Факт |
 |---|---|---|
-| Холодный старт до окна | < 400 мс | **69.2 мс** медиана |
-| Private bytes нашего процесса | < 40 МБ | **12.2 МБ** |
+| Холодный старт до окна | < 400 мс | **66.3 мс** медиана |
+| Private bytes нашего процесса | < 40 МБ | **12.0 МБ** |
 | Private bytes всей семьи | < 200 МБ | вне бюджета: семья WebView2, справочно (D-013) |
-| JS-бандл | < 356 000 Б | **347 664 Б** |
-| Тесты | все зелёные | **368** (288 Rust + 80 TS) |
+| JS-бандл | < 356 000 Б | **351 227 Б** |
+| Тесты | все зелёные | **369** (289 Rust + 80 TS) |
 | Clippy · svelte-check | 0 · 0/0 | ✅ |
 
 Таблица переписывается только реальным прогоном: числа в README без строки

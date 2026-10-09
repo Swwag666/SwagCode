@@ -71,13 +71,19 @@ pub fn grep_files(
             continue;
         }
         let path = entry.path();
-        if path
-            .components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some(".git") | Some("node_modules") | Some("target")))
-        {
+        if path.components().any(|c| {
+            matches!(
+                c.as_os_str().to_str(),
+                Some(".git") | Some("node_modules") | Some("target")
+            )
+        }) {
             continue;
         }
-        if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(true) {
+        if entry
+            .metadata()
+            .map(|m| m.len() > MAX_GREP_FILE_BYTES)
+            .unwrap_or(true)
+        {
             continue;
         }
         let bytes = match std::fs::read(path) {
@@ -214,7 +220,12 @@ pub fn glob_files(root: &Path, sub: Option<&str>, pattern: &str) -> Result<Vec<S
 ///    частая беда моделей с отступами, лечится similar-подходом к строкам;
 /// 3. иначе ошибка, а в ней — ближайший похожий регион (similar ratio),
 ///    чтобы модель могла поправиться сама.
-pub fn patch_text(content: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), String> {
+pub fn patch_text(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
     if old.is_empty() {
         return Err("old_string пуст: для создания файла есть write".into());
     }
@@ -266,7 +277,10 @@ pub fn patch_text(content: &str, old: &str, new: &str, replace_all: bool) -> Res
         }
     }
     // Уровень 3: similar-диагностика — где ближайший похожий регион.
-    Err(format!("old_string не найден в файле{}", closest_region(content, old)))
+    Err(format!(
+        "old_string не найден в файле{}",
+        closest_region(content, old)
+    ))
 }
 
 /// Подсказка «ближайший похожий регион» через similar ratio. Считается
@@ -362,9 +376,7 @@ fn looks_html(data: &[u8]) -> bool {
 pub fn html_to_text(data: &[u8]) -> String {
     use scraper::{Html, Node};
     const SKIP: [&str; 5] = ["script", "style", "noscript", "template", "svg"];
-    const BREAK: [&str; 10] = [
-        "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5",
-    ];
+    const BREAK: [&str; 10] = ["p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5"];
     let doc = Html::parse_document(&String::from_utf8_lossy(data));
     let mut out = String::new();
     for node in doc.tree.nodes() {
@@ -445,7 +457,11 @@ mod tests {
     #[test]
     fn grep_finds_matches_with_context_and_line_numbers() {
         let root = temp_root("grep");
-        write(&root, "src/a.rs", "fn one() {}\nfn target() {}\nfn three() {}\n");
+        write(
+            &root,
+            "src/a.rs",
+            "fn one() {}\nfn target() {}\nfn three() {}\n",
+        );
         write(&root, "b.txt", "nothing here\n");
         let hits = grep_files(&root, None, "target", 1).unwrap();
         assert_eq!(hits.len(), 1);
@@ -576,7 +592,10 @@ mod tests {
         let content = (1..=20).map(|i| format!("line {i}\n")).collect::<String>();
         let err = patch_text(&content, "line 10\nline 111", "x", false).unwrap_err();
         assert!(err.contains("не найден"), "{err}");
-        assert!(err.contains("строки 10") || err.contains("сходство"), "{err}");
+        assert!(
+            err.contains("строки 10") || err.contains("сходство"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -594,7 +613,10 @@ mod tests {
             </body></html>";
         let text = html_to_text(html);
         assert!(text.contains("Title"));
-        assert!(text.contains("First & second"), "сущности декодируются: {text}");
+        assert!(
+            text.contains("First & second"),
+            "сущности декодируются: {text}"
+        );
         assert!(!text.contains("secret"));
         assert!(!text.contains("color:red"));
         assert!(text.contains("one") && text.contains("two"));
@@ -608,9 +630,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_url_rejects_non_http_schemes() {
-        let err = fetch_url("file:///C:/Windows/win.ini", std::time::Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let err = fetch_url(
+            "file:///C:/Windows/win.ini",
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("http"), "{err}");
     }
 }

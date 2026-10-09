@@ -67,16 +67,27 @@ impl PtyHandle {
     }
 
     pub fn write(&self, data: &[u8]) -> PtyResult<()> {
-        let mut w = self.writer.lock().map_err(|e| PtyError::Other(e.to_string()))?;
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|e| PtyError::Other(e.to_string()))?;
         w.write_all(data)?;
         w.flush()?;
         Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> PtyResult<()> {
-        let m = self.master.lock().map_err(|e| PtyError::Other(e.to_string()))?;
-        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        let m = self
+            .master
+            .lock()
             .map_err(|e| PtyError::Other(e.to_string()))?;
+        m.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| PtyError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -96,7 +107,8 @@ impl PtyHandle {
         // Без консольного окна при убийстве PTY.
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let _ = cmd.stdout(std::process::Stdio::null())
+        let _ = cmd
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     }
@@ -107,7 +119,8 @@ impl PtyHandle {
 
     pub fn dropped_batches(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-    }}
+    }
+}
 
 /// Реестр PTY-сессий приложения.
 #[derive(Default)]
@@ -121,10 +134,22 @@ impl PtyManager {
     }
 
     /// Поднять PTY: shell в cwd сессии, читатель уходит в свой поток.
-    pub fn spawn(&self, id: &str, shell: &str, cwd: &str, cols: u16, rows: u16) -> PtyResult<Arc<PtyHandle>> {
+    pub fn spawn(
+        &self,
+        id: &str,
+        shell: &str,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+    ) -> PtyResult<Arc<PtyHandle>> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| PtyError::Other(e.to_string()))?;
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(cwd);
@@ -154,7 +179,9 @@ impl PtyManager {
                 let mut child = child;
                 let mut buf = vec![0u8; READ_CHUNK];
                 let mut batch: Vec<u8> = Vec::with_capacity(BATCH_BYTES);
-                let send = |msg: PtyMsg, tx: &SyncSender<PtyMsg>, dropped: &std::sync::atomic::AtomicU64| {
+                let send = |msg: PtyMsg,
+                            tx: &SyncSender<PtyMsg>,
+                            dropped: &std::sync::atomic::AtomicU64| {
                     // try_send: переполнение канала = медленный потребитель,
                     // пачка дропается и считается (backpressure по плану B-2).
                     if tx.try_send(msg).is_err() {
@@ -174,7 +201,8 @@ impl PtyManager {
                             let quiet = n < buf.len();
                             batch.extend_from_slice(&buf[..n]);
                             if batch.len() >= BATCH_BYTES || quiet {
-                                let out = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BYTES));
+                                let out =
+                                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BYTES));
                                 send(PtyMsg::Output(out), &tx, &dropped_thread);
                             }
                         }
@@ -237,7 +265,11 @@ mod tests {
             .spawn("pty-test", shell, cwd.to_str().unwrap(), 80, 24)
             .expect("pty поднялся");
         let rx = handle.take_rx().expect("приёмник один");
-        let cmd = if cfg!(windows) { "echo swagcod-pty-ok\r" } else { "echo swagcod-pty-ok\n" };
+        let cmd = if cfg!(windows) {
+            "echo swagcod-pty-ok\r"
+        } else {
+            "echo swagcod-pty-ok\n"
+        };
         handle.write(cmd.as_bytes()).unwrap();
 
         let mut got = String::new();
@@ -259,7 +291,10 @@ mod tests {
             }
         }
         handle.kill();
-        assert!(got.contains("swagcod-pty-ok"), "вывод эха не доехал: {got:?}");
+        assert!(
+            got.contains("swagcod-pty-ok"),
+            "вывод эха не доехал: {got:?}"
+        );
         let _ = exited;
     }
 
@@ -356,8 +391,14 @@ mod tests {
         }
         // Считаем от первого до последнего байта: старт шелла и чтение файла
         // в поток не входят — бюджет про сам конвейер PTY, а не про PowerShell.
-        let window = first.map(|f| last.duration_since(f).as_secs_f64()).unwrap_or(0.0);
-        let rate = if window > 0.0 { got as f64 / window } else { 0.0 };
+        let window = first
+            .map(|f| last.duration_since(f).as_secs_f64())
+            .unwrap_or(0.0);
+        let rate = if window > 0.0 {
+            got as f64 / window
+        } else {
+            0.0
+        };
         handle.kill();
         let _ = std::fs::remove_dir_all(&dir);
         println!(
@@ -371,7 +412,11 @@ mod tests {
         // ConPTY сам рендерит поток и на этом железе даёт ~19 МБ/с. Наша
         // сторона обязана поглотить всё без единого дропа — это и проверяем,
         // плюс нижний порог реальной скорости платформы (см. DECISIONS, ревизия 17).
-        assert_eq!(handle.dropped_batches(), 0, "конвейер PTY уронил пачки: потребитель не успевает");
+        assert_eq!(
+            handle.dropped_batches(),
+            0,
+            "конвейер PTY уронил пачки: потребитель не успевает"
+        );
         assert!(
             rate >= 15.0 * 1e6,
             "пропускная способность {:.1} МБ/с ниже порога платформы 15 МБ/с",

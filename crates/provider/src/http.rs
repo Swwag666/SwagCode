@@ -111,7 +111,11 @@ impl OpenAiProvider {
     ) -> Result<Vec<Vec<f32>>, ProviderError> {
         let body = serde_json::json!({ "model": model, "input": input });
         let resp = self
-            .auth(self.client.post(format!("{}/embeddings", self.base_url)).json(&body))
+            .auth(
+                self.client
+                    .post(format!("{}/embeddings", self.base_url))
+                    .json(&body),
+            )
             .send()
             .await
             .map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -253,17 +257,24 @@ pub fn parse_embeddings(v: &serde_json::Value) -> Result<Vec<Vec<f32>>, Provider
     }
     let mut items: Vec<(i64, Vec<f32>)> = Vec::with_capacity(data.len());
     for (i, item) in data.iter().enumerate() {
-        let idx = item.get("index").and_then(|x| x.as_i64()).unwrap_or(i as i64);
+        let idx = item
+            .get("index")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(i as i64);
         let emb = item
             .get("embedding")
             .and_then(|e| e.as_array())
-            .ok_or_else(|| ProviderError::Http(format!("embeddings: у data[{i}] нет embedding[]")))?;
+            .ok_or_else(|| {
+                ProviderError::Http(format!("embeddings: у data[{i}] нет embedding[]"))
+            })?;
         let vec: Vec<f32> = emb
             .iter()
             .filter_map(|x| x.as_f64().map(|f| f as f32))
             .collect();
         if vec.is_empty() {
-            return Err(ProviderError::Http(format!("embeddings: data[{i}] — пустой вектор")));
+            return Err(ProviderError::Http(format!(
+                "embeddings: data[{i}] — пустой вектор"
+            )));
         }
         items.push((idx, vec));
     }

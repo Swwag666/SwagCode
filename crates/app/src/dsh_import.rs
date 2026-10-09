@@ -165,8 +165,16 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
         let data = rec.get("data").cloned().unwrap_or(serde_json::Value::Null);
         match kind {
             "session" => {
-                s.id = rec.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                s.cwd = rec.get("cwd").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                s.id = rec
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                s.cwd = rec
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 s.created_ms = rec.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
             }
             "session/title" => {
@@ -222,7 +230,10 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
                 if !is_user {
                     continue;
                 }
-                let text = text_of(data.get("content").unwrap_or(&serde_json::Value::Null), "text");
+                let text = text_of(
+                    data.get("content").unwrap_or(&serde_json::Value::Null),
+                    "text",
+                );
                 if text.is_empty() {
                     continue;
                 }
@@ -238,8 +249,14 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
             }
             "assistant/message" => {
                 let Some(t) = current.as_mut() else { continue };
-                let msg = data.get("message").cloned().unwrap_or(serde_json::Value::Null);
-                let content = msg.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                let msg = data
+                    .get("message")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let content = msg
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let text = text_of(&content, "text");
                 let reasoning = text_of(&content, "reasoning");
                 if !text.is_empty() {
@@ -258,15 +275,30 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
             }
             "tool/call" => {
                 let Some(t) = current.as_mut() else { continue };
-                let id = data.get("callId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let name = data.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let id = data
+                    .get("callId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let name = data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 // DSH хранит аргументы JSON-строкой — парсим в Map.
-                let args_raw = data.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                let args_raw = data
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
                 let arguments = serde_json::from_str::<serde_json::Value>(args_raw)
                     .ok()
                     .and_then(|v| v.as_object().cloned())
                     .unwrap_or_default();
-                t.rec.tool_calls.push(ToolCall { id, name, arguments });
+                t.rec.tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
             "turn/end" => {
                 if let Some(mut t) = current.take() {
@@ -322,9 +354,13 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
 /// Найти все файлы сессий под корнем DSH (два уровня: workspace/сессия).
 fn session_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(workspaces) = std::fs::read_dir(root) else { return out };
+    let Ok(workspaces) = std::fs::read_dir(root) else {
+        return out;
+    };
     for ws in workspaces.flatten() {
-        let Ok(sessions) = std::fs::read_dir(ws.path()) else { continue };
+        let Ok(sessions) = std::fs::read_dir(ws.path()) else {
+            continue;
+        };
         for ses in sessions.flatten() {
             let f = ses.path().join("session.v3.jsonl.zstd");
             if f.is_file() {
@@ -375,11 +411,8 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
                 // оставляет в базе каркас без ходов, и старый код считал его
                 // «уже перенесённым» навсегда. Сверяем id ходов и тащим
                 // только недостающие (save_turn — INSERT OR REPLACE).
-                let have: std::collections::HashSet<&str> = existing
-                    .turns
-                    .iter()
-                    .map(|t| t.id.as_str())
-                    .collect();
+                let have: std::collections::HashSet<&str> =
+                    existing.turns.iter().map(|t| t.id.as_str()).collect();
                 let missing: Vec<&ParsedTurn> = parsed
                     .turns
                     .iter()
@@ -403,7 +436,9 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
                             report.messages += t.msgs.len();
                         }
                         Err(e) => {
-                            report.errors.push(format!("{}: save_turn: {e}", file.display()));
+                            report
+                                .errors
+                                .push(format!("{}: save_turn: {e}", file.display()));
                         }
                     }
                 }
@@ -414,7 +449,9 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
             }
             Ok(None) => {}
             Err(e) => {
-                report.errors.push(format!("{}: store: {e}", file.display()));
+                report
+                    .errors
+                    .push(format!("{}: store: {e}", file.display()));
                 continue;
             }
         }
@@ -433,7 +470,9 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
             created_ms: parsed.created_ms,
         };
         if let Err(e) = store.create_session(&session) {
-            report.errors.push(format!("{}: create_session: {e}", file.display()));
+            report
+                .errors
+                .push(format!("{}: create_session: {e}", file.display()));
             continue;
         }
         report.sessions += 1;
@@ -449,7 +488,9 @@ pub fn import_dsh_sessions(store: &dyn Store, root: &Path) -> ImportReport {
                     report.messages += t.msgs.len();
                 }
                 Err(e) => {
-                    report.errors.push(format!("{}: save_turn: {e}", file.display()));
+                    report
+                        .errors
+                        .push(format!("{}: save_turn: {e}", file.display()));
                 }
             }
         }
@@ -586,8 +627,7 @@ fn parse_patch_entry(v: &serde_yaml::Value) -> Option<DshPluginEntry> {
 
 /// Разобрать один cordis.patch.yml: insert-списки + прямые записи.
 pub fn parse_cordis_patch(text: &str) -> Result<Vec<DshPluginEntry>, String> {
-    let v: serde_yaml::Value =
-        serde_yaml::from_str(text).map_err(|e| format!("yaml: {e}"))?;
+    let v: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| format!("yaml: {e}"))?;
     let serde_yaml::Value::Sequence(items) = &v else {
         return Err("корень патча — не массив".into());
     };
@@ -620,9 +660,7 @@ fn json_scalar_to_string(v: &serde_json::Value) -> String {
 
 /// Запись DSH → конфиг MCP-сервера SwagCod. Ошибка — честная причина
 /// пропуска (чужой транспорт, нет команды), а не тихий дроп.
-pub fn mcp_from_entry(
-    e: &DshPluginEntry,
-) -> Result<crate::mcp::McpServerConfig, String> {
+pub fn mcp_from_entry(e: &DshPluginEntry) -> Result<crate::mcp::McpServerConfig, String> {
     if !e.id.starts_with("mcp-") {
         return Err(format!("{}: не MCP-запись", e.id));
     }
@@ -709,9 +747,7 @@ pub fn import_dsh_configs(store: &dyn Store) -> ConfigReport {
         match std::fs::read_to_string(f) {
             Ok(text) => match parse_cordis_patch(&text) {
                 Ok(mut e) => entries.append(&mut e),
-                Err(e) => report
-                    .mcp_skipped
-                    .push(format!("{}: {e}", f.display())),
+                Err(e) => report.mcp_skipped.push(format!("{}: {e}", f.display())),
             },
             Err(e) => report
                 .mcp_skipped
@@ -843,7 +879,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let p = parse_session_log(&no_title).unwrap();
-        assert_eq!(p.title, "Проверка кода", "label суб-агента — второй приоритет");
+        assert_eq!(
+            p.title, "Проверка кода",
+            "label суб-агента — второй приоритет"
+        );
 
         let no_both: String = no_title
             .lines()
@@ -851,12 +890,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let p = parse_session_log(&no_both).unwrap();
-        assert_eq!(p.title, "почини оплату", "первая реплика — третий приоритет");
+        assert_eq!(
+            p.title, "почини оплату",
+            "первая реплика — третий приоритет"
+        );
     }
 
     #[test]
     fn failed_turn_end_marks_failure() {
-        let log = sample_log().replace(r#""reason":{"kind":"completed"}"#, r#""reason":{"kind":"interrupted"}"#);
+        let log = sample_log().replace(
+            r#""reason":{"kind":"completed"}"#,
+            r#""reason":{"kind":"interrupted"}"#,
+        );
         let p = parse_session_log(&log).unwrap();
         assert!(!p.turns[0].rec.ok);
         assert_eq!(p.turns[0].rec.failure.as_deref(), Some("dsh: interrupted"));
@@ -895,7 +940,10 @@ mod tests {
     fn import_is_idempotent_and_fills_store() {
         let dir = std::env::temp_dir().join(format!(
             "swagcod-dsh-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let ses = dir.join("sessions").join("--D-proj--").join("session-aaaa");
         std::fs::create_dir_all(&ses).unwrap();
@@ -979,7 +1027,10 @@ mod tests {
     fn empty_session_is_skipped_not_created() {
         let dir = std::env::temp_dir().join(format!(
             "swagcod-dsh-empty-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let ses = dir.join("sessions").join("--D-proj--").join("session-empt");
         std::fs::create_dir_all(&ses).unwrap();
@@ -1013,7 +1064,10 @@ mod tests {
     fn resume_backfills_missing_turns() {
         let dir = std::env::temp_dir().join(format!(
             "swagcod-dsh-resume-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let ses = dir.join("sessions").join("--D-proj--").join("session-aaaa");
         std::fs::create_dir_all(&ses).unwrap();

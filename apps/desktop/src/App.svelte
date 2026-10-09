@@ -6,6 +6,7 @@
    */
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
+  import { listen } from '@tauri-apps/api/event'
   import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { bus, type WireEvent } from './lib/bus'
@@ -705,6 +706,74 @@
       telTasks = tasks
     } catch {
       // старое ядро без телеметрии: графики остаются пустыми
+    }
+  }
+
+  /* Обновления (rev37): проверка → скачивание → перезапуск. Прогресс
+     приходит tauri-событием 'update-progress' из команды update_install;
+     подписка живёт только на время скачивания. */
+  interface UpdateCheckInfo {
+    available: boolean
+    version: string | null
+    current: string
+    notes: string | null
+    error: string | null
+  }
+  let updateState = $state<'idle' | 'checking' | 'upToDate' | 'available' | 'downloading' | 'ready' | 'error'>('idle')
+  let updateCurrent = $state('')
+  let updateVersion = $state('')
+  let updateNotes = $state('')
+  let updateError = $state('')
+  let updatePercent = $state(0)
+
+  async function checkUpdate(): Promise<void> {
+    updateState = 'checking'
+    updateError = ''
+    try {
+      const info = await invoke<UpdateCheckInfo>('update_check')
+      updateCurrent = info.current
+      if (info.error) {
+        updateState = 'error'
+        updateError = info.error
+      } else if (info.available) {
+        updateState = 'available'
+        updateVersion = info.version ?? ''
+        updateNotes = info.notes ?? ''
+      } else {
+        updateState = 'upToDate'
+        updateVersion = ''
+        updateNotes = ''
+      }
+    } catch (e) {
+      updateState = 'error'
+      updateError = String(e)
+    }
+  }
+
+  async function installUpdate(): Promise<void> {
+    updateState = 'downloading'
+    updatePercent = 0
+    let unlistenProgress: (() => void) | undefined
+    try {
+      unlistenProgress = await listen<{ percent?: number | null }>('update-progress', (e) => {
+        const p = e.payload?.percent
+        if (typeof p === 'number') updatePercent = p
+      })
+      updateVersion = await invoke<string>('update_install')
+      updateState = 'ready'
+    } catch (e) {
+      updateState = 'error'
+      updateError = String(e)
+    } finally {
+      if (unlistenProgress) unlistenProgress()
+    }
+  }
+
+  async function restartApp(): Promise<void> {
+    try {
+      await invoke('restart_app')
+    } catch {
+      // приложение уже перезапускается — обрабатывать нечего
     }
   }
 
@@ -2052,6 +2121,45 @@
                   </label>
                   {#if bgMediaName}
                     <button class="step-btn text-btn" onclick={clearBgMedia}>{t('studioMediaClear')}</button>
+                  {/if}
+                </div>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('updateTitle')}</span>
+                  <span class="label-desc" class:label-err={updateState === 'error'}>
+                    {#if updateState === 'checking'}
+                      {t('updateChecking')}
+                    {:else if updateState === 'upToDate'}
+                      {updateCurrent ? `${t('updateVersion')} ${updateCurrent} — ` : ''}{t('updateUpToDate')}
+                    {:else if updateState === 'available'}
+                      {t('updateAvailable')}: {updateVersion}{updateNotes ? ` — ${updateNotes}` : ''}
+                    {:else if updateState === 'downloading'}
+                      {t('updateDownloading')}… {updatePercent}%
+                    {:else if updateState === 'ready'}
+                      {t('updateReady')}
+                    {:else if updateState === 'error'}
+                      {t('updateError')}: {updateError}
+                    {:else if updateCurrent}
+                      {t('updateVersion')}: {updateCurrent}
+                    {:else}
+                      {t('updateIdle')}
+                    {/if}
+                  </span>
+                </div>
+                <div class="appearance-options">
+                  {#if updateState === 'available'}
+                    <button class="appearance-btn" onclick={() => void installUpdate()}>{t('updateInstallBtn')}</button>
+                  {:else if updateState === 'ready'}
+                    <button class="appearance-btn" onclick={() => void restartApp()}>{t('updateRestartBtn')}</button>
+                  {:else}
+                    <button
+                      class="appearance-btn"
+                      disabled={updateState === 'checking' || updateState === 'downloading'}
+                      onclick={() => void checkUpdate()}
+                    >
+                      {t('updateCheckBtn')}
+                    </button>
                   {/if}
                 </div>
               </div>

@@ -16,6 +16,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
+# Автообновление по схеме DSH Phone: updater читает latest.json из GitHub
+# Releases, подпись minisign обязательна; process — надёжный перезапуск
+# после установки (request_restart идёт через RunEvent::Exit).
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

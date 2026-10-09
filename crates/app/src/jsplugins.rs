@@ -264,7 +264,11 @@ mod tests {
         assert_eq!(tools[0].short, "shout");
         assert_eq!(tools[0].file, "shout.js");
         assert_eq!(tools[0].parameters["type"], "object");
-        assert_eq!(tools[1].parameters, json!({"type": "object"}), "без схемы — заглушка");
+        assert_eq!(
+            tools[1].parameters,
+            json!({"type": "object"}),
+            "без схемы — заглушка"
+        );
         assert_eq!(errors, vec!["broken.js: синтаксис".to_string()]);
     }
 
@@ -309,7 +313,9 @@ swagcod.define({
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn js_host_loads_calls_prefs_and_enforces_deadline() {
-        let Some(node) = crate::mcp::tests_node() else { return };
+        let Some(node) = crate::mcp::tests_node() else {
+            return;
+        };
         if swagcod_core::node_store::sidecar_file("plugin-server.js").is_none() {
             return; // нет sidecar-расклада — честно пропускаем
         }
@@ -322,7 +328,7 @@ swagcod.define({
         std::fs::write(dir.join("hang.js"), HANG_JS).unwrap();
 
         /* База с prefs для моста: файл готовим встроенным стором
-           (sqlite-режим, без sidecar-гонки в тесте). */
+        (sqlite-режим, без sidecar-гонки в тесте). */
         let db = dir.join("prefs.db");
         std::env::set_var("SWAGCOD_STORE", "sqlite");
         {
@@ -330,7 +336,9 @@ swagcod.define({
             store.set_pref("js_pref_probe", "42").unwrap();
         }
 
-        let mut host = JsHost::start(&dir, Some(&db)).await.expect("sidecar поднят");
+        let mut host = JsHost::start(&dir, Some(&db))
+            .await
+            .expect("sidecar поднят");
         // shout + hang загружены, broken — честная ошибка, список жив.
         assert_eq!(host.tools.len(), 2, "{:?}", host.errors);
         assert!(host.tools.iter().any(|t| t.short == "shout"));
@@ -348,13 +356,19 @@ swagcod.define({
 
         // Дедлайн: вечный цикл убит vm, ход не завис.
         std::env::set_var("SWAGCOD_JS_TIMEOUT_MS", "500");
-        let (ok, out) = host.call_plugin("hang", json!({})).await.expect("вызов hang");
+        let (ok, out) = host
+            .call_plugin("hang", json!({}))
+            .await
+            .expect("вызов hang");
         assert!(!ok);
         assert!(out.contains("дедлайн"), "{out}");
         std::env::remove_var("SWAGCOD_JS_TIMEOUT_MS");
 
         // Незнакомый плагин — честная ошибка.
-        let (ok, out) = host.call_plugin("ghost", json!({})).await.expect("вызов ghost");
+        let (ok, out) = host
+            .call_plugin("ghost", json!({}))
+            .await
+            .expect("вызов ghost");
         assert!(!ok);
         assert!(out.contains("нет плагина"), "{out}");
 
@@ -372,7 +386,9 @@ swagcod.define({
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_plugins_dir_is_honest_not_fatal() {
-        let Some(node) = crate::mcp::tests_node() else { return };
+        let Some(node) = crate::mcp::tests_node() else {
+            return;
+        };
         if swagcod_core::node_store::sidecar_file("plugin-server.js").is_none() {
             return;
         }
@@ -380,7 +396,9 @@ swagcod.define({
         let dir = std::env::temp_dir().join(format!("swagcod-jsplug-none-{}", crate::short_id()));
         // Каталог НЕ создаём: загрузка обязана вернуть честную ошибку в
         // errors, а не уронить хост.
-        let host = JsHost::start(&dir, None).await.expect("хост поднят даже без каталога");
+        let host = JsHost::start(&dir, None)
+            .await
+            .expect("хост поднят даже без каталога");
         assert!(host.tools.is_empty());
         assert!(
             host.errors.iter().any(|e| e.contains("не читается")),

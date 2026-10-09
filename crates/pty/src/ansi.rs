@@ -102,7 +102,11 @@ impl AnsiParser {
                         // валидна, пока кусок не разрезал символ; разрезанный
                         // символ уезжает в хвост ниже.
                         let start = i;
-                        while i < data.len() && data[i] != 0x1b && data[i] != 0x07 && data[i] != 0x08 {
+                        while i < data.len()
+                            && data[i] != 0x1b
+                            && data[i] != 0x07
+                            && data[i] != 0x08
+                        {
                             i += 1;
                         }
                         let chunk = &data[start..i];
@@ -212,15 +216,42 @@ fn csi_op(seq: &[u8], final_byte: u8) -> Option<Op> {
 
     match final_byte {
         b'm' => Some(sgr_op(&params)),
-        b'A' => Some(Op::Csi { kind: "cuu".into(), params }),
-        b'B' => Some(Op::Csi { kind: "cud".into(), params }),
-        b'C' => Some(Op::Csi { kind: "cuf".into(), params }),
-        b'D' => Some(Op::Csi { kind: "cub".into(), params }),
-        b'H' | b'f' => Some(Op::Csi { kind: "cup".into(), params }),
-        b'J' => Some(Op::Csi { kind: "ed".into(), params }),
-        b'K' => Some(Op::Csi { kind: "el".into(), params }),
-        b'S' => Some(Op::Csi { kind: "su".into(), params }),
-        b'T' => Some(Op::Csi { kind: "sd".into(), params }),
+        b'A' => Some(Op::Csi {
+            kind: "cuu".into(),
+            params,
+        }),
+        b'B' => Some(Op::Csi {
+            kind: "cud".into(),
+            params,
+        }),
+        b'C' => Some(Op::Csi {
+            kind: "cuf".into(),
+            params,
+        }),
+        b'D' => Some(Op::Csi {
+            kind: "cub".into(),
+            params,
+        }),
+        b'H' | b'f' => Some(Op::Csi {
+            kind: "cup".into(),
+            params,
+        }),
+        b'J' => Some(Op::Csi {
+            kind: "ed".into(),
+            params,
+        }),
+        b'K' => Some(Op::Csi {
+            kind: "el".into(),
+            params,
+        }),
+        b'S' => Some(Op::Csi {
+            kind: "su".into(),
+            params,
+        }),
+        b'T' => Some(Op::Csi {
+            kind: "sd".into(),
+            params,
+        }),
         // Неизвестные CSI молча съедаем: лог-вью не должно ломаться на
         // последовательностях, которых мы ещё не знаем.
         _ => None,
@@ -257,7 +288,13 @@ fn sgr_op(params: &[i64]) -> Op {
     if params.is_empty() {
         reset = true;
     }
-    Op::Sgr { fg, bg, bold, dim, reset }
+    Op::Sgr {
+        fg,
+        bg,
+        bold,
+        dim,
+        reset,
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +312,12 @@ mod tests {
     #[test]
     fn plain_text_is_one_run() {
         let ops = parse(b"hello world\r\n");
-        assert_eq!(ops, vec![Op::Text { s: "hello world\r\n".into() }]);
+        assert_eq!(
+            ops,
+            vec![Op::Text {
+                s: "hello world\r\n".into()
+            }]
+        );
     }
 
     #[test]
@@ -284,9 +326,21 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                Op::Sgr { fg: Some(1), bg: None, bold: None, dim: None, reset: false },
+                Op::Sgr {
+                    fg: Some(1),
+                    bg: None,
+                    bold: None,
+                    dim: None,
+                    reset: false
+                },
                 Op::Text { s: "red".into() },
-                Op::Sgr { fg: None, bg: None, bold: None, dim: None, reset: true },
+                Op::Sgr {
+                    fg: None,
+                    bg: None,
+                    bold: None,
+                    dim: None,
+                    reset: true
+                },
                 Op::Text { s: " plain".into() },
             ]
         );
@@ -302,7 +356,13 @@ mod tests {
         assert_eq!(
             sink.0,
             vec![
-                Op::Sgr { fg: Some(1), bg: None, bold: None, dim: None, reset: false },
+                Op::Sgr {
+                    fg: Some(1),
+                    bg: None,
+                    bold: None,
+                    dim: None,
+                    reset: false
+                },
                 Op::Text { s: "red".into() },
             ]
         );
@@ -333,7 +393,9 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                Op::Osc { payload: "0;SwagCod: bash".into() },
+                Op::Osc {
+                    payload: "0;SwagCod: bash".into()
+                },
                 Op::Text { s: "after".into() },
             ]
         );
@@ -342,8 +404,20 @@ mod tests {
     #[test]
     fn cursor_and_erase_csi_carry_params() {
         let ops = parse(b"\x1b[2J\x1b[12;4H");
-        assert_eq!(ops[0], Op::Csi { kind: "ed".into(), params: vec![2] });
-        assert_eq!(ops[1], Op::Csi { kind: "cup".into(), params: vec![12, 4] });
+        assert_eq!(
+            ops[0],
+            Op::Csi {
+                kind: "ed".into(),
+                params: vec![2]
+            }
+        );
+        assert_eq!(
+            ops[1],
+            Op::Csi {
+                kind: "cup".into(),
+                params: vec![12, 4]
+            }
+        );
     }
 
     #[test]
@@ -360,7 +434,13 @@ mod tests {
         let ops = parse(b"\x1b[1;2m x");
         assert_eq!(
             ops[0],
-            Op::Sgr { fg: None, bg: None, bold: Some(true), dim: Some(true), reset: false }
+            Op::Sgr {
+                fg: None,
+                bg: None,
+                bold: Some(true),
+                dim: Some(true),
+                reset: false
+            }
         );
     }
 }

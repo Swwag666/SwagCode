@@ -96,8 +96,8 @@ impl NodeStore {
             child: Mutex::new(child),
         };
         /* Запросы буферизуются пайпом: писать можно до полной готовности
-           сервера — readline разберёт строки, когда поднимется. ping +
-           open дают и readiness-гарантию, и инициализацию схемы. */
+        сервера — readline разберёт строки, когда поднимется. ping +
+        open дают и readiness-гарантию, и инициализацию схемы. */
         store.rpc(json!({"method": "ping"}))?;
         store.rpc(json!({"method": "open", "path": path.to_string_lossy()}))?;
         Ok(store)
@@ -117,12 +117,17 @@ impl NodeStore {
         let mut line = String::new();
         let n = io.stdout.read_line(&mut line)?;
         if n == 0 {
-            return Err(StoreError::Sidecar("sidecar закрыл канал (процесс умер?)".into()));
+            return Err(StoreError::Sidecar(
+                "sidecar закрыл канал (процесс умер?)".into(),
+            ));
         }
         let resp: Value = serde_json::from_str(line.trim())?;
         if resp["ok"] != json!(true) {
             return Err(StoreError::Sidecar(
-                resp["error"].as_str().unwrap_or("неизвестная ошибка").to_string(),
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("неизвестная ошибка")
+                    .to_string(),
             ));
         }
         Ok(resp)
@@ -343,10 +348,15 @@ impl Store for NodeStore {
         Ok(Some(ses))
     }
 
-    fn save_turn(&self, session_id: &str, turn: &TurnRecord, history: &[ChatMessage]) -> StoreResult<()> {
+    fn save_turn(
+        &self,
+        session_id: &str,
+        turn: &TurnRecord,
+        history: &[ChatMessage],
+    ) -> StoreResult<()> {
         let tools_json = serde_json::to_string(&turn.tool_calls)?;
         /* Ход и снимок истории — одна транзакция (batch на сервере):
-           оборванный процесс не оставляет полупустой ход. */
+        оборванный процесс не оставляет полупустой ход. */
         let mut steps = Vec::with_capacity(2 + history.len());
         steps.push(json!({
             "sql": "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id)
@@ -428,12 +438,18 @@ impl Store for NodeStore {
         Ok(())
     }
 
-    fn approval_log(&self, session_id: Option<&str>, limit: usize) -> StoreResult<Vec<ApprovalEntry>> {
+    fn approval_log(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<ApprovalEntry>> {
         let limit = limit.clamp(1, 5000) as i64;
         let select = "SELECT session_id, turn_id, call_id, tool, summary, decision, actor, decided_ms FROM approvals";
         let rows = match session_id {
             Some(sid) => self.query(
-                &format!("{select} WHERE session_id = ?1 ORDER BY decided_ms DESC, id DESC LIMIT ?2"),
+                &format!(
+                    "{select} WHERE session_id = ?1 ORDER BY decided_ms DESC, id DESC LIMIT ?2"
+                ),
                 vec![json!(sid), json!(limit)],
             )?,
             None => self.query(
@@ -497,7 +513,10 @@ impl Store for NodeStore {
     }
 
     fn task_get(&self, id: &str) -> StoreResult<Option<crate::tasks::Task>> {
-        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", crate::store::TASK_COLS);
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE id = ?1",
+            crate::store::TASK_COLS
+        );
         let rows = self.query(&sql, vec![json!(id)])?;
         Ok(rows.into_iter().next().map(|r| task_from_values(&r)))
     }
@@ -567,7 +586,12 @@ impl Store for NodeStore {
         Ok(())
     }
 
-    fn metrics_query(&self, name: &str, since_ms: u64, limit: usize) -> StoreResult<Vec<(u64, f64)>> {
+    fn metrics_query(
+        &self,
+        name: &str,
+        since_ms: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, f64)>> {
         let limit = limit.clamp(1, 10_000) as i64;
         let rows = self.query(
             "SELECT ts_ms, value FROM metrics WHERE name = ?1 AND ts_ms >= ?2 ORDER BY ts_ms LIMIT ?3",
@@ -586,10 +610,7 @@ impl Store for NodeStore {
 
     fn metrics_prune(&self, before_ms: u64) -> StoreResult<()> {
         let before = before_ms.min(i64::MAX as u64) as i64;
-        self.exec(
-            "DELETE FROM metrics WHERE ts_ms < ?1",
-            vec![json!(before)],
-        )?;
+        self.exec("DELETE FROM metrics WHERE ts_ms < ?1", vec![json!(before)])?;
         Ok(())
     }
 
@@ -611,6 +632,17 @@ impl Store for NodeStore {
                 )
             })
             .collect())
+    }
+
+    fn shutdown(&mut self) {
+        // То же, что Drop: вежливый rpc, затем kill страховки ради.
+        // Вызывается перед установкой обновления: работающий node.exe
+        // заблокирован на запись, NSIS не смог бы его заменить.
+        let _ = self.rpc(json!({"method": "shutdown"}));
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -740,7 +772,10 @@ mod tests {
 
         let loaded = store.load_session("s-1").unwrap().expect("сессия есть");
         assert_eq!(loaded.title, "проба");
-        assert_eq!(loaded.approval_policy, Some(crate::turn::ApprovalPolicy::Never));
+        assert_eq!(
+            loaded.approval_policy,
+            Some(crate::turn::ApprovalPolicy::Never)
+        );
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.turns[0].content, "ответ 1");
         assert!(loaded.turns[0].ok);
@@ -749,7 +784,7 @@ mod tests {
         assert_eq!(loaded.history, ses.history);
 
         /* E-6: дочерний ход суб-агента — parent_turn_id переживает
-           roundtrip через sidecar (паритет с rusqlite-бэкендом). */
+        roundtrip через sidecar (паритет с rusqlite-бэкендом). */
         let mut child = sample_turn(2);
         child.id = crate::session::TurnId::new("t-1-sub-abc");
         child.parent_turn_id = Some(crate::session::TurnId::new("t-1"));
@@ -805,7 +840,10 @@ mod tests {
             store.metrics_query("bus_seq", 0, 100).unwrap(),
             vec![(60_000, 43.0)]
         );
-        assert_eq!(store.metrics_query("sessions", 0, 100).unwrap(), vec![(60_000, 1.0)]);
+        assert_eq!(
+            store.metrics_query("sessions", 0, 100).unwrap(),
+            vec![(60_000, 1.0)]
+        );
 
         assert_eq!(
             store.tokens_by_day(0).unwrap(),

@@ -49,10 +49,12 @@ impl FileIndex {
                 Err(_) => continue,
             };
             // Служебные каталоги не индексируем даже без .gitignore.
-            if rel
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some(".git") | Some("node_modules") | Some("target")))
-            {
+            if rel.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some(".git") | Some("node_modules") | Some("target")
+                )
+            }) {
                 continue;
             }
             let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -62,7 +64,10 @@ impl FileIndex {
             }
         }
         files.sort_unstable();
-        Ok(Self { root: root.to_path_buf(), files })
+        Ok(Self {
+            root: root.to_path_buf(),
+            files,
+        })
     }
 
     /// Fuzzy-поиск: топ `limit` путей по убыванию очка nucleo.
@@ -87,7 +92,11 @@ impl FileIndex {
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.into_iter().take(limit).map(|(_, f)| f.clone()).collect()
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, f)| f.clone())
+            .collect()
     }
 }
 
@@ -152,7 +161,10 @@ mod tests {
         let hits = idx.search("term", 10);
         assert_eq!(hits[0], "src/components/Terminal.svelte");
         let hits = idx.search("slist", 10);
-        assert!(hits.iter().any(|h| h.contains("SessionList")), "fuzzy должен найти {hits:?}");
+        assert!(
+            hits.iter().any(|h| h.contains("SessionList")),
+            "fuzzy должен найти {hits:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -21,6 +21,10 @@ apps/desktop/build/
 # воспроизводится скриптами tools/fetch-node.ps1 + tools/bundle-sidecar.ps1.
 vendor/
 
+# Релизные артефакты (rev37): setup.exe, .sig, latest.json. Собираются
+# tools/build-release.ps1 и уезжают в GitHub Releases, не в репозиторий.
+releases/
+
 # Tauri
 crates/app/gen/schemas/
 

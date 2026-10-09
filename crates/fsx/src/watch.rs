@@ -33,7 +33,10 @@ pub fn watch(root: &Path, out: Sender<Vec<PathBuf>>) -> Result<WatchHandle, FsxE
     if !root.is_dir() {
         return Err(FsxError::NotFound(root.to_path_buf()));
     }
-    let (tx, rx): (Sender<notify::Result<Event>>, Receiver<notify::Result<Event>>) = channel();
+    let (tx, rx): (
+        Sender<notify::Result<Event>>,
+        Receiver<notify::Result<Event>>,
+    ) = channel();
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;

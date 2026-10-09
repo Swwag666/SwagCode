@@ -57,7 +57,12 @@ fn queued_state() -> String {
 
 impl Task {
     /// Разовая задача, готовая к немедленному старту (next_try = now).
-    pub fn new(id: impl Into<String>, kind: impl Into<String>, payload: Value, now_ms: u64) -> Task {
+    pub fn new(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        payload: Value,
+        now_ms: u64,
+    ) -> Task {
         Task {
             id: id.into(),
             kind: kind.into(),
@@ -188,18 +193,23 @@ mod tests {
         let st = SqliteStore::in_memory().expect("in-memory база");
         let t = Task::new("c", "git_fetch", json!({}), 0);
         st.task_enqueue(&t).unwrap();
-        st.task_update("c", TASK_CANCELLED, "отменена", 0, 0).unwrap();
+        st.task_update("c", TASK_CANCELLED, "отменена", 0, 0)
+            .unwrap();
         // Повторный сид не воскрешает отменённую задачу (INSERT OR IGNORE).
         st.task_enqueue(&t).unwrap();
         assert_eq!(st.task_get("c").unwrap().unwrap().state, TASK_CANCELLED);
 
         let p = Task::periodic("p", "semantic_reindex", json!({}), 86_400_000, 0);
         st.task_enqueue(&p).unwrap();
-        assert_eq!(st.task_get("p").unwrap().unwrap().every_ms, Some(86_400_000));
+        assert_eq!(
+            st.task_get("p").unwrap().unwrap().every_ms,
+            Some(86_400_000)
+        );
         let due = st.task_claim_due(86_400_000).unwrap();
         assert_eq!(due.len(), 1);
         // Перевооружение после успеха: снова queued со следующим сроком.
-        st.task_update("p", TASK_QUEUED, "ok", 0, 200_000_000).unwrap();
+        st.task_update("p", TASK_QUEUED, "ok", 0, 200_000_000)
+            .unwrap();
         let p2 = st.task_get("p").unwrap().unwrap();
         assert_eq!(p2.state, TASK_QUEUED);
         assert_eq!(p2.next_try_ms, 200_000_000);
@@ -211,8 +221,13 @@ mod tests {
     fn store_tasks_list_respects_limit_and_order() {
         let st = SqliteStore::in_memory().expect("in-memory база");
         for i in 0..5 {
-            st.task_enqueue(&Task::new(format!("t{i}"), "git_fetch", json!({}), i * 1000))
-                .unwrap();
+            st.task_enqueue(&Task::new(
+                format!("t{i}"),
+                "git_fetch",
+                json!({}),
+                i * 1000,
+            ))
+            .unwrap();
         }
         let all = st.tasks_list(3).unwrap();
         assert_eq!(all.len(), 3);

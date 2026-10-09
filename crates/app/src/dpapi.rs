@@ -14,9 +14,7 @@ keyring — отдельная задача, в план B-7 не входит.
 #[cfg(windows)]
 pub fn protect_hex(plain: &str) -> Result<String, String> {
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN,
-    };
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN};
 
     let data = plain.as_bytes();
     let in_blob = windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB {
