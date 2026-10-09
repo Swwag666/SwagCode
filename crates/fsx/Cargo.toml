@@ -24,4 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 scraper = "0.20"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# F-4: сквозные тесты web_search поднимают mock-сервер на TcpListener,
+# поэтому net/time/io-util явно (reqwest их и так тянет, но тест не должен
+# зависеть от чужих фич).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }

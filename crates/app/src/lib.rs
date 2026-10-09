@@ -2197,6 +2197,7 @@ pub const SUBAGENT_SAFE_TOOLS: &[&str] = &[
     "grep",
     "glob",
     "fetch_url",
+    "web_search",
     "semantic_search",
 ];
 
@@ -2315,7 +2316,7 @@ async fn run_subagent(
     let system = ChatMessage {
         role: Role::System,
         content: "Ты — суб-агент внутри SwagCod: решаешь одну самодостаточную исследовательскую задачу. \
-                  У тебя только read-only инструменты (read, list, grep, glob, fetch_url, semantic_search). \
+                  У тебя только read-only инструменты (read, list, grep, glob, fetch_url, web_search, semantic_search). \
                   Ты не можешь изменять файлы, выполнять команды и плодить собственных суб-агентов. \
                   Когда задача решена — ответь итоговым отчётом обычным текстом, без вызовов инструментов."
             .into(),
@@ -2748,6 +2749,35 @@ async fn execute_tool(
                     Err(e) => fail(format!("patch write: {e}")),
                 },
                 Err(e) => fail(format!("patch: {e}")),
+            }
+        }
+        /* F-4: веб-поиск. Движок выдачи — env `SWAGCOD_SEARCH_URL`
+        (SearXNG с format=json), иначе DuckDuckGo HTML без ключа. Таймаут
+        короче общего: чужой поиск не должен держать ход дольше 10 с. */
+        "web_search" => {
+            let query = arg_str(call, "query");
+            if query.trim().is_empty() {
+                return fail("web_search: пустой query".into());
+            }
+            let max = call
+                .arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(swagcod_fsx::search::DEFAULT_RESULTS as u64)
+                as usize;
+            let endpoint = std::env::var("SWAGCOD_SEARCH_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let search_timeout = timeout.min(std::time::Duration::from_secs(10));
+            match swagcod_fsx::search::web_search(&query, max, endpoint.as_deref(), search_timeout)
+                .await
+            {
+                Ok(hits) => ToolOutcome {
+                    ok: true,
+                    output: swagcod_fsx::search::format_results(&query, &hits),
+                },
+                // Ошибка fsx уже содержит имя инструмента — не удваиваем.
+                Err(e) => fail(e.to_string()),
             }
         }
         "fetch_url" => {
@@ -4952,6 +4982,89 @@ mod tests {
         .await;
         assert!(!out.ok);
         assert!(out.output.contains("http"), "{out:?}");
+    }
+
+    /* F-4: web_search — диспетчеризация инструмента, env-эндпоинт и
+    честная ошибка на не-http. Env-переменная одна на процесс, поэтому
+    обе проверки в одном тесте: параллельные set_var дали бы гонку. */
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_tool_web_search_uses_env_endpoint_and_formats_hits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let out = execute_tool(
+            &call("web_search", serde_json::json!({"query": "  "})),
+            std::path::Path::new("."),
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(!out.ok, "пустой query — ошибка, а не пустая выдача");
+        assert!(out.output.contains("query"), "{out:?}");
+
+        // Не-http эндпоинт отклоняется до выхода в сеть.
+        std::env::set_var("SWAGCOD_SEARCH_URL", "file:///tmp/search");
+        let bad = execute_tool(
+            &call("web_search", serde_json::json!({"query": "x"})),
+            std::path::Path::new("."),
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(!bad.ok, "{bad:?}");
+        assert!(bad.output.contains("http(s)"), "{bad:?}");
+
+        // Живой mock-движок (SearXNG-вкус): JSON → пронумерованный список.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf))
+                        .await;
+                let body = r#"{"results":[
+                    {"title":"Rust async book","url":"https://example.org/async","content":"how async works"},
+                    {"title":"Tokio","url":"https://tokio.rs","content":"runtime"}
+                ]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        std::env::set_var(
+            "SWAGCOD_SEARCH_URL",
+            format!("http://127.0.0.1:{port}/search"),
+        );
+        let out = execute_tool(
+            &call(
+                "web_search",
+                serde_json::json!({"query": "rust async", "max_results": 5}),
+            ),
+            std::path::Path::new("."),
+            std::time::Duration::from_secs(10),
+            &[],
+        )
+        .await;
+        std::env::remove_var("SWAGCOD_SEARCH_URL");
+
+        assert!(out.ok, "{out:?}");
+        assert!(
+            out.output.contains("[web_search: «rust async» — 2 рез.]"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("1. Rust async book"), "{}", out.output);
+        assert!(
+            out.output.contains("https://example.org/async"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("how async works"), "{}", out.output);
     }
 
     #[tokio::test]

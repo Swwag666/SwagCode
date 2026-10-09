@@ -66,6 +66,8 @@ impl ApprovalPolicy {
     /// E-2: `semantic_search` — встроенный и read-only, в опасные не входит.
     /// E-6: `subagent` — встроенный: внутри суб-агента только read-only
     /// инструменты, опасных операций ветка не выполняет.
+    /// F-4: `web_search` — встроенный и read-only (сеть на чтение, как
+    /// `fetch_url`), поэтому тоже вне опасных.
     pub const BUILTIN: &'static [&'static str] = &[
         "read",
         "list",
@@ -76,6 +78,7 @@ impl ApprovalPolicy {
         "glob",
         "patch",
         "fetch_url",
+        "web_search",
         "semantic_search",
         "subagent",
     ];
@@ -604,6 +607,21 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url"]
             }),
         },
+        /* F-4: веб-поиск. Read-only (ничего в системе не меняет), поэтому
+           вне списка опасных; движок выдачи — env SWAGCOD_SEARCH_URL
+           (SearXNG) либо DuckDuckGo HTML без ключа. */
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web for current information. Provide a single search query; optionally cap the number of results (1..8, default 5). Returns a numbered list of title, URL and snippet — cite the URLs you actually used. Follow up with fetch_url to read a specific result in full. An empty result set is reported as an error, not as \"nothing exists\".".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "max_results": { "type": "integer", "description": "Max results 1..8, default 5" }
+                },
+                "required": ["query"]
+            }),
+        },
         /* E-2: семантический поиск по кодовой базе. Read-only, поэтому вне
            списка опасных; индекс строится фоном при старте хода. */
         ToolSpec {
@@ -624,7 +642,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
            траектории сессии. Не рекурсивен: суб-агент не плодит своих. */
         ToolSpec {
             name: "subagent".into(),
-            description: "Run an isolated sub-agent for a self-contained research or analysis task. The sub-agent gets a fresh context (optionally seeded with the session summary), read-only tools only (read, list, grep, glob, fetch_url, semantic_search), its own token budget and round cap. Its full run is recorded as a child turn of the current turn, and its final report is returned here. Use for focused independent investigation that should not pollute the main context. It cannot modify files or spawn sub-agents of its own. Pass a cheaper model (e.g. a flash/mini one from the active provider) for bulk research; omit model to reuse the parent turn's model.".into(),
+            description: "Run an isolated sub-agent for a self-contained research or analysis task. The sub-agent gets a fresh context (optionally seeded with the session summary), read-only tools only (read, list, grep, glob, fetch_url, web_search, semantic_search), its own token budget and round cap. Its full run is recorded as a child turn of the current turn, and its final report is returned here. Use for focused independent investigation that should not pollute the main context. It cannot modify files or spawn sub-agents of its own. Pass a cheaper model (e.g. a flash/mini one from the active provider) for bulk research; omit model to reuse the parent turn's model.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -745,6 +763,29 @@ mod tests {
             .find(|s| s.name == "semantic_search")
             .unwrap();
         assert_eq!(spec.parameters["required"][0], "query");
+    }
+
+    /// F-4: web_search — встроенный read-only (сеть на чтение, как
+    /// fetch_url): подтверждения при OnDangerous не требует, в спеках
+    /// модели присутствует, `query` обязателен, `max_results` нет.
+    #[test]
+    fn web_search_is_builtin_and_safe() {
+        assert!(!ApprovalPolicy::OnDangerous.requires_approval("web_search"));
+        assert!(!ApprovalPolicy::OnDangerous.requires_approval("WEB_SEARCH"));
+        let spec = builtin_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "web_search")
+            .expect("web_search есть в спеках модели");
+        assert_eq!(spec.parameters["required"][0], "query");
+        let props = spec.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("max_results"));
+        assert!(!spec.parameters["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "max_results"));
+        // Описание честно предупреждает: пустая выдача — ошибка, а не «нет».
+        assert!(spec.description.contains("error"), "{}", spec.description);
     }
 
     #[test]

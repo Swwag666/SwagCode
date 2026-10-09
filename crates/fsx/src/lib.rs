@@ -6,6 +6,7 @@ nucleo-fuzzy-поиск (модуль `index`), watch с debounce 200 мс (мо
 */
 
 pub mod index;
+pub mod search;
 pub mod tools;
 pub mod watch;
 
