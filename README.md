@@ -9,10 +9,10 @@ MCP-серверы, JS-плагины, суб-агенты, семантичес
 loopback REST API и дашборд телеметрии — в нативном окне с холодным стартом **68 мс**.
 
 [![CI](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml/badge.svg)](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml)
-![tests](https://img.shields.io/badge/tests-344%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-368%20green-brightgreen)
 ![clippy](https://img.shields.io/badge/clippy-0%20warnings-blue)
 ![svelte--check](https://img.shields.io/badge/svelte--check-0%2F0-blueviolet)
-![version](https://img.shields.io/badge/version-0.1.0%20(rev%2035)-orange)
+![version](https://img.shields.io/badge/version-0.1.0%20(rev%2036)-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -24,15 +24,16 @@ loopback REST API и дашборд телеметрии — в нативном
 | | |
 |---|---|
 | 💬 **Живой стрим** | Инкрементальный markdown с подсветкой, reasoning-поток, курсор стрима, токены и ток/с, очередь реплик, стоп-кнопка |
+| 🔀 **Провайдеры** | 12 пресетов (OpenAI, Anthropic, Kimi, DeepSeek, OpenRouter, Zen, Gemini, Groq, Mistral, xAI, Ollama, LM Studio) + custom со своим endpoint; нативный клиент Anthropic `/v1/messages`; ключи под DPAPI, наружу только `has_key`; Fetch models с превью и явным сохранением |
 | 🛠 **Инструменты** | Файлы (read/write/edit), поиск (grep/glob), bash/pwsh через песочницу, fetch_url — всё с журналированием и подтверждениями |
 | 🔌 **MCP** | Внешние инструменты по Model Context Protocol (stdio): реестр серверов, статусы, общий список тулов с встроенными |
 | 🧩 **JS-плагины** | `plugins/*.js` в изолированном vm-контексте sidecar'а: дедлайн, read-only prefs, `swagcod.define({name, handler})` |
-| 🤖 **Суб-агенты** | Инструмент `subagent` — изолированная ветка хода: только безопасные тулы, бюджет токенов и раундов, отчёт родителю, дерево ходов в UI |
+| 🤖 **Суб-агенты** | Инструмент `subagent` — изолированная ветка хода: только безопасные тулы, своя дешёвая модель (аргумент `model`), бюджет токенов и раундов, отчёт родителю, дерево ходов в UI |
 | 🔎 **Семантический поиск** | Embeddings-индекс воркспейса (облако или локальный лексический фолбэк), кэш в отдельной базе, периодическая переиндексация |
 | 📋 **Фоновые задачи** | Очередь в SQLite, воркер с экспоненциальным backoff (30 с → 30 мин, до 5 попыток), периодические задачи, восстановление сирот после краша |
 | 🌐 **HTTP API** | Loopback REST + SSE рядом с шиной: те же команды, что IPC. Bearer-токен под DPAPI, по умолчанию выключен |
 | 📈 **Телеметрия** | Таблица `metrics`, сэмпл раз в минуту, латентность провайдера на первый токен стрима; дашборд: токены/день, латентность, лаги шины |
-| 📥 **Импорт из DSH** | Перенос истории DSH Desktop (`session.v3.jsonl.zstd`) — идемпотентно, фоново, с ручным триггером в настройках |
+| 📥 **Импорт из DSH** | Перенос истории DSH Desktop (`session.v3.jsonl.zstd`) — идемпотентно, отдельным соединением, догрузка оборванных сессий, конфиги MCP/плагинов; запуск кнопкой в настройках |
 | 🖥 **Терминал** | Настоящий PTY с ANSI-парсером и кольцевым буфером |
 | 🔐 **Безопасность** | API-ключ под DPAPI Windows, политики подтверждений (глобальная + per-session), журнал одобрений, песочница путей fsx |
 | 🎨 **Внешность** | 4 темы, студия (свой акцент, тонировка, медиафон gif/mp4/webm), масштаб окна 60–200%, свои штриховые SVG-иконки — эмодзи в UI нет |
@@ -105,7 +106,7 @@ cargo build --release -p swagcod-app --features tauri/custom-protocol
 > и покажет ERR_CONNECTION_REFUSED — грабля Tauri v2 (DECISIONS.md §7).
 
 ```powershell
-cargo test --workspace                       # 264 Rust-теста
+cargo test --workspace                       # 288 Rust-тестов
 pnpm --filter swagcod-desktop test           # 80 TS-тестов
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -134,15 +135,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Бюджеты — числа, не ощущения
 
 Прогон `tools/bench-startup.ps1` против свежего release-бинарника (i5-10400F / 16 ГБ,
-Windows, ревизия 35); закоммичено в `bench-out/startup.json`:
+Windows, ревизия 36); закоммичено в `bench-out/startup.json`:
 
 | Метрика | Цель | Факт |
 |---|---|---|
-| Холодный старт до окна | < 400 мс | **68.2 мс** медиана |
+| Холодный старт до окна | < 400 мс | **69.2 мс** медиана |
 | Private bytes нашего процесса | < 40 МБ | **12.2 МБ** |
 | Private bytes всей семьи | < 200 МБ | вне бюджета: семья WebView2, справочно (D-013) |
-| JS-бандл | < 340 000 Б | **338 043 Б** |
-| Тесты | все зелёные | **344** (264 Rust + 80 TS) |
+| JS-бандл | < 356 000 Б | **347 664 Б** |
+| Тесты | все зелёные | **368** (288 Rust + 80 TS) |
 | Clippy · svelte-check | 0 · 0/0 | ✅ |
 
 Таблица переписывается только реальным прогоном: числа в README без строки

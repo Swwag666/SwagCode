@@ -115,11 +115,15 @@ jobs:
       # charts.ts и таблица фоновых задач, отложенная с E-5) и строка
       # HTTP API (E-7) в «Безопасности». Библиотек графиков нет —
       # полилинии и бары строятся вручную (см. DECISIONS.md D-124).
+      # Ревизия 36: порог поднят 340000 → 356000, только наш код —
+      # вкладка «Провайдеры» (PR #1: 12 пресетов, custom-провайдер,
+      # Fetch models, ключи под DPAPI). Новых зависимостей во
+      # фронтенде нет (см. DECISIONS.md D-124).
       - name: bundle size budget
         shell: bash
         run: |
           set -e
-          LIMIT=340000
+          LIMIT=356000
           TOTAL=0
           for f in apps/desktop/dist/assets/*.js; do
             SIZE=$(stat -c%s "$f")
