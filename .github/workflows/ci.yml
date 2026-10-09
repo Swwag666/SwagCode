@@ -119,11 +119,14 @@ jobs:
       # вкладка «Провайдеры» (PR #1: 12 пресетов, custom-провайдер,
       # Fetch models, ключи под DPAPI). Новых зависимостей во
       # фронтенде нет (см. DECISIONS.md D-124).
+      # Ревизия 39: порог поднят 356000 → 362000 — палитра команд v2
+      # (F-2: 25 slash-команд, группы, скоринг, локализация) добавила
+      # ~5 КБ. Внешних библиотек по-прежнему нет (D-124).
       - name: bundle size budget
         shell: bash
         run: |
           set -e
-          LIMIT=356000
+          LIMIT=362000
           TOTAL=0
           for f in apps/desktop/dist/assets/*.js; do
             SIZE=$(stat -c%s "$f")

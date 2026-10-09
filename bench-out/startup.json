@@ -1,19 +1,19 @@
 ﻿{
-    "timestamp":  "2026-10-09T20:15:31.2032773+03:00",
+    "timestamp":  "2026-10-09T20:43:55.8804110+03:00",
     "machine":  "Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz",
     "ramGb":  15.9,
     "summary":  {
                     "exe":  "swagcod-app.exe",
-                    "exeSizeMb":  12.82,
+                    "exeSizeMb":  12.83,
                     "runs":  3,
                     "settleSeconds":  8,
-                    "startupMsMedian":  111.7,
-                    "startupMsBest":  97.3,
-                    "startupMsWorst":  903.7,
-                    "rssMbMedian":  621.6,
-                    "rssMbMax":  636.9,
-                    "ourPrivateMbMedian":  11.8,
-                    "famPrivateMbMedian":  468.1,
+                    "startupMsMedian":  89,
+                    "startupMsBest":  67.7,
+                    "startupMsWorst":  360.6,
+                    "rssMbMedian":  620.4,
+                    "rssMbMax":  632.8,
+                    "ourPrivateMbMedian":  11.9,
+                    "famPrivateMbMedian":  468.4,
                     "processesMax":  11,
                     "budgetStartupMs":  400,
                     "budgetRssMb":  150,
@@ -27,26 +27,26 @@
     "runs":  [
                  {
                      "run":  1,
-                     "startupMs":  903.7,
-                     "rssMb":  615.7,
-                     "ourPrivateMb":  12.9,
-                     "famPrivateMb":  425.5,
+                     "startupMs":  360.6,
+                     "rssMb":  590.4,
+                     "ourPrivateMb":  12.8,
+                     "famPrivateMb":  432.4,
                      "processes":  11
                  },
                  {
                      "run":  2,
-                     "startupMs":  111.7,
-                     "rssMb":  636.9,
-                     "ourPrivateMb":  11.8,
-                     "famPrivateMb":  471.6,
+                     "startupMs":  89,
+                     "rssMb":  620.4,
+                     "ourPrivateMb":  11.9,
+                     "famPrivateMb":  468.4,
                      "processes":  11
                  },
                  {
                      "run":  3,
-                     "startupMs":  97.3,
-                     "rssMb":  621.6,
+                     "startupMs":  67.7,
+                     "rssMb":  632.8,
                      "ourPrivateMb":  11.8,
-                     "famPrivateMb":  468.1,
+                     "famPrivateMb":  469.3,
                      "processes":  11
                  }
              ]

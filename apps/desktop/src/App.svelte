@@ -901,41 +901,77 @@
   let paletteQuery = $state('')
   let paletteIdx = $state(0)
 
-  interface Command {
-    label: string
+  interface PaletteCommand {
+    slash: string
+    group: StrKey
+    desc: StrKey
     action: () => void
   }
 
-  const commands: Command[] = [
-    { label: 'Новая сессия', action: () => createNewSession() },
-    { label: 'Очистить транскрипцию', action: () => { transcriptFor(currentSession ?? '').clear(); items = transcriptFor(currentSession ?? '').items; revision++; eventsTotal = 0; batchesTotal = 0 } },
-    { label: 'Экспорт в markdown', action: () => exportTranscript() },
-    { label: 'Экспорт диагностики', action: () => exportDiagnostics() },
-    { label: 'Выбрать модель (Ctrl+M)', action: () => { showPermPicker = false; showModelPicker = true; modelQuery = '' } },
-    { label: 'Права: спрашивать всегда', action: () => { void selectPermission('always') } },
-    { label: 'Права: только опасные', action: () => { void selectPermission('on_dangerous') } },
-    { label: 'Права: никогда не спрашивать', action: () => { void selectPermission('never') } },
-    { label: 'Тема: тёмная', action: () => (appearance = 'dark') },
-    { label: 'Тема: светлая', action: () => (appearance = 'light') },
-    { label: 'Тема: контрастная', action: () => (appearance = 'contrast') },
-    { label: 'Тема: системная', action: () => (appearance = 'system') },
-    { label: 'Масштаб: увеличить (Ctrl++)', action: zoomIn },
-    { label: 'Масштаб: уменьшить (Ctrl+-)', action: zoomOut },
-    { label: 'Масштаб: сбросить (Ctrl+0)', action: zoomReset },
-    { label: 'Панель: свернуть/развернуть (Ctrl+B)', action: () => (sidebarCollapsed = !sidebarCollapsed) },
-    { label: 'Переключить эффекты', action: () => (effectsEnabled = !effectsEnabled) },
-    { label: 'Фон: matrix rain', action: () => (bgMode = 'matrix') },
-    { label: 'Фон: wireframe sphere', action: () => (bgMode = 'sphere') },
-    { label: 'Симуляция 50 токенов', action: () => simulateStream(50) },
-    { label: 'Симуляция 2k токенов', action: () => simulateStream(2000) },
-    { label: 'Симуляция 20k токенов', action: () => simulateStream(20000) },
+  /* F-2: палитра уровня DSH-референса — slash-имя, группа, описание.
+     Имена команд языконейтральны, описания локализованы. */
+  const commands: PaletteCommand[] = [
+    { slash: '/new', group: 'palGroupSession', desc: 'cmdNewDesc', action: () => createNewSession() },
+    { slash: '/clear', group: 'palGroupSession', desc: 'cmdClearDesc', action: () => { transcriptFor(currentSession ?? '').clear(); items = transcriptFor(currentSession ?? '').items; revision++; eventsTotal = 0; batchesTotal = 0 } },
+    { slash: '/compact', group: 'palGroupSession', desc: 'cmdCompactDesc', action: () => void compactNow() },
+    { slash: '/export', group: 'palGroupExport', desc: 'cmdExportDesc', action: () => exportTranscript() },
+    { slash: '/diag', group: 'palGroupExport', desc: 'cmdDiagDesc', action: () => exportDiagnostics() },
+    { slash: '/model', group: 'palGroupAgent', desc: 'cmdModelDesc', action: () => { showPermPicker = false; showModelPicker = true; modelQuery = '' } },
+    { slash: '/perm:always', group: 'palGroupAgent', desc: 'cmdPermAlwaysDesc', action: () => { void selectPermission('always') } },
+    { slash: '/perm:dangerous', group: 'palGroupAgent', desc: 'cmdPermDangerousDesc', action: () => { void selectPermission('on_dangerous') } },
+    { slash: '/perm:never', group: 'palGroupAgent', desc: 'cmdPermNeverDesc', action: () => { void selectPermission('never') } },
+    { slash: '/update', group: 'palGroupAgent', desc: 'cmdUpdateDesc', action: () => { showSettings = true; settingsTab = 'general'; void checkUpdate() } },
+    { slash: '/tasks', group: 'palGroupAgent', desc: 'cmdTasksDesc', action: () => { showSettings = true; settingsTab = 'telemetry'; void refreshTelemetry() } },
+    { slash: '/theme:dark', group: 'palGroupView', desc: 'cmdThemeDarkDesc', action: () => (appearance = 'dark') },
+    { slash: '/theme:light', group: 'palGroupView', desc: 'cmdThemeLightDesc', action: () => (appearance = 'light') },
+    { slash: '/theme:contrast', group: 'palGroupView', desc: 'cmdThemeContrastDesc', action: () => (appearance = 'contrast') },
+    { slash: '/theme:system', group: 'palGroupView', desc: 'cmdThemeSystemDesc', action: () => (appearance = 'system') },
+    { slash: '/zoom:in', group: 'palGroupView', desc: 'cmdZoomInDesc', action: zoomIn },
+    { slash: '/zoom:out', group: 'palGroupView', desc: 'cmdZoomOutDesc', action: zoomOut },
+    { slash: '/zoom:reset', group: 'palGroupView', desc: 'cmdZoomResetDesc', action: zoomReset },
+    { slash: '/sidebar', group: 'palGroupView', desc: 'cmdSidebarDesc', action: () => (sidebarCollapsed = !sidebarCollapsed) },
+    { slash: '/fx', group: 'palGroupView', desc: 'cmdFxDesc', action: () => (effectsEnabled = !effectsEnabled) },
+    { slash: '/bg:matrix', group: 'palGroupView', desc: 'cmdBgMatrixDesc', action: () => (bgMode = 'matrix') },
+    { slash: '/bg:sphere', group: 'palGroupView', desc: 'cmdBgSphereDesc', action: () => (bgMode = 'sphere') },
+    { slash: '/sim:50', group: 'palGroupDev', desc: 'cmdSim50Desc', action: () => simulateStream(50) },
+    { slash: '/sim:2k', group: 'palGroupDev', desc: 'cmdSim2kDesc', action: () => simulateStream(2000) },
+    { slash: '/sim:20k', group: 'palGroupDev', desc: 'cmdSim20kDesc', action: () => simulateStream(20000) },
   ]
 
-  const filteredCommands = $derived(
-    paletteQuery.trim()
-      ? commands.filter((c) => c.label.toLowerCase().includes(paletteQuery.trim().toLowerCase()))
-      : commands
-  )
+  /* F-2: скоринг поиска — префикс slash сильнее подстроки slash, та сильнее
+     описания, а дальше аббревиатуры подпоследовательностью («expmd»
+     находит /export). 4 = не совпало совсем. */
+  function paletteScore(c: PaletteCommand, q: string): number {
+    const s = c.slash.slice(1).toLowerCase()
+    if (s.startsWith(q)) return 0
+    if (s.includes(q)) return 1
+    if (t(c.desc).toLowerCase().includes(q)) return 2
+    let i = 0
+    for (const ch of s) if (i < q.length && ch === q[i]) i++
+    return i === q.length ? 3 : 4
+  }
+
+  const filteredCommands = $derived.by(() => {
+    const q = paletteQuery.trim().toLowerCase().replace(/^\//, '')
+    if (!q) return commands
+    return commands
+      .map((c, idx) => ({ c, idx, sc: paletteScore(c, q) }))
+      .filter((x) => x.sc < 4)
+      .sort((a, b) => a.sc - b.sc || a.idx - b.idx)
+      .map((x) => x.c)
+  })
+
+  /* F-2: /compact — ручная компакция (B-3 по требованию). Честно: 0 —
+     сжимать нечего, ошибка провайдера — во flash-статус. */
+  async function compactNow(): Promise<void> {
+    if (!currentSession) return
+    try {
+      const folded = await invoke<number>('session_compact', { sessionId: currentSession })
+      flashStatus(folded > 0 ? `${t('cmdCompactDone')}: ${folded}` : t('cmdCompactNothing'))
+    } catch (e) {
+      flashStatus(String(e))
+    }
+  }
 
   let bookmarks = $state<Set<string>>(
     new Set(JSON.parse(localStorage.getItem('swagcod-bookmarks') || '[]'))
@@ -2562,8 +2598,9 @@
       <input
         type="text"
         class="palette-input"
-        placeholder="команда…"
+        placeholder={t('palPlaceholder')}
         bind:value={paletteQuery}
+        oninput={() => (paletteIdx = 0)}
         onkeydown={(e) => {
           if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(paletteIdx + 1, filteredCommands.length - 1) }
           else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(paletteIdx - 1, 0) }
@@ -2576,7 +2613,10 @@
         spellcheck="false"
       />
       <div class="palette-list" role="listbox">
-        {#each filteredCommands as cmd, i (cmd.label)}
+        {#each filteredCommands as cmd, i (cmd.slash)}
+          {#if i === 0 || filteredCommands[i - 1].group !== cmd.group}
+            <div class="palette-group">{t(cmd.group)}</div>
+          {/if}
           <div
             class="palette-item"
             class:selected={i === paletteIdx}
@@ -2594,11 +2634,12 @@
             tabindex="0"
             aria-selected={i === paletteIdx}
           >
-            {cmd.label}
+            <span class="palette-cmd">{cmd.slash}</span>
+            <span class="palette-desc">{t(cmd.desc)}</span>
           </div>
         {/each}
         {#if filteredCommands.length === 0}
-          <div class="palette-empty">ничего не найдено</div>
+          <div class="palette-empty">{t('palEmpty')}</div>
         {/if}
       </div>
     </div>
@@ -3155,6 +3196,15 @@
           placeholder={t('placeholder')}
           bind:value={inputText}
           onkeydown={(e) => {
+            // F-2: «/» в пустом вводе открывает палитру команд, как в DSH.
+            if (e.key === '/' && inputText === '') {
+              e.preventDefault()
+              showPalette = true
+              paletteQuery = ''
+              paletteIdx = 0
+              setTimeout(() => document.querySelector<HTMLInputElement>('.palette-input')?.focus(), 50)
+              return
+            }
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
               sendMessage()
@@ -5422,6 +5472,36 @@
     color: var(--text-faint);
     font-size: 12px;
     transition: color 0.15s;
+  }
+
+  /* F-2: группы и пара «slash-имя + описание» как в DSH-референсе. */
+  .palette-group {
+    padding: 8px 12px 2px;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    user-select: none;
+  }
+
+  .palette-item {
+    display: flex;
+    align-items: baseline;
+  }
+
+  .palette-cmd {
+    font-weight: 600;
+    margin-right: 10px;
+    white-space: nowrap;
+    color: var(--text);
+  }
+
+  .palette-desc {
+    color: var(--text-faint);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .palette-empty:nth-child(odd):hover {

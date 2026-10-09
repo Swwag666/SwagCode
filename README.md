@@ -9,7 +9,7 @@ MCP-серверы, JS-плагины, суб-агенты, семантичес
 loopback REST API и дашборд телеметрии — в нативном окне с холодным стартом **68 мс**.
 
 [![CI](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml/badge.svg)](https://github.com/Swwag666/SwagCode/actions/workflows/ci.yml)
-![tests](https://img.shields.io/badge/tests-369%20green-brightgreen)
+![tests](https://img.shields.io/badge/tests-370%20green-brightgreen)
 ![clippy](https://img.shields.io/badge/clippy-0%20warnings-blue)
 ![svelte--check](https://img.shields.io/badge/svelte--check-0%2F0-blueviolet)
 ![version](https://img.shields.io/badge/version-0.2.0%20(rev%2037)-orange)
@@ -106,7 +106,7 @@ cargo build --release -p swagcod-app --features tauri/custom-protocol
 > и покажет ERR_CONNECTION_REFUSED — грабля Tauri v2 (DECISIONS.md §7).
 
 ```powershell
-cargo test --workspace                       # 289 Rust-тестов
+cargo test --workspace                       # 290 Rust-тестов
 pnpm --filter swagcod-desktop test           # 80 TS-тестов
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -175,8 +175,8 @@ Windows, ревизия 37); закоммичено в `bench-out/startup.json`:
 | Холодный старт до окна | < 400 мс | **66.3 мс** медиана |
 | Private bytes нашего процесса | < 40 МБ | **12.0 МБ** |
 | Private bytes всей семьи | < 200 МБ | вне бюджета: семья WebView2, справочно (D-013) |
-| JS-бандл | < 356 000 Б | **351 227 Б** |
-| Тесты | все зелёные | **369** (289 Rust + 80 TS) |
+| JS-бандл | < 362 000 Б | **356 529 Б** |
+| Тесты | все зелёные | **370** (290 Rust + 80 TS) |
 | Clippy · svelte-check | 0 · 0/0 | ✅ |
 
 Таблица переписывается только реальным прогоном: числа в README без строки

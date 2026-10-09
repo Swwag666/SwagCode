@@ -1111,7 +1111,8 @@ pub(crate) async fn start_turn_core(
 
         /* B-3: контекст — калиброванный счёт, компакция сайд-запросом и
         память проекта. Всё до старта машины: машина получает уже
-        подготовленную историю. */
+        подготовленную историю. F-2: компакция вынесена в run_compaction —
+        её же дёргает /compact из палитры команд. */
         use swagcod_core::context;
         let calib = app_state
             .store
@@ -1119,78 +1120,16 @@ pub(crate) async fn start_turn_core(
             .ok()
             .and_then(|s| s.get_pref("token_calibration").ok().flatten());
         let cpt = context::chars_per_token(&effective_model, calib.as_deref());
-        let mut summary = session_summary;
-        let mut history = history;
-        let ctx_window = context::model_context_tokens(&effective_model);
-        let est = context::estimate_history_tokens(&history, cpt)
-            + context::estimate_tokens(&summary, cpt);
-        if context::should_compact(est, ctx_window) {
-            let (old, recent) = context::split_history(&history, context::KEEP_RECENT_TURNS);
-            if !old.is_empty() {
-                bus.publish(EventKind::Status {
-                    message: "сжимаю контекст: сворачиваю старые ходы".into(),
-                });
-                let sum_model = app_state
-                    .store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.get_pref("summarizer_model").ok().flatten())
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or_else(|| effective_model.clone());
-                let prompt = context::summarizer_prompt(&summary, &old);
-                let sum_req = ChatRequest::new(&sum_model, vec![ChatMessage::user(prompt)]);
-                match provider.stream(sum_req) {
-                    Ok((mut srx, shandle)) => {
-                        let mut text = String::new();
-                        let mut sum_err: Option<String> = None;
-                        while let Some(ev) = srx.recv().await {
-                            match ev {
-                                StreamEvent::Content(t) => text.push_str(&t),
-                                StreamEvent::Error(m) => sum_err = Some(m),
-                                _ => {}
-                            }
-                        }
-                        shandle.abort();
-                        if sum_err.is_none() && !text.trim().is_empty() {
-                            summary = text.trim().to_string();
-                            history = recent;
-                            {
-                                let mut sessions = app_state.sessions.lock().await;
-                                if let Some(s) =
-                                    sessions.iter_mut().find(|s| s.id.to_string() == sid)
-                                {
-                                    s.summary = summary.clone();
-                                    s.history = history.clone();
-                                    // D-121: после сжатия контекст стал легче —
-                                    // снимок для сайдбара обновляется сразу.
-                                    if let Ok(mut m) = app_state.session_meta.lock() {
-                                        m.insert(sid.clone(), meta_of(s));
-                                    }
-                                }
-                            }
-                            if let Ok(store) = app_state.store.lock() {
-                                let _ = store.set_session_summary(&sid, &summary);
-                            }
-                            bus.publish(EventKind::Status {
-                                message: format!(
-                                    "контекст сжат: {} старых сообщений свёрнуто в сводку",
-                                    old.len()
-                                ),
-                            });
-                        } else {
-                            bus.publish(EventKind::Status {
-                                message: "сжатие не удалось, продолжаю с полным контекстом".into(),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        bus.publish(EventKind::Status {
-                            message: format!("сжатие не удалось: {e}"),
-                        });
-                    }
-                }
-            }
-        }
+        let (summary, history, _) = run_compaction(
+            &app_state,
+            &provider,
+            &sid,
+            &effective_model,
+            false,
+            session_summary,
+            history,
+        )
+        .await;
         // Память проекта инжектится в system-промпт каждого запроса хода.
         let memory_md =
             std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md")).unwrap_or_default();
@@ -3957,6 +3896,130 @@ async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, 
     }
 }
 
+/// B-3/F-2: компакция истории сайд-запросом саммаризатору. Общая для
+/// turn-драйвера (по порогу should_compact) и команды session_compact
+/// (/compact из палитры, force = всегда). Возвращает (сводка, история,
+/// число свёрнутых старых сообщений). Ошибка саммаризатора не роняет
+/// вызывающего: остаёмся на полном контексте, как в B-3.
+async fn run_compaction(
+    app_state: &Arc<AppState>,
+    provider: &AnyProvider,
+    sid: &str,
+    model: &str,
+    force: bool,
+    summary: String,
+    history: Vec<ChatMessage>,
+) -> (String, Vec<ChatMessage>, usize) {
+    use swagcod_core::context;
+    let calib = app_state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get_pref("token_calibration").ok().flatten());
+    let cpt = context::chars_per_token(model, calib.as_deref());
+    let ctx_window = context::model_context_tokens(model);
+    let est =
+        context::estimate_history_tokens(&history, cpt) + context::estimate_tokens(&summary, cpt);
+    if !force && !context::should_compact(est, ctx_window) {
+        return (summary, history, 0);
+    }
+    let (old, recent) = context::split_history(&history, context::KEEP_RECENT_TURNS);
+    if old.is_empty() {
+        return (summary, history, 0);
+    }
+    let folded = old.len();
+    let bus = app_state.bus.clone();
+    bus.publish(EventKind::Status {
+        message: "сжимаю контекст: сворачиваю старые ходы".into(),
+    });
+    let sum_model = app_state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get_pref("summarizer_model").ok().flatten())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| model.to_string());
+    let prompt = context::summarizer_prompt(&summary, &old);
+    let sum_req = ChatRequest::new(&sum_model, vec![ChatMessage::user(prompt)]);
+    match provider.stream(sum_req) {
+        Ok((mut srx, shandle)) => {
+            let mut text = String::new();
+            let mut sum_err: Option<String> = None;
+            while let Some(ev) = srx.recv().await {
+                match ev {
+                    StreamEvent::Content(t) => text.push_str(&t),
+                    StreamEvent::Error(m) => sum_err = Some(m),
+                    _ => {}
+                }
+            }
+            shandle.abort();
+            if sum_err.is_none() && !text.trim().is_empty() {
+                let summary = text.trim().to_string();
+                {
+                    let mut sessions = app_state.sessions.lock().await;
+                    if let Some(s) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
+                        s.summary = summary.clone();
+                        s.history = recent.clone();
+                        // D-121: после сжатия контекст стал легче —
+                        // снимок для сайдбара обновляется сразу.
+                        if let Ok(mut m) = app_state.session_meta.lock() {
+                            m.insert(sid.to_string(), meta_of(s));
+                        }
+                    }
+                }
+                if let Ok(store) = app_state.store.lock() {
+                    let _ = store.set_session_summary(sid, &summary);
+                }
+                bus.publish(EventKind::Status {
+                    message: format!("контекст сжат: {folded} старых сообщений свёрнуто в сводку"),
+                });
+                (summary, recent, folded)
+            } else {
+                bus.publish(EventKind::Status {
+                    message: "сжатие не удалось, продолжаю с полным контекстом".into(),
+                });
+                (summary, history, 0)
+            }
+        }
+        Err(e) => {
+            bus.publish(EventKind::Status {
+                message: format!("сжатие не удалось: {e}"),
+            });
+            (summary, history, 0)
+        }
+    }
+}
+
+/// F-2: /compact — ручная компакция истории сессии (B-3 по требованию,
+/// без порога). Возвращает число свёрнутых старых сообщений; 0 — сжимать
+/// нечего (история мала) или саммаризатор не смог: UI скажет честно.
+#[tauri::command]
+async fn session_compact(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<usize, String> {
+    let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
+    let (history, summary, model) = {
+        let sessions = state.sessions.lock().await;
+        let s = sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
+        (s.history.clone(), s.summary.clone(), s.model.clone())
+    };
+    let (_, _, folded) = run_compaction(
+        &state,
+        &provider,
+        &session_id,
+        &model,
+        true,
+        summary,
+        history,
+    )
+    .await;
+    Ok(folded)
+}
+
 /// E-5: список задач для UI/диагностики (журнал исполнения — last_error).
 #[tauri::command]
 async fn tasks_list(state: State<'_, Arc<AppState>>) -> Result<Vec<Task>, String> {
@@ -4155,6 +4218,7 @@ pub fn run() {
             js_plugins_list,
             js_plugins_reload,
             tasks_list,
+            session_compact,
             task_cancel,
             task_add,
             initial_prefs,
@@ -4280,6 +4344,63 @@ mod tests {
         // Ресурсы бандла: node.exe и sidecar едут в установщик (E-1).
         assert!(conf["bundle"]["resources"]["../../vendor/node/node.exe"].is_string());
         assert!(conf["bundle"]["resources"]["../../vendor/sidecar"].is_string());
+    }
+
+    #[tokio::test]
+    async fn compact_force_on_tiny_history_folds_nothing() {
+        // F-2: /compact на пустой или крошечной истории не должен трогать
+        // саммаризатор: ноль свёрнутых, сводка и история неизменны
+        // (ранний выход до сайд-запроса — сеть в тесте не нужна).
+        let provider = AnyProvider::OpenAi(
+            Router::from_env_with_key(Some("unit-test-key".into())).expect("роутер с явным ключом"),
+        );
+        let state = Arc::new(AppState::default());
+        let (summary, history, folded) = run_compaction(
+            &state,
+            &provider,
+            "s-none",
+            "gpt-4o-mini",
+            true,
+            "old summary".into(),
+            vec![],
+        )
+        .await;
+        assert_eq!(folded, 0);
+        assert_eq!(summary, "old summary");
+        assert!(history.is_empty());
+
+        // Крошечная история: split_history оставляет всё в recent —
+        // сворачивать нечего даже с force.
+        let tiny = vec![
+            ChatMessage::user("привет"),
+            ChatMessage::assistant("привет!"),
+        ];
+        let (_, hist2, folded2) = run_compaction(
+            &state,
+            &provider,
+            "s-none",
+            "gpt-4o-mini",
+            true,
+            String::new(),
+            tiny.clone(),
+        )
+        .await;
+        assert_eq!(folded2, 0);
+        assert_eq!(hist2.len(), 2);
+
+        // Без force и ниже порога B-3 — тоже ноль, провайдер не дёргается.
+        let (_, hist3, folded3) = run_compaction(
+            &state,
+            &provider,
+            "s-none",
+            "gpt-4o-mini",
+            false,
+            String::new(),
+            tiny,
+        )
+        .await;
+        assert_eq!(folded3, 0);
+        assert_eq!(hist3.len(), 2);
     }
 
     #[test]
