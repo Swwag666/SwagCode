@@ -7,6 +7,7 @@
    * onRespond, поэтому диалог тестируется без Tauri и без сети.
    */
   import Icon from './Icon.svelte'
+  import DiffPreview from './DiffPreview.svelte'
 
   interface Props {
     summary: string
@@ -14,10 +15,26 @@
     hint: string
     approveLabel: string
     denyLabel: string
+    /**
+     * F-6: unified-diff будущей правки из ядра. Есть только у файловых
+     * инструментов: у bash/fetch_url показывать нечего, там решает summary.
+     */
+    preview?: string
+    /** Подпись обрезки diff ({n} — сколько строк не влезло в DOM). */
+    diffHiddenLabel?: string
     onRespond: (decision: 'approved' | 'denied') => void
   }
 
-  let { summary, title, hint, approveLabel, denyLabel, onRespond }: Props = $props()
+  let {
+    summary,
+    title,
+    hint,
+    approveLabel,
+    denyLabel,
+    preview = '',
+    diffHiddenLabel = '',
+    onRespond,
+  }: Props = $props()
 </script>
 
 <div class="approval-overlay" role="presentation">
@@ -28,6 +45,10 @@
     </div>
     <p class="approval-hint">{hint}</p>
     <pre class="approval-summary">{summary}</pre>
+    {#if preview}
+      <!-- Что именно произойдёт с файлом — до того как человек решит. -->
+      <DiffPreview text={preview} hiddenLabel={diffHiddenLabel} />
+    {/if}
     <div class="approval-actions">
       <button class="approval-btn deny" onclick={() => onRespond('denied')}>{denyLabel}</button>
       <button class="approval-btn approve" onclick={() => onRespond('approved')}>{approveLabel}</button>

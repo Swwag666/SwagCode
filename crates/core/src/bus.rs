@@ -73,6 +73,12 @@ pub enum EventKind {
         tool: String,
         /// Человекочитаемое описание действия для показа пользователю.
         summary: String,
+        /// F-6: unified-diff того, что произойдёт с файлом, — до того как
+        /// правка уйдёт на диск. None у инструментов, которым показывать
+        /// нечего (bash, fetch_url): у них есть summary. serde-default:
+        /// старые записи журнала и клиенты без F-6 читаются как раньше.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
     },
     /// Ошибка, которую надо показать пользователю.
     Error {
@@ -362,6 +368,7 @@ mod tests {
                 call_id: "1".into(),
                 tool: "bash".into(),
                 summary: "rm -rf".into(),
+                preview: None,
             },
             EventKind::Error {
                 turn: None,
@@ -404,5 +411,54 @@ mod tests {
         assert_eq!(SessionId::new("a").as_str(), "a");
         assert_eq!(TurnId::new("a").as_str(), "a");
         assert_ne!(SessionId::new("a"), SessionId::new("b"));
+    }
+
+    /// F-6: preview — поле необязательное. Журнал и клиенты, записанные до
+    /// F-6, обязаны читаться прежним кодом, а None не должен уезжать в JSON
+    /// (иначе телефон и SSE платят за пустое поле в каждом событии).
+    #[test]
+    fn approval_preview_is_optional_and_skipped_when_absent() {
+        let legacy = serde_json::json!({
+            "kind": "approval_required",
+            "data": {
+                "turn": "t-1",
+                "call_id": "c-1",
+                "tool": "bash",
+                "summary": "rm -rf tmp"
+            }
+        });
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ApprovalRequired { preview, .. } => assert_eq!(preview, None),
+            other => panic!("ожидался approval_required, получено {other:?}"),
+        }
+
+        let none = EventKind::ApprovalRequired {
+            turn: tid(),
+            call_id: "c-1".into(),
+            tool: "bash".into(),
+            summary: "s".into(),
+            preview: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(
+            v.pointer("/data/preview").is_none(),
+            "None не должен сериализоваться: {v}"
+        );
+
+        let with = EventKind::ApprovalRequired {
+            turn: tid(),
+            call_id: "c-1".into(),
+            tool: "write".into(),
+            summary: "s".into(),
+            preview: Some("@@ -1,1 +1,1 @@\n-a\n+b\n".into()),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            v.pointer("/data/preview").and_then(|p| p.as_str()),
+            Some("@@ -1,1 +1,1 @@\n-a\n+b\n")
+        );
+        let back: EventKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, with);
     }
 }

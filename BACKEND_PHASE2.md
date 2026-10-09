@@ -23,7 +23,7 @@ our private < 40 МБ — D-013), запись в `DECISIONS.md` (ревизия
 | F-3 | 40 | allow/deny-list команд в подтверждениях | готово |
 | F-4 | 41 | инструмент web_search | готово |
 | F-5 | 42 | git-чекпоинты ходов + откат | готово |
-| F-6 | 43 | diff-review для edit/write в подтверждениях | |
+| F-6 | 43 | diff-review для edit/write в подтверждениях | готово |
 | F-7 | 44 | персистентная память (таблица + инструменты + UI) | |
 | F-8 | 45 | hooks (pre/post turn, pre_tool) | |
 | F-9 | 46 | SwagCod Phone: подключить qwe/dsh-phone к HTTP API | |

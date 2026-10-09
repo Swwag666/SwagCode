@@ -119,6 +119,114 @@ pub fn diff_text(old: &str, new: &str) -> Diff {
     out
 }
 
+/* ── F-6: preview для диалога подтверждения ─────────────────────────────── */
+
+/// Предел preview в байтах. Диалог подтверждения — не канал передачи
+/// файла: мегабайты текста в событии означают тормозящий UI и раздутый
+/// SSE-поток для телефона.
+pub const PREVIEW_MAX_BYTES: usize = 64 * 1024;
+
+/// Сколько одинаковых строк вокруг изменения показывать (как `git diff -U3`).
+pub const PREVIEW_CONTEXT: usize = 3;
+
+/// Отрендерить diff в unified-текст с контекстом — для показа человеку
+/// ПЕРЕД тем, как правка уйдёт на диск.
+///
+/// Формат намеренно примитивный: одна строка на строку diff, первый символ —
+/// маркер (`+`, `-`, ` `), между регионами — заголовок `@@ -a,b +c,d @@`.
+/// UI красит строки по маркеру и не тянет структуру, а телефон получает тот
+/// же текст в SSE без отдельного контракта.
+///
+/// Возвращает `(текст, обрезан_ли)`. Пустой текст при отсутствии изменений —
+/// показывать нечего, и диалог в этом случае честно говорит «изменений нет».
+pub fn format_unified_preview(d: &Diff, max_bytes: usize) -> (String, bool) {
+    let n = d.lines.len();
+    if n == 0 || !d.lines.iter().any(|l| l.change != LineChange::Same) {
+        return (String::new(), false);
+    }
+
+    /* Что показываем: каждое изменение плюс контекст. Без этого правка одной
+    строки в файле на 5000 строк утонула бы в контексте и обрезалась бы
+    раньше, чем человек увидел само изменение. */
+    let mut keep = vec![false; n];
+    for (i, l) in d.lines.iter().enumerate() {
+        if l.change != LineChange::Same {
+            let from = i.saturating_sub(PREVIEW_CONTEXT);
+            let to = (i + PREVIEW_CONTEXT).min(n - 1);
+            for slot in &mut keep[from..=to] {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let mut truncated = false;
+    'hunks: for start in hunk_starts(&keep) {
+        let end = (start..n).take_while(|&i| keep[i]).last().unwrap_or(start);
+        let (old_start, old_count, new_start, new_count) = hunk_numbers(&d.lines[start..=end]);
+        let header = format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n");
+        if !push_capped(&mut out, &header, max_bytes, &mut truncated) {
+            break;
+        }
+        for l in &d.lines[start..=end] {
+            let marker = match l.change {
+                LineChange::Added => '+',
+                LineChange::Removed => '-',
+                LineChange::Same => ' ',
+            };
+            let row = format!("{marker}{}\n", l.text);
+            if !push_capped(&mut out, &row, max_bytes, &mut truncated) {
+                break 'hunks;
+            }
+        }
+    }
+    (out, truncated)
+}
+
+/// Индексы начал регионов (после пропуска показ идёт подряд).
+fn hunk_starts(keep: &[bool]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, &k) in keep.iter().enumerate() {
+        if k && (i == 0 || !keep[i - 1]) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Номера строк для заголовка `@@`: начало и размер региона в старом и новом
+/// файле. У добавленных строк нет старого номера (и наоборот), поэтому начало
+/// берём из первой строки региона, где номер есть.
+fn hunk_numbers(lines: &[DiffLine]) -> (u32, u32, u32, u32) {
+    let old_count = lines
+        .iter()
+        .filter(|l| l.change != LineChange::Added)
+        .count() as u32;
+    let new_count = lines
+        .iter()
+        .filter(|l| l.change != LineChange::Removed)
+        .count() as u32;
+    let old_start = lines
+        .iter()
+        .find_map(|l| l.old_no)
+        .unwrap_or(if old_count == 0 { 0 } else { 1 });
+    let new_start = lines
+        .iter()
+        .find_map(|l| l.new_no)
+        .unwrap_or(if new_count == 0 { 0 } else { 1 });
+    (old_start, old_count, new_start, new_count)
+}
+
+/// Дописать строку, если влезает в предел; иначе отметить обрезку.
+fn push_capped(out: &mut String, row: &str, max_bytes: usize, truncated: &mut bool) -> bool {
+    if max_bytes > 0 && out.len() + row.len() > max_bytes {
+        *truncated = true;
+        return false;
+    }
+    out.push_str(row);
+    true
+}
+
 /// Проверить, что путь не выходит за границу рабочей директории.
 ///
 /// Это барьер песочницы для файловых тулзов: модель может попросить
@@ -378,5 +486,79 @@ mod tests {
             "слишком медленно: {} мс (бюджет < {budget_ms} мс)",
             elapsed.as_millis()
         );
+    }
+
+    /* ── F-6: preview для диалога подтверждения ── */
+
+    #[test]
+    fn preview_marks_changes_and_keeps_context() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let new = "a\nb\nc\nX\ne\nf\ng\nh\n";
+        let (text, truncated) = format_unified_preview(&diff_text(old, new), PREVIEW_MAX_BYTES);
+        assert!(!truncated);
+        // Контекст 3 строки вокруг изменения: a b c | d→X | e f g.
+        assert!(text.starts_with("@@ -1,7 +1,7 @@\n"), "{text}");
+        assert!(text.contains("-d\n"), "{text}");
+        assert!(text.contains("+X\n"), "{text}");
+        // Контекст вокруг изменения есть, и он помечен пробелом.
+        assert!(text.contains(" c\n"), "{text}");
+        assert!(text.contains(" e\n"), "{text}");
+        assert!(
+            !text.contains(" h\n"),
+            "дальний контекст не показываем: {text}"
+        );
+    }
+
+    #[test]
+    fn preview_of_identical_texts_is_empty() {
+        let (text, truncated) =
+            format_unified_preview(&diff_text("a\nb\n", "a\nb\n"), PREVIEW_MAX_BYTES);
+        assert_eq!(text, "");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn preview_shows_only_context_around_far_changes() {
+        // Правка одной строки в середине файла на 2000 строк: весь файл в
+        // диалог не уезжает, иначе человек листает, а не читает.
+        let old: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..2000)
+            .map(|i| {
+                if i == 1000 {
+                    "CHANGED\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let (text, truncated) = format_unified_preview(&diff_text(&old, &new), PREVIEW_MAX_BYTES);
+        assert!(!truncated);
+        assert!(text.contains("-line 1000\n"), "{text}");
+        assert!(text.contains("+CHANGED\n"), "{text}");
+        // Контекст 3 строки с каждой стороны + заголовок hunk.
+        assert_eq!(text.lines().count(), 1 + 3 + 2 + 3, "{text}");
+        assert!(!text.contains("line 500"), "{text}");
+    }
+
+    #[test]
+    fn preview_is_truncated_at_byte_cap() {
+        let old: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..500).map(|i| format!("changed {i}\n")).collect();
+        let (text, truncated) = format_unified_preview(&diff_text(&old, &new), 512);
+        assert!(truncated, "предел обязан сработать");
+        assert!(text.len() <= 512, "{} байт", text.len());
+        assert!(text.contains("-line 0\n"), "начало diff показано: {text}");
+    }
+
+    #[test]
+    fn preview_new_file_is_all_additions() {
+        let (text, truncated) = format_unified_preview(&diff_text("", "a\nb\n"), PREVIEW_MAX_BYTES);
+        assert!(!truncated);
+        assert!(text.contains("+a\n"), "{text}");
+        assert!(text.contains("+b\n"), "{text}");
+        // Заголовок hunk содержит «-0,0», поэтому смотрим на маркеры строк,
+        // а не на все дефисы текста.
+        let removals = text.lines().filter(|l| l.starts_with('-')).count();
+        assert_eq!(removals, 0, "удалять нечего: {text}");
     }
 }

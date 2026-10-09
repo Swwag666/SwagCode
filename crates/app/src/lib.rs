@@ -972,6 +972,90 @@ async fn start_turn(
     .await
 }
 
+/* ── F-6: diff-review перед применением правки ─────────────────────────────
+ * Диалог подтверждения показывал «write {"path":…,"content":…}» — по такому
+ * тексту человек одобряет не глядя, а именно это подтверждение и должно
+ * предотвращать. Поэтому вместе со сводкой уходит unified-diff того, что
+ * произойдёт с файлом: посчитанный ДО записи, из текущего содержимого и
+ * предложенного. */
+
+/// Инструменты, у которых есть что показать до применения.
+const PREVIEWABLE_TOOLS: [&str; 2] = ["write", "patch"];
+
+/// Файлы больше этого не диффим: LCS на мегабайтах съел бы секунды прямо в
+/// ходе, а диалог всё равно обрезан 64 КБ.
+const PREVIEW_SOURCE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Строка-заглушка: показываем причину, а не пустоту.
+fn preview_note(text: &str) -> String {
+    format!("@@ {text} @@\n")
+}
+
+/// Unified-diff того, что сделает вызов, либо None.
+///
+/// None — «нечего показывать»: не файловый инструмент или путь не
+/// резолвится. Ошибку применения (old_string не найден, файл не читается)
+/// тоже не прячем за выдуманным diff: preview=None, а сводка и результат
+/// исполнения остаются честными.
+pub(crate) fn approval_preview(call: &ToolCall, cwd: &std::path::Path) -> Option<String> {
+    if !PREVIEWABLE_TOOLS.contains(&call.name.as_str()) {
+        return None;
+    }
+    let path = sandbox_path(cwd, &arg_str(call, "path")).ok()?;
+    let exists = path.exists();
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    /* Огромный файл отсекаем до patch_text: и LCS, и поиск вхождений на
+    мегабайтах стоили бы секунд прямо в ходе, а показать их всё равно нельзя
+    (предел preview — 64 КБ). */
+    if current.len() > PREVIEW_SOURCE_MAX_BYTES {
+        return Some(preview_note(
+            "файл больше 2 МБ: diff не считался, решение по сводке",
+        ));
+    }
+
+    let proposed = match call.name.as_str() {
+        "write" => arg_str(call, "content"),
+        /* patch несуществующего файла — ошибка исполнения («old_string не
+        найден»), а не «создадим файл»: показывать все строки добавленными
+        было бы ложью о поведении инструмента. */
+        "patch" if exists => {
+            let old = arg_str(call, "old_string");
+            let new = arg_str(call, "new_string");
+            let replace_all = call
+                .arguments
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match swagcod_fsx::tools::patch_text(&current, &old, &new, replace_all) {
+                Ok((patched, _)) => patched,
+                Err(e) => return Some(preview_note(&format!("правка не применима: {e}"))),
+            }
+        }
+        _ => return None,
+    };
+
+    if current.len() + proposed.len() > PREVIEW_SOURCE_MAX_BYTES {
+        return Some(preview_note(
+            "файл больше 2 МБ: diff не считался, решение по сводке",
+        ));
+    }
+    let d = swagcod_fsx::diff_text(&current, &proposed);
+    if d.is_empty() {
+        return Some(preview_note("изменений нет: содержимое совпадает"));
+    }
+    let (mut text, truncated) =
+        swagcod_fsx::format_unified_preview(&d, swagcod_fsx::PREVIEW_MAX_BYTES);
+    if truncated {
+        text.push_str(&preview_note(&format!(
+            "diff обрезан: предел {} КБ, всего +{} -{}",
+            swagcod_fsx::PREVIEW_MAX_BYTES / 1024,
+            d.added,
+            d.removed
+        )));
+    }
+    Some(text)
+}
+
 /* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
 loopback REST API. Поведение идентично: та же машина хода, та же шина. */
 pub(crate) async fn start_turn_core(
@@ -1288,11 +1372,17 @@ pub(crate) async fn start_turn_core(
                 }
                 TurnStep::AwaitApproval { call } => {
                     let call_id = call.id.clone();
+                    /* F-6: diff считается только здесь — то есть только когда
+                    диалог действительно будет показан. При политике Never и
+                    при совпадении с allow-списком (F-3) машина до этого шага
+                    не доходит, и лишней работы с файлами нет. */
+                    let preview = approval_preview(&call, &cwd);
                     bus.publish(EventKind::ApprovalRequired {
                         turn: tid.clone(),
                         call_id: call_id.clone(),
                         tool: call.name.clone(),
                         summary: describe_call(&call),
+                        preview,
                     });
                     let (tx, rx) = oneshot::channel();
                     {
@@ -6097,7 +6187,7 @@ rl.on('line', (l) => {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_revert_without_checkpoint_says_so() {
-        let dir = std::env::temp_dir().join(format!("swagcod-noshа-{}", short_id()));
+        let dir = std::env::temp_dir().join(format!("swagcod-nosha-{}", short_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (state, sid, tid) = session_with_checkpoint(&dir, None).await;
         let e = turn_revert_core(&state, &sid, &tid).await.unwrap_err();
@@ -6107,6 +6197,152 @@ rl.on('line', (l) => {
         assert!(e.contains("ход не найден"), "{e}");
         let e = turn_revert_core(&state, "s-nope", &tid).await.unwrap_err();
         assert!(e.contains("сессия не найдена"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- F-6: diff-review перед применением правки ----
+
+    /// Временная рабочая директория с файлом `a.txt`.
+    fn preview_cwd(tag: &str, body: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("swagcod-preview-{tag}-{}", short_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(b) = body {
+            std::fs::write(dir.join("a.txt"), b).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn preview_of_write_on_new_file_is_all_additions() {
+        let dir = preview_cwd("new", None);
+        let p = approval_preview(
+            &call(
+                "write",
+                serde_json::json!({"path": "a.txt", "content": "строка 1\nстрока 2\n"}),
+            ),
+            &dir,
+        )
+        .expect("у write есть preview");
+        assert!(p.contains("+строка 1\n"), "{p}");
+        assert!(p.contains("+строка 2\n"), "{p}");
+        assert!(p.starts_with("@@ -0,0 +1,2 @@\n"), "{p}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_of_patch_shows_removed_and_added_lines() {
+        let dir = preview_cwd("patch", Some("a\nb\nc\n"));
+        let p = approval_preview(
+            &call(
+                "patch",
+                serde_json::json!({"path": "a.txt", "old_string": "b", "new_string": "B"}),
+            ),
+            &dir,
+        )
+        .expect("у patch есть preview");
+        assert!(p.contains("-b\n"), "{p}");
+        assert!(p.contains("+B\n"), "{p}");
+        // Контекст на месте: человек видит, где именно правка.
+        assert!(p.contains(" a\n"), "{p}");
+        assert!(p.contains(" c\n"), "{p}");
+        // Файл на диске не тронут: preview считается ДО применения.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_reports_unappliable_patch_instead_of_inventing_diff() {
+        let dir = preview_cwd("badpatch", Some("a\nb\n"));
+        let p = approval_preview(
+            &call(
+                "patch",
+                serde_json::json!({"path": "a.txt", "old_string": "нет такого", "new_string": "x"}),
+            ),
+            &dir,
+        )
+        .unwrap();
+        assert!(p.contains("правка не применима"), "{p}");
+        assert!(!p.contains("+x"), "выдуманного diff быть не должно: {p}");
+
+        // patch несуществующего файла: preview нет, исполнение честно упадёт.
+        let p = approval_preview(
+            &call(
+                "patch",
+                serde_json::json!({"path": "nope.txt", "old_string": "a", "new_string": "b"}),
+            ),
+            &dir,
+        );
+        assert_eq!(p, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_says_when_nothing_changes() {
+        let dir = preview_cwd("same", Some("a\nb\n"));
+        let p = approval_preview(
+            &call(
+                "write",
+                serde_json::json!({"path": "a.txt", "content": "a\nb\n"}),
+            ),
+            &dir,
+        )
+        .unwrap();
+        assert!(p.contains("изменений нет"), "{p}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_is_none_for_non_file_tools_and_escaping_paths() {
+        let dir = preview_cwd("none", Some("a\n"));
+        // bash: показывать нечего, есть summary с командой.
+        assert_eq!(
+            approval_preview(
+                &call("bash", serde_json::json!({"command": "rm -rf /"})),
+                &dir
+            ),
+            None
+        );
+        assert_eq!(
+            approval_preview(
+                &call("web_search", serde_json::json!({"query": "rust"})),
+                &dir
+            ),
+            None
+        );
+        // Выход за песочницу: preview не считается, исполнение отклонит путь.
+        assert_eq!(
+            approval_preview(
+                &call(
+                    "write",
+                    serde_json::json!({"path": "../evil.txt", "content": "x"}),
+                ),
+                &dir
+            ),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_skips_diff_for_huge_files() {
+        let dir = preview_cwd("huge", None);
+        // 2 МБ + хвост: LCS на таком съел бы секунды прямо в ходе.
+        let big = "x".repeat(PREVIEW_SOURCE_MAX_BYTES + 1024);
+        std::fs::write(dir.join("a.txt"), &big).unwrap();
+        let p = approval_preview(
+            &call(
+                "patch",
+                serde_json::json!({"path": "a.txt", "old_string": "x", "new_string": "y"}),
+            ),
+            &dir,
+        )
+        .unwrap();
+        assert!(p.contains("больше 2 МБ"), "{p}");
+        assert!(p.len() < 200, "заглушка короткая: {p}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

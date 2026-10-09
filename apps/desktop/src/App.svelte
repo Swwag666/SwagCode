@@ -606,7 +606,7 @@
   /* Диалог подтверждения действия: ядро спрашивает событием
      approval_required, решение уходит командой respond_approval.
      Решение принимает человек здесь, но исполняет его ядро — не UI. */
-  let approvalReq = $state<{ call_id: string; tool: string; summary: string } | null>(null)
+  let approvalReq = $state<{ call_id: string; tool: string; summary: string; preview?: string } | null>(null)
 
   async function respondApproval(decision: 'approved' | 'denied'): Promise<void> {
     if (!approvalReq) return
@@ -1675,8 +1675,21 @@
         }
       }
       if (e.kind.kind === 'approval_required') {
-        const d = e.kind.data as { turn: string; call_id: string; tool: string; summary: string }
-        approvalReq = { call_id: d.call_id, tool: d.tool, summary: d.summary }
+        const d = e.kind.data as {
+          turn: string
+          call_id: string
+          tool: string
+          summary: string
+          preview?: string
+        }
+        /* F-6: preview (unified-diff будущей правки) показываем вместе со
+           сводкой — решение по тексту «write {"path":…}» принимается вслепую. */
+        approvalReq = {
+          call_id: d.call_id,
+          tool: d.tool,
+          summary: d.summary,
+          preview: d.preview,
+        }
       }
       if (e.kind.kind === 'file_changed') {
         /* B-4: файлы сессии изменились — дерево перерисовывается само,
@@ -2078,6 +2091,8 @@
     hint={t('approvalHint')}
     approveLabel={t('approve')}
     denyLabel={t('deny')}
+    preview={approvalReq.preview}
+    diffHiddenLabel={t('diffHidden')}
     onRespond={respondApproval}
   />
 {/if}

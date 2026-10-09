@@ -32,7 +32,10 @@ export type EventKind =
     }
   | {
       kind: 'approval_required'
-      data: { turn: string; call_id: string; tool: string; summary: string }
+      /* F-6: preview — unified-diff того, что произойдёт с файлом. Есть
+         только у файловых инструментов и только когда ядро смогло его
+         честно посчитать; старые записи журнала приходят без поля. */
+      data: { turn: string; call_id: string; tool: string; summary: string; preview?: string }
     }
   | { kind: 'error'; data: { turn: string | null; message: string } }
   | { kind: 'status'; data: { message: string } }

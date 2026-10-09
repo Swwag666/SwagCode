@@ -31,6 +31,26 @@ describe('ApprovalDialog: smoke', () => {
     await fireEvent.click(screen.getByText('Отклонить'))
     expect(onRespond.mock.calls.map((c) => c[0])).toEqual(['approved', 'denied'])
   })
+
+  /* F-6: с preview диалог показывает саму правку, а не только JSON вызова;
+     без preview (bash, fetch_url) остаётся прежняя сводка. */
+  it('показывает diff, когда ядро прислало preview', () => {
+    render(ApprovalDialog, {
+      ...props,
+      preview: '@@ -1,3 +1,3 @@\n a\n-b\n+B\n',
+      onRespond: vi.fn(),
+    })
+    expect(screen.getByTestId('diff-preview')).toBeTruthy()
+    expect(screen.getByTestId('dp-adds').textContent).toBe('+1')
+    expect(screen.getByTestId('dp-dels').textContent).toBe('−1')
+    // Сводка остаётся: из неё видно имя инструмента и путь.
+    expect(screen.getByText(/bash/)).toBeTruthy()
+  })
+
+  it('без preview diff-блок не рисуется', () => {
+    render(ApprovalDialog, { ...props, onRespond: vi.fn() })
+    expect(screen.queryByTestId('diff-preview')).toBeNull()
+  })
 })
 
 describe('Icon: smoke', () => {
