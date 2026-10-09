@@ -18,6 +18,7 @@
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import CommandRules from './components/CommandRules.svelte'
+  import RevertDialog from './components/RevertDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
@@ -891,6 +892,62 @@
     }
   }
 
+  /* ── F-5: git-чекпоинты ходов ───────────────────────────────────────────
+     Ядро снимает worktree перед ходом и пишет sha в turns.checkpoint_sha.
+     Здесь — карта «ход → короткий sha» для кнопки отката в траектории:
+     кнопка рисуется только там, где снимок действительно есть. */
+  interface TurnCheckpoint {
+    turn_id: string
+    sha: string
+    short_sha: string
+  }
+  let checkpoints = $state<Record<string, string>>({})
+  let revertTarget = $state<{ turnId: string; sha: string } | null>(null)
+  let revertBusy = $state(false)
+
+  async function refreshCheckpoints(): Promise<void> {
+    if (!tauriAvailable || !currentSession) {
+      checkpoints = {}
+      return
+    }
+    try {
+      const rows = await invoke<TurnCheckpoint[]>('turn_checkpoints', {
+        sessionId: currentSession,
+      })
+      const map: Record<string, string> = {}
+      for (const r of rows) map[r.turn_id] = r.short_sha || r.sha.slice(0, 10)
+      checkpoints = map
+    } catch {
+      // Ядро без F-5 или сессия ещё не загружена: кнопок нет, ходы не ломаем.
+      checkpoints = {}
+    }
+  }
+
+  async function confirmRevert(): Promise<void> {
+    const target = revertTarget
+    if (!target || !currentSession || revertBusy) return
+    revertBusy = true
+    try {
+      const msg = await invoke<string>('turn_revert', {
+        sessionId: currentSession,
+        turnId: target.turnId,
+      })
+      flashStatus(t('revertDone').replace('{msg}', msg))
+      revertTarget = null
+    } catch (e) {
+      // Отказ ядра (ход идёт, снимка нет, git сломался) — человеку текстом.
+      flashStatus(t('revertFailed').replace('{msg}', String(e)))
+    } finally {
+      revertBusy = false
+    }
+  }
+
+  /* Вкладка траектории показывает свежие снимки: при открытии и после
+     каждого завершившегося хода. */
+  $effect(() => {
+    if (activeTab === 'trajectory') void refreshCheckpoints()
+  })
+
   /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
      «подозрительно тихий», а не вечное «думает». Состояние живёт здесь,
      derived turnQuiet — ниже, рядом с `thinking` (порядок объявлений). */
@@ -1611,6 +1668,8 @@
           approvalReq = null
           if (sendingSession === d.session) sendingSession = null
           if (d.session === currentSession) turnsCount++
+          /* F-5: ход записан — его снимок стал доступен для отката. */
+          if (d.session === currentSession) void refreshCheckpoints()
           /* Ход закончился — очередь ЭТОЙ сессии продолжает её разговор сама. */
           void drainQueue(d.session)
         }
@@ -2020,6 +2079,23 @@
     approveLabel={t('approve')}
     denyLabel={t('deny')}
     onRespond={respondApproval}
+  />
+{/if}
+
+<!-- F-5: подтверждение отката хода к git-снимку. Откат переписывает файлы
+     рабочей директории, поэтому без диалога не обходится. -->
+{#if revertTarget}
+  <RevertDialog
+    title={t('revertTitle')}
+    turnLabel={`${t('turn')} ${revertTarget.turnId.slice(0, 8)}`}
+    sha={revertTarget.sha}
+    warning={t('revertWarning')}
+    confirmLabel={t('revertConfirm')}
+    cancelLabel={t('revertCancel')}
+    busyLabel={t('revertBusy')}
+    busy={revertBusy}
+    onConfirm={() => void confirmRevert()}
+    onCancel={() => (revertTarget = null)}
   />
 {/if}
 
@@ -3104,6 +3180,17 @@
                   <span class="turn-icon">{isSub ? '↳' : '▶'}</span>
                   <span class="turn-name">{isSub ? `${t('subagentTurn')} ${turn.slice(-6)}` : `${t('turn')} ${turn.slice(0, 8)}`}</span>
                   <span class="turn-count">{turnItems.length} {t('events')}</span>
+                  {#if !isSub && checkpoints[turn]}
+                    <!-- F-5: снимок есть — значит ход можно откатить. -->
+                    <button
+                      class="turn-revert"
+                      title={t('revertButton')}
+                      onclick={() => (revertTarget = { turnId: turn, sha: checkpoints[turn] })}
+                    >
+                      <Icon name="restore" size={12} />
+                      <span>{t('revertButton')}</span>
+                    </button>
+                  {/if}
                 </div>
                 <div class="turn-items">
                   {#each turnItems as item (item.key)}
@@ -5045,6 +5132,29 @@
   .turn-group:hover .turn-count {
     color: var(--text-dim);
     text-shadow: 0 0 6px rgba(255, 255, 255, 0.08);
+  }
+
+  /* F-5: откат хода к git-снимку. Кнопка в строке хода, правый край. */
+  .turn-revert {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, box-shadow 0.15s;
+  }
+
+  .turn-revert:hover {
+    color: var(--err);
+    border-color: rgba(var(--err-rgb), 0.55);
+    box-shadow: 0 0 14px rgba(var(--err-rgb), 0.18);
   }
 
   .turn-items {

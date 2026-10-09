@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS turns(
   tool_calls_json TEXT NOT NULL DEFAULT '[]',
   est_in INTEGER NOT NULL DEFAULT 0,
   est_out INTEGER NOT NULL DEFAULT 0,
-  parent_turn_id TEXT
+  parent_turn_id TEXT,
+  checkpoint_sha TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,6 +237,8 @@ impl SqliteStore {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN approval_policy TEXT", []);
         // Миграция E-6: дерево суб-агентов — родительский ход.
         let _ = conn.execute("ALTER TABLE turns ADD COLUMN parent_turn_id TEXT", []);
+        // Миграция F-5: git-чекпоинт хода (снимок worktree до хода).
+        let _ = conn.execute("ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT", []);
         Ok(Self { conn })
     }
 
@@ -445,8 +448,8 @@ impl Store for SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         let tools_json = serde_json::to_string(&turn.tool_calls)?;
         tx.execute(
-            "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id, checkpoint_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 turn.id.as_str(),
                 session_id,
@@ -460,6 +463,7 @@ impl Store for SqliteStore {
                 turn.est_input_tokens as i64,
                 turn.est_output_tokens as i64,
                 turn.parent_turn_id.as_ref().map(|p| p.as_str()),
+                turn.checkpoint_sha,
             ],
         )?;
         // Снимок истории целиком: порядок и содержимое восстанавливаются
@@ -747,7 +751,7 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tasks::Task> 
 /// Ходы и сообщения сессии из базы в живую структуру.
 fn fill_session(conn: &Connection, ses: &mut Session) -> StoreResult<()> {
     let mut tstmt = conn.prepare(
-        "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id
+        "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id, checkpoint_sha
          FROM turns WHERE session_id = ?1 ORDER BY started_ms, id",
     )?;
     let turns = tstmt
@@ -767,6 +771,7 @@ fn fill_session(conn: &Connection, ses: &mut Session) -> StoreResult<()> {
                 parent_turn_id: r
                     .get::<_, Option<String>>(10)?
                     .map(crate::session::TurnId::new),
+                checkpoint_sha: r.get::<_, Option<String>>(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -839,6 +844,7 @@ mod tests {
             ok: true,
             failure: None,
             parent_turn_id: None,
+            checkpoint_sha: None,
         }
     }
 
@@ -883,6 +889,74 @@ mod tests {
             loaded.turns[1].parent_turn_id.as_ref().map(|p| p.as_str()),
             Some("t-1")
         );
+    }
+
+    #[test]
+    fn turn_checkpoint_sha_roundtrip_and_legacy_migration() {
+        // F-5: снимок хода живёт в базе и читается назад.
+        let store = SqliteStore::in_memory().unwrap();
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        let mut turn = sample_turn(1);
+        let sha = "a".repeat(40);
+        turn.checkpoint_sha = Some(sha.clone());
+        store.save_turn("s-1", &turn, &[]).unwrap();
+        store.save_turn("s-1", &sample_turn(2), &[]).unwrap();
+
+        let loaded = store.load_session("s-1").unwrap().unwrap();
+        assert_eq!(loaded.turns.len(), 2);
+        assert_eq!(
+            loaded.turns[0].checkpoint_sha.as_deref(),
+            Some(sha.as_str())
+        );
+        assert_eq!(
+            loaded.turns[1].checkpoint_sha, None,
+            "ход без снимка — NULL, а не пустая строка"
+        );
+
+        /* База, созданная до F-5 (в turns нет ни checkpoint_sha, ни
+        parent_turn_id), открывается прежним кодом: SCHEMA не пересоздаёт
+        существующую таблицу, а ALTER добирает колонки. Без этого обновления
+        на машине владельца означали бы «журнал не читается». */
+        const LEGACY_TURNS: &str = "CREATE TABLE turns(
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          started_ms INTEGER NOT NULL,
+          ended_ms INTEGER,
+          ok INTEGER NOT NULL,
+          failure TEXT,
+          content TEXT NOT NULL,
+          reasoning TEXT NOT NULL,
+          tool_calls_json TEXT NOT NULL DEFAULT '[]',
+          est_in INTEGER NOT NULL DEFAULT 0,
+          est_out INTEGER NOT NULL DEFAULT 0
+        );";
+        let dir = std::env::temp_dir().join(format!("swagcod-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(LEGACY_TURNS).unwrap();
+        }
+        let opened = SqliteStore::open(&path).unwrap();
+        assert_eq!(opened.integrity_check().unwrap(), "ok");
+        let cols: Vec<String> = {
+            let mut stmt = opened.conn.prepare("PRAGMA table_info(turns)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|c| c.ok())
+                .collect()
+        };
+        assert!(
+            cols.iter().any(|c| c == "checkpoint_sha"),
+            "миграция не добавила checkpoint_sha: {cols:?}"
+        );
+        assert!(
+            cols.iter().any(|c| c == "parent_turn_id"),
+            "миграция не добавила parent_turn_id: {cols:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

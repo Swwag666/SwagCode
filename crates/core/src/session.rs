@@ -104,6 +104,11 @@ pub struct TurnRecord {
     /// уровня). serde-default: старые журналы без поля читаются как раньше.
     #[serde(default)]
     pub parent_turn_id: Option<TurnId>,
+    /// F-5: снимок git-worktree, сделанный ПЕРЕД ходом (dangling-коммит,
+    /// refs/index/worktree не тронуты). None — не репозиторий, git
+    /// недоступен или worktree был чист: откатывать нечего.
+    #[serde(default)]
+    pub checkpoint_sha: Option<String>,
 }
 
 /// Сессия: рабочее пространство, история, текущее состояние.
@@ -320,6 +325,7 @@ mod tests {
                 ok: true,
                 failure: None,
                 parent_turn_id: None,
+                checkpoint_sha: None,
             });
         }
         let ids: Vec<_> = ses.turns_desc().map(|t| t.id.as_str()).collect();

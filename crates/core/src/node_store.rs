@@ -359,8 +359,8 @@ impl Store for NodeStore {
         оборванный процесс не оставляет полупустой ход. */
         let mut steps = Vec::with_capacity(2 + history.len());
         steps.push(json!({
-            "sql": "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "sql": "INSERT OR REPLACE INTO turns(id, session_id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id, checkpoint_sha)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             "params": [
                 json!(turn.id.as_str()),
                 json!(session_id),
@@ -373,7 +373,8 @@ impl Store for NodeStore {
                 json!(tools_json),
                 json!(turn.est_input_tokens as i64),
                 json!(turn.est_output_tokens as i64),
-                turn.parent_turn_id.as_ref().map(|p| json!(p.as_str())).unwrap_or(Value::Null)
+                turn.parent_turn_id.as_ref().map(|p| json!(p.as_str())).unwrap_or(Value::Null),
+                turn.checkpoint_sha.as_deref().map(|s| json!(s)).unwrap_or(Value::Null)
             ]
         }));
         steps.push(json!({
@@ -666,7 +667,7 @@ impl NodeStore {
     /// Ходы и сообщения сессии — аналог fill_session для rusqlite.
     fn fill_session(&self, ses: &mut Session) -> StoreResult<()> {
         let trows = self.query(
-            "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id
+            "SELECT id, started_ms, ended_ms, ok, failure, content, reasoning, tool_calls_json, est_in, est_out, parent_turn_id, checkpoint_sha
              FROM turns WHERE session_id = ?1 ORDER BY started_ms, id",
             vec![json!(ses.id.as_str())],
         )?;
@@ -684,6 +685,7 @@ impl NodeStore {
                 est_input_tokens: v_int(col(r, 8)) as u32,
                 est_output_tokens: v_int(col(r, 9)) as u32,
                 parent_turn_id: v_opt_text(col(r, 10)).map(crate::session::TurnId::new),
+                checkpoint_sha: v_opt_text(col(r, 11)),
             })
             .collect();
 
@@ -757,6 +759,7 @@ mod tests {
             ok: true,
             failure: None,
             parent_turn_id: None,
+            checkpoint_sha: None,
         }
     }
 
@@ -801,6 +804,28 @@ mod tests {
             Some("t-1")
         );
         assert_eq!(with_child.turns[0].parent_turn_id, None);
+
+        /* F-5: git-чекпоинт хода переживает roundtrip через sidecar —
+        паритет с rusqlite-бэкендом (тот же тест в store.rs). Без него
+        кнопка «Откатить» молча исчезла бы у всех, кто работает на NodeStore. */
+        let sha = "b".repeat(40);
+        let mut with_ckpt = sample_turn(3);
+        with_ckpt.checkpoint_sha = Some(sha.clone());
+        store.save_turn("s-1", &with_ckpt, &ses.history).unwrap();
+        let loaded_ckpt = store.load_session("s-1").unwrap().unwrap();
+        assert_eq!(
+            loaded_ckpt
+                .turns
+                .iter()
+                .find(|t| t.id.as_str() == "t-3")
+                .and_then(|t| t.checkpoint_sha.clone())
+                .as_deref(),
+            Some(sha.as_str())
+        );
+        assert_eq!(
+            loaded_ckpt.turns[0].checkpoint_sha, None,
+            "ход без снимка — NULL, а не пустая строка"
+        );
 
         // Политика снимается обратно в «как глобальная».
         store.set_session_policy("s-1", None).unwrap();
@@ -935,6 +960,12 @@ mod tests {
             assert!(
                 js.contains(&format!("ALTER TABLE sessions ADD COLUMN {col}")),
                 "в store-server.js нет миграции колонки {col}"
+            );
+        }
+        for col in ["parent_turn_id", "checkpoint_sha"] {
+            assert!(
+                js.contains(&format!("ALTER TABLE turns ADD COLUMN {col}")),
+                "в store-server.js нет миграции колонки turns.{col}"
             );
         }
     }

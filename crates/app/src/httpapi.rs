@@ -311,6 +311,69 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
                 Err(e) => Some(response(400, "Bad Request", &json_error(&e))),
             }
         }
+        /* F-5: откат хода к его git-снимку — тот же путь, что кнопка
+        «Откатить» в траектории (turn_revert_core), поэтому Phone и E2E-smoke
+        видят ровно то же поведение, что десктоп. */
+        ("POST", "/v1/turns/revert") => {
+            let v: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(response(
+                        400,
+                        "Bad Request",
+                        &json_error(&format!("json: {e}")),
+                    ))
+                }
+            };
+            let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+            let turn_id = v.get("turn_id").and_then(|x| x.as_str()).unwrap_or("");
+            if session_id.trim().is_empty() || turn_id.trim().is_empty() {
+                return Some(response(
+                    400,
+                    "Bad Request",
+                    &json_error("нужны session_id и turn_id"),
+                ));
+            }
+            match crate::turn_revert_core(state, session_id, turn_id).await {
+                Ok(message) => Some(response(
+                    200,
+                    "OK",
+                    &serde_json::json!({ "message": message }).to_string(),
+                )),
+                Err(e) => Some(response(400, "Bad Request", &json_error(&e))),
+            }
+        }
+        /* F-5: какие ходы сессии можно откатить. POST, а не GET: query в
+        parse_head отбрасывается, а заводить разбор параметров ради одного
+        маршрута не нужно — телефон и E2E шлют JSON. */
+        ("POST", "/v1/checkpoints") => {
+            let v: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(response(
+                        400,
+                        "Bad Request",
+                        &json_error(&format!("json: {e}")),
+                    ))
+                }
+            };
+            let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+            if session_id.trim().is_empty() {
+                return Some(response(
+                    400,
+                    "Bad Request",
+                    &json_error("нужен session_id"),
+                ));
+            }
+            match crate::turn_checkpoints_core(state, session_id).await {
+                Ok(rows) => Some(response(
+                    200,
+                    "OK",
+                    &serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
+                )),
+                Err(e) => Some(response(400, "Bad Request", &json_error(&e))),
+            }
+        }
         ("POST", "/v1/approvals") => {
             let v: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,

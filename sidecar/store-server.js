@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS turns(
   tool_calls_json TEXT NOT NULL DEFAULT '[]',
   est_in INTEGER NOT NULL DEFAULT 0,
   est_out INTEGER NOT NULL DEFAULT 0,
-  parent_turn_id TEXT
+  parent_turn_id TEXT,
+  checkpoint_sha TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +139,8 @@ function openDb(path) {
   try { db.exec('ALTER TABLE sessions ADD COLUMN approval_policy TEXT'); } catch { /* уже есть */ }
   /* E-6: дерево суб-агентов — родительский ход. */
   try { db.exec('ALTER TABLE turns ADD COLUMN parent_turn_id TEXT'); } catch { /* уже есть */ }
+  /* F-5: git-чекпоинт хода (снимок worktree до хода). */
+  try { db.exec('ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT'); } catch { /* уже есть */ }
 }
 
 function handle(req) {

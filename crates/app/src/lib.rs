@@ -1100,6 +1100,19 @@ pub(crate) async fn start_turn_core(
             session: swagcod_core::SessionId::new(&sid),
             parent: None,
         });
+        /* F-5: снимок worktree ДО первого инструмента хода. Не репозиторий
+        или чистое дерево → None (нечего откатывать), и ход идёт как раньше.
+        Ошибка git — не повод ронять ход: сообщаем в статус и работаем без
+        страховки, но честно. */
+        let checkpoint_sha = match swagcod_fsx::git::create_checkpoint(&cwd).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                bus.publish(EventKind::Status {
+                    message: format!("чекпоинт git не создан: {e}"),
+                });
+                None
+            }
+        };
         /* E-2: в начале каждого хода фоном освежаем семантический индекс.
         Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
         репозитория и не толкаются в одной базе. */
@@ -1433,7 +1446,9 @@ pub(crate) async fn start_turn_core(
                     + swagcod_core::context::estimate_tokens(&report.reasoning, cpt),
             ),
         };
-        let record = report.into_record(tid.clone(), calls, est_in, est_out);
+        let mut record = report.into_record(tid.clone(), calls, est_in, est_out);
+        // F-5: снимок принадлежит этому ходу — вместе с ним и хранится.
+        record.checkpoint_sha = checkpoint_sha;
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
@@ -2479,6 +2494,10 @@ async fn run_subagent(
         ok,
         failure: failure.clone(),
         parent_turn_id: Some(parent_turn),
+        /* F-5: снимок делается ОДИН на ход верхнего уровня — ветка
+        суб-агента живёт внутри родительского хода и откатывается вместе
+        с ним, собственный чекпоинт ей не положен. */
+        checkpoint_sha: None,
     };
     /* Дочерний ход — в стор и в живую сессию: ветка видна в траектории
     сразу, не дожидаясь конца родительского хода. */
@@ -3081,6 +3100,125 @@ fn cmd_rules_save(
         .set_pref(CMD_DENY_PREF, &deny.join("\n"))
         .map_err(|e| e.to_string())?;
     Ok(rules_dto(store.as_ref()))
+}
+
+/* ── F-5: git-чекпоинты ходов ───────────────────────────────────────────────
+ * Снимок worktree делается в самом начале хода (`fsx::git::create_checkpoint`,
+ * полный срез дерева через временный индекс), sha пишется в
+ * `turns.checkpoint_sha`. Откат возвращает содержимое файлов из снимка в
+ * границах cwd сессии; HEAD, индекс и refs не трогаются — откат не создаёт
+ * коммитов и не теряет историю git. Файлы, созданные ПОСЛЕ снимка, не
+ * удаляются (restore — не clean) и честно перечисляются в отчёте. */
+
+/// Откатить ход к его снимку. Ядро команды: без Tauri-`State`, чтобы тест
+/// мог вызвать его напрямую на временном репозитории.
+pub(crate) async fn turn_revert_core(
+    state: &Arc<AppState>,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let (cwd, sha, sid) = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
+        /* Откат во время хода — гонка за файлы с работающими инструментами.
+        Отказываем до всякого git: сначала остановите ход (F-1). */
+        if session.status.is_busy() {
+            return Err("ход выполняется: сначала остановите его, потом откатывайте".into());
+        }
+        let turn = session
+            .turns
+            .iter()
+            .find(|t| t.id.to_string() == turn_id)
+            .ok_or_else(|| format!("ход не найден: {turn_id}"))?;
+        let sha = turn.checkpoint_sha.clone().ok_or_else(|| {
+            "у хода нет git-снимка: рабочая директория не репозиторий, git недоступен \
+             или дерево было чистым"
+                .to_string()
+        })?;
+        (session.cwd.clone(), sha, session.id.clone())
+    };
+
+    let report = swagcod_fsx::git::restore_checkpoint(std::path::Path::new(&cwd), &sha)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let bus = state.bus.clone();
+    bus.publish(EventKind::Status {
+        message: report.message(),
+    });
+    /* Дерево файлов и diff обязаны ожить без опроса: те же пути, что
+    шлёт watcher B-4. */
+    if !report.restored.is_empty() {
+        bus.publish(EventKind::FileChanged {
+            session: sid,
+            paths: report.restored.clone(),
+        });
+    }
+    if let Ok(store) = state.store.lock() {
+        let _ = store.metrics_insert(
+            swagcod_core::bus::now_ms(),
+            "turn_revert_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    Ok(report.message())
+}
+
+/// Команда UI: «Откатить» на строке хода в траектории.
+#[tauri::command]
+async fn turn_revert(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    turn_id: String,
+) -> Result<String, String> {
+    let st = state.inner().clone();
+    turn_revert_core(&st, &session_id, &turn_id).await
+}
+
+/// Ход, который есть куда откатить.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct TurnCheckpointDto {
+    pub turn_id: String,
+    /// Короткий sha для подписи в UI (полный не нужен человеку).
+    pub sha: String,
+    pub short_sha: String,
+}
+
+/// Какие ходы сессии можно откатить. Кнопка «Откатить» рисуется только там,
+/// где снимок действительно есть: обещать откат, которого не существует, —
+/// хуже, чем не обещать.
+pub(crate) async fn turn_checkpoints_core(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<Vec<TurnCheckpointDto>, String> {
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .iter()
+        .find(|s| s.id.to_string() == session_id)
+        .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
+    Ok(session
+        .turns
+        .iter()
+        .filter_map(|t| {
+            t.checkpoint_sha.clone().map(|sha| TurnCheckpointDto {
+                turn_id: t.id.to_string(),
+                short_sha: sha.chars().take(10).collect(),
+                sha,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn turn_checkpoints(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Vec<TurnCheckpointDto>, String> {
+    turn_checkpoints_core(state.inner(), &session_id).await
 }
 
 /// Положить ключ провайдера под DPAPI: в store уходит только шифроблоб.
@@ -4422,6 +4560,8 @@ pub fn run() {
             approval_log,
             cmd_rules_load,
             cmd_rules_save,
+            turn_revert,
+            turn_checkpoints,
             save_protected_key,
             clear_protected_key,
             get_diagnostics,
@@ -5246,6 +5386,7 @@ mod tests {
                 ok: true,
                 failure: None,
                 parent_turn_id: None,
+                checkpoint_sha: None,
             };
             store
                 .save_turn(
@@ -5379,6 +5520,7 @@ rl.on('line', (l) => {
             ok: true,
             failure: None,
             parent_turn_id: None,
+            checkpoint_sha: None,
         });
         let out_path = dir.join("journal.jsonl");
         {
@@ -5785,5 +5927,186 @@ rl.on('line', (l) => {
             out,
             vec!["^git status".to_string(), "# пояснение".to_string()]
         );
+    }
+
+    // ---- F-5: git-чекпоинты ходов и откат ----
+
+    fn git_ok() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Временный репозиторий с одним коммитом: `a.txt` = «до хода».
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("swagcod-revert-{tag}-{}", short_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            #[cfg(windows)]
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("git");
+            c.current_dir(&dir).args(args);
+            #[cfg(windows)]
+            c.creation_flags(0x0800_0000);
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@swagcod.local"]);
+        run(&["config", "user.name", "SwagCod Test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        // Глобальный autocrlf=true (норма Windows) иначе превратил бы LF в
+        // CRLF при restore, и тест зависел бы от настроек машины.
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("a.txt"), "до хода\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// Сессия в состоянии Ready с одним ходом и снимком этого хода.
+    async fn session_with_checkpoint(
+        dir: &std::path::Path,
+        sha: Option<String>,
+    ) -> (Arc<AppState>, String, String) {
+        let sid = format!("s-{}", short_id());
+        let tid = format!("t-{}", short_id());
+        let mut ses = Session::new(
+            SessionId::new(&sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        ses.turns.push(TurnRecord {
+            id: swagcod_core::TurnId::new(&tid),
+            started_ms: 1,
+            ended_ms: Some(2),
+            content: "готово".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            est_input_tokens: 0,
+            est_output_tokens: 0,
+            ok: true,
+            failure: None,
+            parent_turn_id: None,
+            checkpoint_sha: sha,
+        });
+        let state = Arc::new(AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        });
+        state.sessions.lock().await.push(ses);
+        (state, sid, tid)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_revert_restores_worktree_and_names_surviving_files() {
+        if !git_ok() {
+            return;
+        }
+        let dir = temp_repo("ok");
+        let sha = swagcod_fsx::git::create_checkpoint(&dir)
+            .await
+            .unwrap()
+            .expect("чистое дерево — чекпоинт на HEAD");
+        let (state, sid, tid) = session_with_checkpoint(&dir, Some(sha.clone())).await;
+
+        // Подписка ДО отката: проверяем, что UI узнаёт о нём из шины.
+        let mut rx = state.bus.subscribe();
+
+        // «Ход» напортачил: правка отслеживаемого файла, новый файл, удаление.
+        std::fs::write(dir.join("a.txt"), "агент всё сломал\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "новый файл\n").unwrap();
+        std::fs::remove_file(dir.join("a.txt")).ok();
+        std::fs::write(dir.join("a.txt"), "агент всё сломал\n").unwrap();
+
+        let msg = turn_revert_core(&state, &sid, &tid).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "до хода\n",
+            "содержимое вернулось из снимка"
+        );
+        assert!(msg.contains("откат к снимку"), "{msg}");
+        assert!(
+            msg.contains("new.txt"),
+            "созданный после снимка файл обязан быть назван: {msg}"
+        );
+        assert!(
+            dir.join("new.txt").exists(),
+            "restore не удаляет файлы: удаление решает человек"
+        );
+
+        // Шина: Status для строки состояния и FileChanged для дерева/diff.
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(ev.kind.clone());
+        }
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, EventKind::Status { message } if message.contains("откат"))),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, EventKind::FileChanged { paths, .. } if paths.iter().any(|p| p.contains("a.txt")))),
+            "{kinds:?}"
+        );
+
+        // Телеметрия: сколько стоил откат.
+        let rows = {
+            let store = state.store.lock().unwrap();
+            store.metrics_query("turn_revert_ms", 0, 100).unwrap()
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+
+        // HEAD не сдвинулся: откат не создаёт коммитов.
+        let head = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            sha,
+            "чекпоинт чистого дерева и есть HEAD, и он не изменился"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_revert_refuses_while_turn_is_running() {
+        if !git_ok() {
+            return;
+        }
+        let dir = temp_repo("busy");
+        let (state, sid, tid) = session_with_checkpoint(&dir, Some("a".repeat(40))).await;
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions[0].status = swagcod_core::session::SessionStatus::Running;
+        }
+        let e = turn_revert_core(&state, &sid, &tid).await.unwrap_err();
+        assert!(e.contains("ход выполняется"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_revert_without_checkpoint_says_so() {
+        let dir = std::env::temp_dir().join(format!("swagcod-noshа-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, sid, tid) = session_with_checkpoint(&dir, None).await;
+        let e = turn_revert_core(&state, &sid, &tid).await.unwrap_err();
+        assert!(e.contains("нет git-снимка"), "{e}");
+        // Чужой ход и чужая сессия — внятные ошибки, а не паника.
+        let e = turn_revert_core(&state, &sid, "t-nope").await.unwrap_err();
+        assert!(e.contains("ход не найден"), "{e}");
+        let e = turn_revert_core(&state, "s-nope", &tid).await.unwrap_err();
+        assert!(e.contains("сессия не найдена"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -212,6 +212,9 @@ fn parse_session_log(text: &str) -> Result<ParsedSession, String> {
                         ok: false,
                         failure: None,
                         parent_turn_id: None,
+                        // DSH-история импортируется задним числом: снимков
+                        // worktree у тех ходов нет и быть не может.
+                        checkpoint_sha: None,
                     },
                     msgs: Vec::new(),
                 });
