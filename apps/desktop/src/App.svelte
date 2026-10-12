@@ -18,6 +18,7 @@
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import CommandRules from './components/CommandRules.svelte'
+  import HooksEditor from './components/HooksEditor.svelte'
   import MemoryTab, { type MemoryItem } from './components/MemoryTab.svelte'
   import RevertDialog from './components/RevertDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
@@ -658,6 +659,8 @@
     }
     // F-3: списки команд обновляем вместе с остальной безопасностью.
     void loadCmdRules()
+    // F-8: хуки — там же, это тоже граница разрешённого.
+    void loadHooks()
     try {
       const list = await invoke<{ id: string; approval_policy?: string | null }[]>('list_sessions')
       const cur = list.find((s) => s.id === currentSession)
@@ -890,6 +893,54 @@
     } finally {
       cmdRulesBusy = false
       cmdRulesTimer = setTimeout(() => (cmdRulesStatus = null), 5000)
+    }
+  }
+
+  /* ── F-8: хуки (pre/post turn, pre_tool) ──────────────────────────────────
+     Движок — core::hooks, исполнение — app::hooks. Конфигурация читается на
+     каждый ход, поэтому сохранение действует без перезапуска. Редактор
+     показывает JSON как есть: три события с разными формами в плоские поля
+     не раскладываются без потери смысла. */
+  interface HooksDto {
+    raw: string
+    pre_turn: number
+    post_turn: number
+    pre_tool: number
+    errors: string[]
+    timeout_secs: number
+    max_per_event: number
+  }
+  let hooksDto = $state<HooksDto | null>(null)
+  let hooksBusy = $state(false)
+  let hooksStatus = $state<string | null>(null)
+  let hooksError = $state<string | null>(null)
+  let hooksTimer: ReturnType<typeof setTimeout> | null = null
+
+  async function loadHooks(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      hooksDto = await invoke<HooksDto>('hooks_load')
+    } catch {
+      hooksDto = null // ядро без F-8: секцию не показываем
+    }
+  }
+
+  async function saveHooks(raw: string): Promise<void> {
+    hooksBusy = true
+    if (hooksTimer) clearTimeout(hooksTimer)
+    try {
+      hooksDto = await invoke<HooksDto>('hooks_save', { raw })
+      hooksError = null
+      const total = hooksDto.pre_turn + hooksDto.post_turn + hooksDto.pre_tool
+      hooksStatus = total > 0 ? t('hooksSaved').replace('{n}', String(total)) : t('hooksEmpty')
+    } catch (e) {
+      /* Ядро отклоняет битую конфигурацию целиком: текст остался в редакторе,
+      сохранённая конфигурация не тронута. */
+      hooksError = String(e)
+      hooksStatus = null
+    } finally {
+      hooksBusy = false
+      hooksTimer = setTimeout(() => (hooksStatus = null), 5000)
     }
   }
 
@@ -2500,6 +2551,29 @@
                   />
                 </div>
               {/if}
+              {#if hooksDto}
+                <div class="settings-row rules-row">
+                  <HooksEditor
+                    title={t('hooksTitle')}
+                    desc={t('hooksDesc')}
+                    hint={t('hooksHint')}
+                    saveLabel={t('hooksSave')}
+                    savedLabel={t('hooksBusy')}
+                    raw={hooksDto.raw}
+                    counts={{
+                      pre_turn: hooksDto.pre_turn,
+                      post_turn: hooksDto.post_turn,
+                      pre_tool: hooksDto.pre_tool,
+                    }}
+                    timeoutSecs={hooksDto.timeout_secs}
+                    maxPerEvent={hooksDto.max_per_event}
+                    busy={hooksBusy}
+                    status={hooksStatus}
+                    error={hooksError ?? (hooksDto.errors.length > 0 ? hooksDto.errors.join('; ') : null)}
+                    onSave={(raw) => void saveHooks(raw)}
+                  />
+                </div>
+              {/if}
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('approvalLogTitle')}</span>
@@ -2532,7 +2606,19 @@
                                 {r.decision === 'approved' ? t('decisionApproved') : t('decisionDenied')}
                               </span>
                             </td>
-                            <td>{r.actor === 'user' ? t('actorUser') : t('actorSystem')}</td>
+                            <!-- F-8: отказ хука — отдельный actor. Показывать
+                            его «системой» значило бы стереть разницу между
+                            «запретило правило из списка» и «не пустил скрипт
+                            владельца» — в аудите это разные решения. -->
+                            <td>
+                              {#if r.actor === 'user'}
+                                {t('actorUser')}
+                              {:else if r.actor === 'hook'}
+                                {t('actorHook')}
+                              {:else}
+                                {t('actorSystem')}
+                              {/if}
+                            </td>
                           </tr>
                         {/each}
                       </tbody>

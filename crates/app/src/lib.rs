@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
+pub mod hooks;
 pub mod httpapi;
 pub mod jsplugins;
 pub mod mcp;
@@ -1184,6 +1185,30 @@ pub(crate) async fn start_turn_core(
             session: swagcod_core::SessionId::new(&sid),
             parent: None,
         });
+        /* F-8: хуки владельца. Конфигурация читается один раз на ход: правка в
+        настройках действует со следующего хода, а перечитывать prefs на каждом
+        инструменте значило бы платить запросом к базе внутри цикла.
+        pre_turn идёт ДО снимка git: отказавший ход не должен оставлять
+        артефактов (лишних объектов в .git). */
+        let hooks_cfg = hooks::load_hooks(&app_state);
+        let mut pre_turn_refusal: Option<String> = None;
+        if !hooks_cfg.pre_turn.is_empty() {
+            let ctx = hooks::HookCtx {
+                session: sid.as_str(),
+                event: swagcod_core::hooks::EVENT_PRE_TURN,
+                tool: "",
+                cwd: &cwd,
+                ok: None,
+            };
+            let run = hooks::run_event_hooks(&app_state, &hooks_cfg.pre_turn, &ctx).await;
+            if !run.ok {
+                bus.publish(EventKind::Error {
+                    turn: Some(tid.clone()),
+                    message: run.message.clone(),
+                });
+                pre_turn_refusal = Some(run.message);
+            }
+        }
         /* F-5: снимок worktree ДО первого инструмента хода. Не репозиторий
         или чистое дерево → None (нечего откатывать), и ход идёт как раньше.
         Ошибка git — не повод ронять ход: сообщаем в статус и работаем без
@@ -1255,6 +1280,13 @@ pub(crate) async fn start_turn_core(
         let mut last_usage: Option<(u32, u32)> = None;
 
         let outcome = loop {
+            /* F-8: отказ pre_turn-хука закрывает ход до первого запроса
+            модели. Охранник, который не может остановить ход, бесполезен:
+            «не запускай агента на грязной ветке» — именно такой случай. */
+            if let Some(reason) = pre_turn_refusal.take() {
+                fail_reason = Some(reason);
+                break TurnOutcome::Failed;
+            }
             // B-8: каждый шаг машины — признак жизни для watchdog.
             touch_turn(&app_state, &turn, None);
             if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1455,6 +1487,43 @@ pub(crate) async fn start_turn_core(
                 }
                 TurnStep::ExecuteTool { call } => {
                     let started = std::time::Instant::now();
+                    /* F-8: pre_tool-хук решает до исполнения вызова. Отказ
+                    оформляется как blocked (тот же путь, что у deny-списка
+                    F-3): вызов закрывается сообщением tool с причиной, ход
+                    продолжается, и модель может сделать иначе. В журнал
+                    подтверждений пишем actor=system — автоматический отказ
+                    должен быть виден в аудите наравне с человеческим. */
+                    if let Some(reason) = hooks::run_pre_tool_hooks(
+                        &app_state,
+                        &hooks_cfg,
+                        sid.as_str(),
+                        &call.name,
+                        &cwd,
+                    )
+                    .await
+                    {
+                        bus.publish(EventKind::ToolResult {
+                            turn: tid.clone(),
+                            call_id: call.id.clone(),
+                            ok: false,
+                            output: truncate_output(&reason),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        });
+                        if let Ok(store) = app_state.store.lock() {
+                            let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
+                                session_id: sid.clone(),
+                                turn_id: tid.to_string(),
+                                call_id: call.id.clone(),
+                                tool: call.name.clone(),
+                                summary: describe_call(&call),
+                                decision: "denied".into(),
+                                actor: "hook".into(),
+                                decided_ms: swagcod_core::bus::now_ms(),
+                            });
+                        }
+                        step = machine.on_blocked(&reason);
+                        continue;
+                    }
                     /* E-2: semantic_search исполняется здесь, а не в
                     execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
                     и сеть, а execute_tool остаётся чистой и тестируемой.
@@ -1550,6 +1619,12 @@ pub(crate) async fn start_turn_core(
         let mut record = report.into_record(tid.clone(), calls, est_in, est_out);
         // F-5: снимок принадлежит этому ходу — вместе с ним и хранится.
         record.checkpoint_sha = checkpoint_sha;
+        /* F-8: конкретная причина (отказ хука, ошибка провайдера) важнее
+        общей «ошибка хода» из машины: журнал читают и после перезапуска,
+        когда событие TurnEnded уже никто не увидит. */
+        if let Some(reason) = fail_reason.clone() {
+            record.failure = Some(reason);
+        }
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
@@ -1583,6 +1658,20 @@ pub(crate) async fn start_turn_core(
         // B-8: watchdog больше не следит за мёртвым ходом.
         if let Ok(mut activity) = app_state.turn_activity.lock() {
             activity.remove(&turn);
+        }
+        /* F-8: post_turn — после записи хода, поэтому хук видит полный
+        журнал. Код возврата ни на что не влияет (ход уже случился): отказ
+        попадает в шину и метрику. Ругаться на владельца за упавший линтер,
+        спрятав от него результат хода, было бы самонадеянно. */
+        if !hooks_cfg.post_turn.is_empty() {
+            let ctx = hooks::HookCtx {
+                session: sid.as_str(),
+                event: swagcod_core::hooks::EVENT_POST_TURN,
+                tool: "",
+                cwd: &cwd,
+                ok: Some(record.ok),
+            };
+            let _ = hooks::run_event_hooks(&app_state, &hooks_cfg.post_turn, &ctx).await;
         }
     });
 
@@ -3379,6 +3468,77 @@ fn cmd_rules_save(
     Ok(rules_dto(store.as_ref()))
 }
 
+/* ── F-8: hooks (pre/post turn, pre_tool) ───────────────────────────────────
+ * Движок — в `core::hooks` (разбор, проверка, отбор по regex), исполнение —
+ * в `crate::hooks` (процессы, таймаут, метрика). Здесь хранение в prefs и
+ * команды для редактора во вкладке «Безопасность». Конфигурация читается на
+ * каждый ход, поэтому правка действует без перезапуска приложения. */
+
+/// Состояние хуков для UI: текст как есть, счётчики и ошибки разбора.
+#[derive(Serialize, Clone)]
+pub struct HooksDto {
+    /// JSON из prefs — редактор показывает и правит именно его.
+    pub raw: String,
+    pub pre_turn: usize,
+    pub post_turn: usize,
+    pub pre_tool: usize,
+    /// Ошибки сохранённого текста (возможны только после ручной правки базы:
+    /// `hooks_save` битую конфигурацию не принимает).
+    pub errors: Vec<String>,
+    pub timeout_secs: u64,
+    pub max_per_event: usize,
+}
+
+fn hooks_dto(store: &dyn swagcod_core::store::Store) -> HooksDto {
+    let raw = store
+        .get_pref(swagcod_core::hooks::HOOKS_PREF)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let (pre_turn, post_turn, pre_tool, errors) = match swagcod_core::hooks::parse_hooks(&raw) {
+        Ok(cfg) => (
+            cfg.pre_turn.len(),
+            cfg.post_turn.len(),
+            cfg.pre_tool.len(),
+            Vec::new(),
+        ),
+        Err(e) => (0, 0, 0, vec![e]),
+    };
+    HooksDto {
+        raw,
+        pre_turn,
+        post_turn,
+        pre_tool,
+        errors,
+        timeout_secs: swagcod_core::hooks::HOOK_TIMEOUT_SECS,
+        max_per_event: swagcod_core::hooks::HOOKS_PER_EVENT,
+    }
+}
+
+/// Прочитать конфигурацию хуков (вкладка «Безопасность»).
+#[tauri::command]
+fn hooks_load(state: State<'_, Arc<AppState>>) -> Result<HooksDto, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    Ok(hooks_dto(store.as_ref()))
+}
+
+/// Сохранить конфигурацию хуков.
+///
+/// Битый JSON, пустая команда, некомпилруемый regex и превышение предела
+/// отклоняются ЦЕЛИКОМ (тот же принцип, что у списков команд F-3): охранник,
+/// который молча не собрался, выглядит работающим и обманывает владельца.
+/// Пустой текст — осознанное «хуков нет».
+#[tauri::command]
+fn hooks_save(state: State<'_, Arc<AppState>>, raw: String) -> Result<HooksDto, String> {
+    // Проверяем ДО записи: prefs не должен содержать неприменимую конфигурацию.
+    swagcod_core::hooks::parse_hooks(&raw)?;
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_pref(swagcod_core::hooks::HOOKS_PREF, raw.trim())
+        .map_err(|e| e.to_string())?;
+    Ok(hooks_dto(store.as_ref()))
+}
+
 /* ── F-5: git-чекпоинты ходов ───────────────────────────────────────────────
  * Снимок worktree делается в самом начале хода (`fsx::git::create_checkpoint`,
  * полный срез дерева через временный индекс), sha пишется в
@@ -3891,7 +4051,8 @@ async fn open_in_explorer(
 /// Команда без всплывающего консольного окна на Windows
 /// (CREATE_NO_WINDOW). Иначе каждый git/cmd/taskkill моргает
 /// консолью поверх окна приложения.
-fn silent_cmd(program: &str) -> tokio::process::Command {
+/// F-8: pub(crate) — хуки запускают команды владельца тем же способом.
+pub(crate) fn silent_cmd(program: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -4837,6 +4998,8 @@ pub fn run() {
             approval_log,
             cmd_rules_load,
             cmd_rules_save,
+            hooks_load,
+            hooks_save,
             turn_revert,
             turn_checkpoints,
             memory_list,
@@ -6921,6 +7084,256 @@ rl.on('line', (l) => {
         );
         // Инструмент памяти объявлен модели: без спека она бы его не вызвала.
         assert!(first.contains("memory_add"), "в запросе нет memory_add");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ── F-8: e2e хуков ───────────────────────────────────────────────────────
+     * Оба теста гоняют настоящий драйвер хода через fake-провайдер (SSE на
+     * 127.0.0.1, ключ не нужен — настраивается prefs-записью, поэтому
+     * env-переменные не трогаем и тесты идут параллельно). */
+
+    /// Fake-провайдер: первый запрос получает `first_body`, остальные —
+    /// «ГОТОВО». Тело запроса вычитывается и выбрасывается: иначе клиент
+    /// упрётся в заполненный буфер сокета.
+    async fn spawn_fake_provider(first_body: &str) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let srv_hits = hits.clone();
+        let first = first_body.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = srv_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let first = first.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 65_536];
+                    while let Ok(Ok(k)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        sock.read(&mut buf),
+                    )
+                    .await
+                    {
+                        if k == 0 {
+                            break;
+                        }
+                    }
+                    let body = if n == 1 {
+                        first
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ГОТОВО\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// Дождаться `want` записей ходов в базе (ход пишется по завершении).
+    async fn wait_for_turns(state: &Arc<AppState>, sid: &str, want: usize) {
+        for _ in 0..600 {
+            let n = state
+                .store
+                .lock()
+                .ok()
+                .and_then(|g| g.load_session(sid).ok().flatten())
+                .map(|s| s.turns.len())
+                .unwrap_or(0);
+            if n >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("ходы не записались за 30 с");
+    }
+
+    /// Прописать фейк-провайдера активным (локальный base_url, ключ не нужен).
+    fn wire_fake_provider(state: &AppState, port: u16) {
+        let g = state.store.lock().unwrap();
+        g.set_pref("provider_active", "fake").unwrap();
+        g.set_pref(
+            "providers_custom",
+            &format!(
+                "[{{\"id\":\"fake\",\"label\":\"fake\",\"base_url\":\"http://127.0.0.1:{port}/v1\",\"flavor\":\"openai\"}}]"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// F-8 e2e: pre_tool-хук отклоняет вызов — инструмент не исполняется,
+    /// модель получает причину и ход завершается успешно.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pre_tool_hook_refuses_call_and_model_sees_reason() {
+        let first = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"h1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"secret.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let (port, hits) = spawn_fake_provider(first).await;
+
+        let state = mem_state();
+        wire_fake_provider(&state, port);
+        let dir = std::env::temp_dir().join(format!("swagcod-hook-e2e-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), "СЕКРЕТ-СОДЕРЖИМОЕ").unwrap();
+        let sid = "hook-sess";
+        let s = Session::new(
+            SessionId::new(sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+            g.set_pref(
+                swagcod_core::hooks::HOOKS_PREF,
+                r#"{"pre_tool":[{"match":"^read$","cmd":"echo dist закрыт 1>&2 & exit /b 2"}]}"#,
+            )
+            .unwrap();
+        }
+        state.sessions.lock().await.push(s);
+
+        start_turn_core(
+            state.clone(),
+            sid.to_string(),
+            "прочитай secret.txt".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ход стартовал");
+        wait_for_turns(&state, sid, 1).await;
+
+        // Запрос модели + второй запрос после отказа: ход не оборвался.
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "ожидалось два обращения к провайдеру"
+        );
+
+        let g = state.store.lock().unwrap();
+        let ses = g.load_session(sid).unwrap().unwrap();
+        assert!(
+            ses.turns[0].ok,
+            "отказ хука не роняет ход: {:?}",
+            ses.turns[0].failure
+        );
+        let tool_msg = ses
+            .history
+            .iter()
+            .find(|m| m.role == swagcod_provider::types::Role::Tool)
+            .expect("в истории есть ответ тулза");
+        assert!(
+            tool_msg.content.contains("hook pre_tool отклонил"),
+            "{}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("dist закрыт"),
+            "stderr хука дошёл до модели: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("exit 2"),
+            "код возврата виден: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("СЕКРЕТ"),
+            "инструмент не должен был исполниться: {}",
+            tool_msg.content
+        );
+        // Аудит: автоматический отказ виден в журнале наравне с человеческими.
+        let log = g.approval_log(Some(sid), 50).unwrap();
+        let hook_entry = log
+            .iter()
+            .find(|a| a.actor == "hook")
+            .expect("запись хука в журнале подтверждений");
+        assert_eq!(hook_entry.decision, "denied");
+        assert_eq!(hook_entry.tool, "read");
+        // Стоимость хуков видна в телеметрии.
+        assert!(
+            !g.metrics_query("hook_ms", 0, 10).unwrap().is_empty(),
+            "метрика hook_ms не записана"
+        );
+        drop(g);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-8 e2e: упавший pre_turn-хук закрывает ход ДО первого запроса модели —
+    /// охранник, который не может остановить ход, бесполезен.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pre_turn_hook_failure_aborts_turn_before_model() {
+        let (port, hits) = spawn_fake_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ГОТОВО\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+
+        let state = mem_state();
+        wire_fake_provider(&state, port);
+        let dir = std::env::temp_dir().join(format!("swagcod-hook-pre-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "hook-pre-sess";
+        let s = Session::new(
+            SessionId::new(sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+            g.set_pref(
+                swagcod_core::hooks::HOOKS_PREF,
+                r#"{"pre_turn":["echo ветка грязная 1>&2 & exit /b 4"]}"#,
+            )
+            .unwrap();
+        }
+        state.sessions.lock().await.push(s);
+
+        start_turn_core(
+            state.clone(),
+            sid.to_string(),
+            "сделай что-нибудь".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ход стартовал");
+        wait_for_turns(&state, sid, 1).await;
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "модель не должна запрашиваться: ход закрыт хуком"
+        );
+        let g = state.store.lock().unwrap();
+        let ses = g.load_session(sid).unwrap().unwrap();
+        assert!(!ses.turns[0].ok, "ход с отказавшим хуком не успешен");
+        let failure = ses.turns[0].failure.clone().expect("причина записана");
+        assert!(failure.contains("hook pre_turn отклонил"), "{failure}");
+        assert!(failure.contains("ветка грязная"), "{failure}");
+        assert!(
+            !ses.history
+                .iter()
+                .any(|m| m.role == swagcod_provider::types::Role::Assistant),
+            "ответа модели в истории быть не должно"
+        );
+        assert!(
+            !g.metrics_query("hook_ms", 0, 10).unwrap().is_empty(),
+            "метрика hook_ms не записана"
+        );
+        drop(g);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

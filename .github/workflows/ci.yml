@@ -132,11 +132,14 @@ jobs:
       # «Память» (F-7: MemoryTab.svelte, две области, строки ru/en) и
       # diff-preview F-6 вместе дали факт 374353. Подъём заложен заранее
       # (D-164), внешних библиотек по-прежнему нет (D-124).
+      # Ревизия 45: порог поднят 380000 → 400000 — редактор хуков (F-8:
+      # HooksEditor.svelte, JSON-текст, счётчики событий, строки ru/en)
+      # добавил ~5.4 КБ, факт 379733. Внешних библиотек нет (D-124).
       - name: bundle size budget
         shell: bash
         run: |
           set -e
-          LIMIT=380000
+          LIMIT=400000
           TOTAL=0
           for f in apps/desktop/dist/assets/*.js; do
             SIZE=$(stat -c%s "$f")

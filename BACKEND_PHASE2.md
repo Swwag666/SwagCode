@@ -25,7 +25,7 @@ our private < 40 МБ — D-013), запись в `DECISIONS.md` (ревизия
 | F-5 | 42 | git-чекпоинты ходов + откат | готово |
 | F-6 | 43 | diff-review для edit/write в подтверждениях | готово |
 | F-7 | 44 | персистентная память (таблица + инструменты + UI) | готово |
-| F-8 | 45 | hooks (pre/post turn, pre_tool) | |
+| F-8 | 45 | hooks (pre/post turn, pre_tool) | готово |
 | F-9 | 46 | SwagCod Phone: подключить qwe/dsh-phone к HTTP API | |
 | F-10 | 47-48 | гигиена фулл: компоненты App.svelte, модули lib.rs, FTS5 | |
 | F-11 | 49 | тесты и CI всё: E2E-smoke, компонентные тесты | |
