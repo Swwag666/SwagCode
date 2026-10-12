@@ -153,6 +153,29 @@ fn json_error(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
 }
 
+/* F-9: разбор тела и полей для маршрутов, добавленных под Phone. Маршруты
+E-7/F-5 написаны раньше и оставлены как есть — их тексты ошибок уже покрыты
+тестами и журналом, переписывать их ради единого стиля значило бы мешать
+чужую правку в атомарный коммит стадии. */
+
+/// JSON-тело POST: ошибка разбора возвращается текстом для честного 400.
+fn json_body(body: &[u8]) -> Result<serde_json::Value, String> {
+    serde_json::from_slice(body).map_err(|e| format!("json: {e}"))
+}
+
+/// Строковое поле тела: отсутствует или не строка — пустая строка.
+fn str_field(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Ответ 400 с текстом ошибки для человека.
+fn bad_request(msg: &str) -> Vec<u8> {
+    response(400, "Bad Request", &json_error(msg))
+}
+
 /// Проверка Bearer-токена.
 fn authorized(auth: Option<&str>, token: &str) -> bool {
     let Some(v) = auth else { return false };
@@ -271,6 +294,54 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             &serde_json::to_string(&crate::list_sessions_core(state).await)
                 .unwrap_or_else(|_| "[]".into()),
         )),
+        /* F-9: каталог моделей активного провайдера — сырой JSON провайдера
+        (обычно `{data:[{id,…}]}`). Phone строит по нему список моделей: без
+        непустого каталога его «новый чат» не открывается. Ошибка провайдера —
+        честный 400 с причиной, а не пустой список. */
+        ("GET", "/v1/models") => match crate::list_models_core(state).await {
+            Ok(v) => Some(response(200, "OK", &v.to_string())),
+            Err(e) => Some(bad_request(&e)),
+        },
+        /* F-9: создание сессии — тот же core, что у IPC-команды, поэтому
+        Phone получает ту же валидацию cwd и тот же дефолт модели. */
+        ("POST", "/v1/sessions") => {
+            let v = match json_body(&body) {
+                Ok(v) => v,
+                Err(e) => return Some(bad_request(&e)),
+            };
+            let cwd = str_field(&v, "cwd");
+            let model = v.get("model").and_then(|x| x.as_str()).map(String::from);
+            match crate::create_session_core(state, cwd, model).await {
+                Ok(brief) => Some(response(
+                    200,
+                    "OK",
+                    &serde_json::to_string(&brief).unwrap_or_else(|_| "{}".into()),
+                )),
+                Err(e) => Some(bad_request(&e)),
+            }
+        }
+        /* F-9: лента сессии в wire-формате B-8 — Phone рисует историю
+        открытой сессии тем же журналом, что десктоп, вместо того чтобы
+        ждать живых событий. POST с JSON, как у /v1/checkpoints: query в
+        parse_head отбрасывается. */
+        ("POST", "/v1/sessions/transcript") => {
+            let v = match json_body(&body) {
+                Ok(v) => v,
+                Err(e) => return Some(bad_request(&e)),
+            };
+            let session_id = str_field(&v, "session_id");
+            if session_id.trim().is_empty() {
+                return Some(bad_request("нужен session_id"));
+            }
+            match crate::transcript_events(state, &session_id).await {
+                Ok(events) => Some(response(
+                    200,
+                    "OK",
+                    &serde_json::to_string(&events).unwrap_or_else(|_| "[]".into()),
+                )),
+                Err(e) => Some(bad_request(&e)),
+            }
+        }
         ("POST", "/v1/turns") => {
             let v: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -309,6 +380,22 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
                     &serde_json::json!({ "turn_id": turn_id }).to_string(),
                 )),
                 Err(e) => Some(response(400, "Bad Request", &json_error(&e))),
+            }
+        }
+        /* F-9: остановка живого хода — кнопка «стоп» на телефоне. Тот же
+        core, что у IPC: флаг в задачу стрима + аборт HTTP-задачи. */
+        ("POST", "/v1/turns/stop") => {
+            let v = match json_body(&body) {
+                Ok(v) => v,
+                Err(e) => return Some(bad_request(&e)),
+            };
+            let session_id = str_field(&v, "session_id");
+            if session_id.trim().is_empty() {
+                return Some(bad_request("нужен session_id"));
+            }
+            match crate::stop_turn_core(state, session_id).await {
+                Ok(()) => Some(response(200, "OK", "{}")),
+                Err(e) => Some(bad_request(&e)),
             }
         }
         /* F-5: откат хода к его git-снимку — тот же путь, что кнопка
@@ -634,6 +721,29 @@ mod tests {
         .await;
         assert!(r.starts_with("HTTP/1.1 400"), "{r}");
 
+        // Каталог моделей: без токена 401. С токеном провайдер в этом тесте
+        // заведомо недоступен (закрытый порт 1), поэтому ждём честный 400 с
+        // причиной: телефон отличает «провайдер не отвечает» от «моделей нет»
+        // только по ошибке, а пустой 200 заблокировал бы его «новый чат».
+        let r = req(port, "GET /v1/models HTTP/1.1\r\nhost: x\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        {
+            let g = state.store.lock().unwrap();
+            g.set_pref("provider_active", "fake").unwrap();
+            g.set_pref(
+                "providers_custom",
+                "[{\"id\":\"fake\",\"label\":\"fake\",\"base_url\":\"http://127.0.0.1:1/v1\",\"flavor\":\"openai\"}]",
+            )
+            .unwrap();
+        }
+        let r = req(
+            port,
+            &format!("GET /v1/models HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("error"), "{r}");
+
         // Неизвестный путь — 404 (с токеном!).
         let r = req(
             port,
@@ -674,5 +784,121 @@ mod tests {
         assert!(got.contains("text/event-stream"), "{got}");
         assert!(got.contains("data: "), "{got}");
         assert!(got.contains("проба SSE"), "{got}");
+    }
+
+    /// F-9: маршруты, добавленные под Phone — создание сессии, её лента и
+    /// остановка хода. Все три обязаны требовать токен и честно отвечать 400
+    /// на мусор: телефон показывает текст ошибки человеку.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_api_phone_endpoints() {
+        let state = Arc::new(AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let st = state.clone();
+        tokio::spawn(async move { serve_on(listener, st, "test-token".into()).await });
+
+        async fn req(port: u16, raw: &str) -> String {
+            let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            sock.write_all(raw.as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sock.read_to_end(&mut out),
+            )
+            .await;
+            String::from_utf8_lossy(&out).to_string()
+        }
+        let auth = "authorization: Bearer test-token\r\n";
+        /// POST с JSON-телом и токеном.
+        async fn post(port: u16, path: &str, body: &str, auth: &str) -> String {
+            req(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nhost: x\r\n{auth}content-length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .await
+        }
+
+        // Без токена все три маршрута закрыты.
+        for path in ["/v1/sessions", "/v1/sessions/transcript", "/v1/turns/stop"] {
+            let r = post(port, path, "{}", "").await;
+            assert!(r.starts_with("HTTP/1.1 401"), "{path}: {r}");
+        }
+
+        // Битый JSON — 400, а не паника и не 500.
+        for path in ["/v1/sessions", "/v1/sessions/transcript", "/v1/turns/stop"] {
+            let r = post(port, path, "{oops", auth).await;
+            assert!(r.starts_with("HTTP/1.1 400"), "{path}: {r}");
+            assert!(r.contains("json"), "{path}: {r}");
+        }
+
+        // Создание сессии в существующей директории.
+        let dir = std::env::temp_dir();
+        let dir_json = serde_json::to_string(&dir.to_string_lossy()).unwrap();
+        let body = format!(r#"{{"cwd":{dir_json},"model":"test-model"}}"#);
+        let r = post(port, "/v1/sessions", &body, auth).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let json_start = r.find('{').expect("тело JSON");
+        let brief: serde_json::Value =
+            serde_json::from_str(&r[json_start..]).expect("ответ — SessionBrief");
+        let sid = brief["id"].as_str().unwrap_or("").to_string();
+        assert!(sid.starts_with("s-"), "{brief}");
+        assert_eq!(brief["model"].as_str(), Some("test-model"), "{brief}");
+
+        // Относительный cwd и несуществующая директория отвергаются.
+        let r = post(port, "/v1/sessions", r#"{"cwd":"rel/path"}"#, auth).await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("абсолютным"), "{r}");
+        let r = post(
+            port,
+            "/v1/sessions",
+            r#"{"cwd":"Z:\\swagcod-нет-такой-папки"}"#,
+            auth,
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("не существует"), "{r}");
+
+        // Созданная сессия видна в списке — Phone строит список по нему.
+        let r = req(
+            port,
+            &format!("GET /v1/sessions HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains(&sid), "сессии нет в списке: {r}");
+
+        // Лента новой сессии пуста, но это 200 и массив.
+        let body = format!(r#"{{"session_id":"{sid}"}}"#);
+        let r = post(port, "/v1/sessions/transcript", &body, auth).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains('['), "{r}");
+
+        // Без session_id и для чужой сессии — честный 400.
+        let r = post(port, "/v1/sessions/transcript", "{}", auth).await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("session_id"), "{r}");
+        let r = post(
+            port,
+            "/v1/sessions/transcript",
+            r#"{"session_id":"нет-такой"}"#,
+            auth,
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("не найдена"), "{r}");
+
+        // Остановка: живого хода нет — 400 с понятной причиной.
+        let r = post(port, "/v1/turns/stop", &body, auth).await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("нет живого хода"), "{r}");
+        let r = post(port, "/v1/turns/stop", "{}", auth).await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(r.contains("session_id"), "{r}");
     }
 }

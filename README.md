@@ -76,10 +76,23 @@ flowchart LR
 |---|---|---|
 | GET | `/health` | liveness без токена |
 | GET | `/v1/diagnostics` | шина, лаги, активные ходы, uptime |
-| GET | `/v1/sessions` | список сессий |
+| GET | `/v1/sessions` | список сессий (`SessionBrief[]`) |
+| GET | `/v1/models` | каталог моделей активного провайдера (F-9) |
+| POST | `/v1/sessions` | `{cwd, model?}` → `SessionBrief` (F-9) |
+| POST | `/v1/sessions/transcript` | `{session_id}` → лента сессии в wire-формате B-8 (F-9) |
 | POST | `/v1/turns` | `{session_id, message, model?, temperature?}` → `{turn_id}` |
+| POST | `/v1/turns/stop` | `{session_id}` → остановка живого хода (F-9) |
+| POST | `/v1/turns/revert` | `{session_id, turn_id}` → откат к git-снимку хода (F-5) |
+| POST | `/v1/checkpoints` | `{session_id}` → какие ходы можно откатить (F-5) |
 | POST | `/v1/approvals` | `{call_id, decision: approved\|denied}` |
 | GET | `/v1/events` | SSE-поток всех событий шины |
+
+Все маршруты, кроме `/health`, требуют `Authorization: Bearer <токен>`.
+POST-маршруты — только с JSON-телом: query-строка в парсере отбрасывается
+(`parse_head`), поэтому даже «чтение» (`/v1/checkpoints`,
+`/v1/sessions/transcript`) сделано POST-ом. Ошибки — честные 400/401/404 с
+`{"error":"…"}`; SSE не рвётся на лаге broadcast, а шлёт комментарий
+`: lagged N`.
 
 ```bash
 TOKEN=...   # Настройки → Безопасность → «Копировать токен»
@@ -89,6 +102,33 @@ curl -s http://127.0.0.1:47479/v1/turns -H "Authorization: Bearer $TOKEN" \
   -d '{"session_id":"s-1","message":"почини тесты"}'
 curl -sN http://127.0.0.1:47479/v1/events -H "Authorization: Bearer $TOKEN"
 ```
+
+## SwagCod Phone (F-9)
+
+Телефонный клиент — отдельный проект `dsh-phone` (PWA + python-гейтвей на
+stdlib, живёт вне этого репозитория). Он подключается к HTTP API SwagCod
+адаптером `swagcod_backend.py`: тот же интерфейс бэкенда, что у моста DSH,
+поэтому ни HTTP-роутинг гейтвея, ни его long-poll, ни черновики не меняются.
+Адаптер переводит RPC-методы телефона в маршруты API и события шины (SSE) — в
+события гейтвея, так что телефон получает живой стрим, а не опрос.
+
+Подключение: включить API на `47479`, скопировать токен из Настройки →
+Безопасность в `swagcodToken` конфига гейтвея, выставить `"backend":
+"swagcod"` и запустить `python gateway.py`. Полное описание, таблица
+«метод телефона → маршрут API», каноническая копия адаптера с его 34 тестами и
+два скрипта ручной проверки — в [`tools/phone/README.md`](tools/phone/README.md).
+
+```powershell
+# сторона SwagCod: 15 проверок API (с -Turn ещё и настоящий ход)
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\phone-check.ps1 -Token <hex>
+# вся цепочка через гейтвей: 17 проверок, а с --create — 24 (новый чат, ход, стрим)
+python tools\phone\phone-gateway-check.py --config <путь>\dsh-phone\config.json --create <папка> --model <id>
+```
+
+Чего телефон против SwagCod не умеет: вложения (API принимает только текст),
+смена политики подтверждений (намеренно: телефон не должен расширять себе
+права удалённо), откат хода (маршрут есть, UI в телефоне нет). Честный список
+отдаёт `runtime.getCapabilities`.
 
 ## Быстрый старт
 

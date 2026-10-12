@@ -508,9 +508,10 @@ async fn delete_background(name: String) -> Result<(), String> {
 /// Пользовательские реплики и выводы тулзов берём из wire-истории сессии —
 /// в журнале ходов их нет.
 /// События сессии в wire-формате B-8 (D-121: ленивая история — перед
-/// экспортом сессия догружается). Потребители: команда session_transcript
-/// и задача E-5 journal_export.
-async fn transcript_events(
+/// экспортом сессия догружается). Потребители: команда session_transcript,
+/// задача E-5 journal_export и loopback REST (F-9: Phone открывает сессию и
+/// рисует её ленту тем же журналом, что десктоп).
+pub(crate) async fn transcript_events(
     state: &AppState,
     session_id: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -666,6 +667,17 @@ pub(crate) async fn list_sessions_core(state: &AppState) -> Vec<SessionBrief> {
 #[tauri::command]
 async fn create_session(
     state: State<'_, Arc<AppState>>,
+    cwd: String,
+    model: Option<String>,
+) -> Result<SessionBrief, String> {
+    create_session_core(&state, cwd, model).await
+}
+
+/* F-9: ядро создания сессии — общее для IPC и loopback REST. Phone создаёт
+сессию с телефона и обязан получать то же поведение, что десктоп: та же
+валидация cwd, тот же дефолт модели, та же запись в store и событие в шину. */
+pub(crate) async fn create_session_core(
+    state: &AppState,
     cwd: String,
     model: Option<String>,
 ) -> Result<SessionBrief, String> {
@@ -1697,6 +1709,12 @@ pub(crate) async fn start_turn_core(
 /// и разблокирует ввод; очередь сообщений продолжает работать.
 #[tauri::command]
 async fn stop_turn(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    stop_turn_core(&state, session_id).await
+}
+
+/* F-9: ядро остановки — общее для IPC и loopback REST: кнопка «стоп» на
+телефоне обязана останавливать ход ровно так же, как на десктопе. */
+pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Result<(), String> {
     let handle = {
         let mut turns = state.turns.lock().await;
         let victim = turns
@@ -3892,7 +3910,14 @@ async fn read_file(
 /// Список моделей АКТИВНОГО провайдера (вкладка провайдеров).
 #[tauri::command]
 async fn list_models(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
+    list_models_core(&state).await
+}
+
+/// F-9: тот же список моделей для loopback REST — Phone строит по нему
+/// каталог моделей, иначе «новый чат» в телефоне не открывается вовсе:
+/// клиент требует непустой каталог до создания сессии.
+pub(crate) async fn list_models_core(state: &AppState) -> Result<serde_json::Value, String> {
+    let provider = providers::build_chat_provider(state).map_err(|e| format!("провайдер: {e}"))?;
     provider
         .list_models()
         .await

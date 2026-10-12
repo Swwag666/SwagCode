@@ -17,6 +17,11 @@ apps/desktop/dist/
 apps/desktop/.svelte-kit/
 apps/desktop/build/
 
+# Python (F-9: адаптер SwagCod Phone и его тесты живут в tools/phone/)
+__pycache__/
+*.pyc
+.vite/
+
 # E-1: упаковочный вендор — node.exe и плоский sidecar. Тяжёлое,
 # воспроизводится скриптами tools/fetch-node.ps1 + tools/bundle-sidecar.ps1.
 vendor/
