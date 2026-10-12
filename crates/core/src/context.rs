@@ -361,10 +361,7 @@ mod tests {
         /* Потолок в символах, а не в байтах: кириллический факт весит 2 байта,
         и сравнение по `len()` ловило бы не переполнение, а кодировку. */
         let chars = huge.content.chars().count();
-        assert!(
-            chars < FACTS_MAX_CHARS + 700,
-            "{chars} символов в промпте"
-        );
+        assert!(chars < FACTS_MAX_CHARS + 700, "{chars} символов в промпте");
     }
 
     #[test]
