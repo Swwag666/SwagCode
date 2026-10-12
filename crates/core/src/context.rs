@@ -27,6 +27,13 @@ pub const SUMMARY_MAX_CHARS: usize = 6000;
 /// Потолок MEMORY.md в системном промпте.
 pub const MEMORY_MAX_CHARS: usize = 4000;
 
+/// Потолок глобальной памяти (таблица `memory`, план F-7) — 4 КБ.
+///
+/// Память вшивается в КАЖДЫЙ запрос хода, поэтому её рост стоит токенов на
+/// всех последующих ходах: потолок здесь — не защита от переполнения, а
+/// напоминание, что факты должны быть короткими.
+pub const FACTS_MAX_CHARS: usize = 4000;
+
 /// Семейство модели по подстрокам имени. Порядок проверок значим:
 /// «deepseek-chat» не должен попасть в default.
 pub fn model_family(model: &str) -> &'static str {
@@ -172,11 +179,19 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     format!("{cut}\n[... обрезано ...]")
 }
 
-/// Системный промпт хода: роль + свёртка прошлых ходов + память проекта.
+/// Системный промпт хода: роль + свёртка прошлых ходов + память проекта +
+/// глобальные факты из базы (F-7).
 ///
 /// Не хранится в истории сессии: драйвер подставляет его в каждый запрос
 /// свежим, иначе system-сообщения множились бы от хода к ходу.
-pub fn system_prompt(summary: &str, memory_md: &str) -> ChatMessage {
+///
+/// Два источника памяти намеренно разделены: `.swagcod/MEMORY.md` — блокнот
+/// проекта (живёт в репозитории, коммитится, виден человеку в файле), а
+/// `facts` — строки из таблицы `memory`, переживающие сессии и не
+/// требующие файла в рабочей директории. Смешать их в одну секцию значило бы
+/// потерять разницу в происхождении: модель должна понимать, что файл
+/// проектный, а факты — из базы приложения.
+pub fn system_prompt(summary: &str, memory_md: &str, facts: &str) -> ChatMessage {
     let mut text = String::from(
         "Ты SwagCod — агент-программист в рабочем каталоге пользователя. \
          Отвечай на языке пользователя. Инструменты работают только внутри \
@@ -190,6 +205,16 @@ pub fn system_prompt(summary: &str, memory_md: &str) -> ChatMessage {
     if !memory_md.trim().is_empty() {
         text.push_str("\n## Память проекта (.swagcod/MEMORY.md)\n");
         text.push_str(&truncate_chars(memory_md.trim(), MEMORY_MAX_CHARS));
+        text.push('\n');
+    }
+    if !facts.trim().is_empty() {
+        text.push_str("\n## Сохранённые факты (память приложения)\n");
+        text.push_str(
+            "Учтённые ниже сведения сохранены между сессиями; \
+                       если они противоречат тому, что видно в файлах, верь файлам \
+                       и обнови факт инструментом memory_add.\n",
+        );
+        text.push_str(&truncate_chars(facts.trim(), FACTS_MAX_CHARS));
         text.push('\n');
     }
     ChatMessage::system(text)
@@ -296,15 +321,50 @@ mod tests {
 
     #[test]
     fn system_prompt_sections_in_order() {
-        let m = system_prompt("сводка тут", "# память\nважный факт");
+        let m = system_prompt(
+            "сводка тут",
+            "# память\nважный факт",
+            "- владелец любит краткость",
+        );
         assert_eq!(m.role, Role::System);
         let pos_summary = m.content.find("сводка тут").unwrap();
         let pos_memory = m.content.find("важный факт").unwrap();
+        let pos_facts = m.content.find("владелец любит краткость").unwrap();
         assert!(pos_summary < pos_memory, "сводка идёт раньше памяти");
+        assert!(pos_memory < pos_facts, "память проекта идёт раньше фактов");
         // Пустые секции не оставляют заголовков.
-        let empty = system_prompt("", "");
+        let empty = system_prompt("", "", "");
         assert!(!empty.content.contains("Сводка"));
         assert!(!empty.content.contains("Память"));
+        assert!(!empty.content.contains("факты"));
+    }
+
+    /// F-7: факты из базы вшиваются в промпт и обрезаны потолком — память
+    /// платит токенами на каждом ходе, поэтому рост ограничен.
+    #[test]
+    fn facts_section_is_injected_and_capped() {
+        let m = system_prompt(
+            "",
+            "",
+            "- сборка: cargo test --workspace\n- деплой: tools\\build-release.ps1",
+        );
+        assert!(m.content.contains("Сохранённые факты"), "{}", m.content);
+        assert!(m.content.contains("cargo test --workspace"));
+        // Подсказка про приоритет файлов на месте: факт может устареть.
+        assert!(m.content.contains("верь файлам"), "{}", m.content);
+
+        let huge = system_prompt("", "", &"ф".repeat(FACTS_MAX_CHARS * 2));
+        assert!(
+            huge.content.contains("[... обрезано ...]"),
+            "потолок фактов не сработал"
+        );
+        /* Потолок в символах, а не в байтах: кириллический факт весит 2 байта,
+        и сравнение по `len()` ловило бы не переполнение, а кодировку. */
+        let chars = huge.content.chars().count();
+        assert!(
+            chars < FACTS_MAX_CHARS + 700,
+            "{chars} символов в промпте"
+        );
     }
 
     #[test]
@@ -331,7 +391,7 @@ mod tests {
         let summary = "с".repeat(SUMMARY_MAX_CHARS);
         let compacted_est = estimate_history_tokens(&recent, cpt)
             + estimate_tokens(&summary, cpt)
-            + estimate_tokens(&system_prompt(&summary, "").content, cpt);
+            + estimate_tokens(&system_prompt(&summary, "", "").content, cpt);
         assert!(
             compacted_est < ctx,
             "сжатый контекст {compacted_est} не влез в окно {ctx}"

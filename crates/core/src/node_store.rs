@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 
 use crate::session::{Session, SessionId, SessionStatus, TurnRecord};
 use crate::store::{
-    policy_from_str_opt, policy_to_str, role_from_str, role_to_str, ApprovalEntry, Store,
-    StoreError, StoreResult,
+    memory_check_scope, memory_check_text, policy_from_str_opt, policy_to_str, role_from_str,
+    role_to_str, ApprovalEntry, MemoryEntry, Store, StoreError, StoreResult,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall};
 
@@ -471,6 +471,60 @@ impl Store for NodeStore {
                 decided_ms: v_int(col(r, 7)) as u64,
             })
             .collect())
+    }
+
+    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64> {
+        let scope = memory_check_scope(scope)?;
+        let text = memory_check_text(text)?;
+        let now = crate::bus::now_ms() as i64;
+        /* insertId отдаёт sidecar (better-sqlite3 lastInsertRowid): id нужен
+        инструментам и UI, чтобы забыть конкретную строку. */
+        let resp = self.exec(
+            "INSERT INTO memory(scope, text, created_ms, session_id) VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                json!(scope),
+                json!(text),
+                json!(now),
+                session_id.map(|s| json!(s)).unwrap_or(Value::Null),
+            ],
+        )?;
+        Ok(resp["insertId"].as_i64().unwrap_or(0))
+    }
+
+    fn memory_list(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<MemoryEntry>> {
+        let scope = memory_check_scope(scope)?;
+        let limit = limit.clamp(1, 1000) as i64;
+        let select = "SELECT id, scope, text, created_ms, session_id FROM memory WHERE scope = ?1";
+        let rows = match session_id {
+            Some(sid) => self.query(
+                &format!("{select} AND session_id = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3"),
+                vec![json!(scope), json!(sid), json!(limit)],
+            )?,
+            None => self.query(
+                &format!("{select} ORDER BY created_ms DESC, id DESC LIMIT ?2"),
+                vec![json!(scope), json!(limit)],
+            )?,
+        };
+        Ok(rows
+            .iter()
+            .map(|r| MemoryEntry {
+                id: v_int(col(r, 0)),
+                scope: v_text(col(r, 1)),
+                text: v_text(col(r, 2)),
+                created_ms: v_int(col(r, 3)) as u64,
+                session_id: v_opt_text(col(r, 4)),
+            })
+            .collect())
+    }
+
+    fn memory_forget(&self, id: i64) -> StoreResult<bool> {
+        let resp = self.exec("DELETE FROM memory WHERE id = ?1", vec![json!(id)])?;
+        Ok(resp["changes"].as_i64().unwrap_or(0) > 0)
     }
 
     fn task_enqueue(&self, t: &crate::tasks::Task) -> StoreResult<()> {
@@ -945,17 +999,72 @@ mod tests {
         assert_eq!(node_binary(), "node");
     }
 
+    /// F-7: память через sidecar ведёт себя как через rusqlite — области,
+    /// порядок, forget, insertId и общая валидация.
+    #[test]
+    fn node_memory_roundtrip_matches_sqlite() {
+        use crate::store::{MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
+        let Some(store) = try_memory() else { return };
+        let id = store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, "  факт 1  ")
+            .unwrap();
+        assert!(id > 0, "sidecar обязан вернуть insertId");
+        let id2 = store
+            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка")
+            .unwrap();
+        assert_ne!(id, id2);
+
+        let globals = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 50).unwrap();
+        assert_eq!(globals.len(), 1, "сессионная строка не в глобальных");
+        assert_eq!(globals[0].text, "факт 1", "текст пишется trimmed");
+        assert_eq!(globals[0].id, id);
+        assert!(globals[0].created_ms > 0);
+        assert_eq!(globals[0].session_id, None);
+
+        let sess = store
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .unwrap();
+        assert_eq!(sess.len(), 1);
+        assert_eq!(sess[0].session_id.as_deref(), Some("s-1"));
+        assert!(store
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), 50)
+            .unwrap()
+            .is_empty());
+
+        assert!(store.memory_forget(id2).unwrap());
+        assert!(!store.memory_forget(id2).unwrap(), "повтор — false");
+        // Валидация общая для обеих реализаций (memory_check_* в store.rs).
+        assert!(store.memory_add(MEMORY_SCOPE_GLOBAL, None, "   ").is_err());
+        assert!(store.memory_add("private", None, "x").is_err());
+        assert!(store.memory_list("private", None, 10).is_err());
+    }
+
     /// Схема не разъезжается с JS-sidecar: одинаковый набор таблиц.
     #[test]
     fn schema_matches_js_sidecar() {
         let js = std::fs::read_to_string(sidecar_script().expect("скрипт sidecar найдён от cwd"))
             .expect("скрипт читается");
-        for table in ["sessions", "turns", "messages", "prefs", "approvals"] {
+        for table in [
+            "sessions",
+            "turns",
+            "messages",
+            "prefs",
+            "approvals",
+            "tasks",
+            "metrics",
+            "memory",
+        ] {
             assert!(
                 js.contains(&format!("CREATE TABLE IF NOT EXISTS {table}(")),
                 "в store-server.js нет таблицы {table}"
             );
         }
+        /* Индекс — тоже часть схемы: без idx_memory_scope выборка памяти
+        сканировала бы таблицу на каждом ходе. */
+        assert!(
+            js.contains("CREATE INDEX IF NOT EXISTS idx_memory_scope "),
+            "в store-server.js нет индекса idx_memory_scope"
+        );
         for col in ["summary", "approval_policy"] {
             assert!(
                 js.contains(&format!("ALTER TABLE sessions ADD COLUMN {col}")),

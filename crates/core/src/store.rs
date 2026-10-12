@@ -28,6 +28,11 @@ pub enum StoreError {
     /// Ревизия 25: ошибки Node-sidecar (better-sqlite3) — процесс, канал, SQL.
     #[error("sidecar: {0}")]
     Sidecar(String),
+    /// F-7: нарушение доменного правила (область памяти, длина строки).
+    /// Отдельный вариант, а не `Sidecar`: проверки общие для обеих
+    /// реализаций Store и к каналу с Node отношения не имеют.
+    #[error("недопустимые данные: {0}")]
+    Invalid(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -46,6 +51,59 @@ pub struct ApprovalEntry {
     /// молчаливое одобрение исключено политикой.
     pub actor: String,
     pub decided_ms: u64,
+}
+
+/// F-7: строка персистентной памяти.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryEntry {
+    pub id: i64,
+    /// "global" — факты приложения (вшиваются в системный промпт каждого
+    /// хода), "session" — заметка одной сессии.
+    pub scope: String,
+    pub text: String,
+    pub created_ms: u64,
+    /// Заполнен у строк с scope="session".
+    pub session_id: Option<String>,
+}
+
+/// Область памяти: факты приложения.
+pub const MEMORY_SCOPE_GLOBAL: &str = "global";
+/// Область памяти: заметки одной сессии.
+pub const MEMORY_SCOPE_SESSION: &str = "session";
+/// Потолок одной строки памяти в символах.
+///
+/// Глобальная память вшивается в КАЖДЫЙ запрос хода (кап секции —
+/// `context::FACTS_MAX_CHARS`), поэтому длинная «заметка» стоит токенов на
+/// всех последующих ходах. Превышение — ошибка, а не тихая обрезка:
+/// молча отрезанный факт выглядит сохранённым.
+pub const MEMORY_TEXT_MAX_CHARS: usize = 2000;
+
+/// Проверка текста памяти — одна на обе реализации Store, чтобы правило не
+/// разъехалось между rusqlite и sidecar.
+pub(crate) fn memory_check_text(text: &str) -> StoreResult<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(StoreError::Invalid("пустая строка памяти".into()));
+    }
+    if t.chars().count() > MEMORY_TEXT_MAX_CHARS {
+        return Err(StoreError::Invalid(format!(
+            "строка памяти длиннее {} символов: разбейте на несколько",
+            MEMORY_TEXT_MAX_CHARS
+        )));
+    }
+    Ok(t.to_string())
+}
+
+/// Нормализовать scope: неизвестное имя — не «global по умолчанию», а ошибка.
+/// Молча превратить заметку сессии в глобальный факт значит показать её во
+/// всех остальных сессиях.
+pub(crate) fn memory_check_scope(scope: &str) -> StoreResult<String> {
+    match scope.trim() {
+        MEMORY_SCOPE_GLOBAL | MEMORY_SCOPE_SESSION => Ok(scope.trim().to_string()),
+        other => Err(StoreError::Invalid(format!(
+            "неизвестная область памяти {other:?} (global | session)"
+        ))),
+    }
 }
 
 /// Схема и режимы. WAL и NORMAL выставляются сразу: после перезапуска
@@ -126,6 +184,18 @@ CREATE TABLE IF NOT EXISTS metrics(
   name TEXT NOT NULL,
   value REAL NOT NULL
 );
+/* F-7: персистентная память. scope='global' — факты приложения (вшиваются
+   в системный промпт каждого хода), scope='session' — заметки одной сессии.
+   Автономная таблица без FK на sessions: память обязана пережить удаление
+   сессии, иначе «забыть сессию» молча стирало бы факты владельца. */
+CREATE TABLE IF NOT EXISTS memory(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'global',
+  text TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);
@@ -167,6 +237,22 @@ pub trait Store: Send {
         session_id: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<ApprovalEntry>>;
+    /// F-7: добавить строку памяти, вернуть её id.
+    ///
+    /// Текст и область проверяются до записи ([`memory_check_text`],
+    /// [`memory_check_scope`]): пустая строка или «память» неизвестной
+    /// области — ошибка, а не молчаливое сохранение мусора.
+    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64>;
+    /// F-7: строки области (новые первыми). `session_id` фильтрует заметки
+    /// конкретной сессии; для глобальных строк передают None.
+    fn memory_list(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<MemoryEntry>>;
+    /// F-7: забыть строку; true, если она существовала.
+    fn memory_forget(&self, id: i64) -> StoreResult<bool>;
     /// E-5: очередь фоновых задач. id — ключ дедупликации (INSERT OR
     /// IGNORE): сид периодической задачи идемпотентен, отмена не
     /// воскрешается повторным сидом.
@@ -579,6 +665,64 @@ impl Store for SqliteStore {
             }
         };
         Ok(rows)
+    }
+
+    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64> {
+        let scope = memory_check_scope(scope)?;
+        let text = memory_check_text(text)?;
+        let now = crate::bus::now_ms() as i64;
+        self.conn.execute(
+            "INSERT INTO memory(scope, text, created_ms, session_id) VALUES (?1, ?2, ?3, ?4)",
+            params![scope, text, now, session_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn memory_list(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<MemoryEntry>> {
+        let scope = memory_check_scope(scope)?;
+        let limit = limit.clamp(1, 1000) as i64;
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<MemoryEntry> {
+            Ok(MemoryEntry {
+                id: r.get(0)?,
+                scope: r.get(1)?,
+                text: r.get(2)?,
+                created_ms: r.get::<_, i64>(3)? as u64,
+                session_id: r.get(4)?,
+            })
+        };
+        /* Новые первыми: память читается как лента, и свежие факты важнее —
+        при переполнении потолка контекста обрезается хвост, то есть
+        старьё. */
+        let select = "SELECT id, scope, text, created_ms, session_id FROM memory WHERE scope = ?1";
+        let rows = match session_id {
+            Some(sid) => {
+                let sql = format!(
+                    "{select} AND session_id = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mapped = stmt.query_map(params![scope, sid, limit], map_row)?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            }
+            None => {
+                let sql = format!("{select} ORDER BY created_ms DESC, id DESC LIMIT ?2");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mapped = stmt.query_map(params![scope, limit], map_row)?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(rows)
+    }
+
+    fn memory_forget(&self, id: i64) -> StoreResult<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM memory WHERE id = ?1", params![id])?;
+        Ok(n > 0)
     }
 
     fn task_enqueue(&self, t: &crate::tasks::Task) -> StoreResult<()> {
@@ -1201,5 +1345,126 @@ mod tests {
         store.create_session(&ses).unwrap();
         let loaded = store.load_session("s-1").unwrap().unwrap();
         assert_eq!(loaded.approval_policy, Some(ApprovalPolicy::OnDangerous));
+    }
+
+    /* ── F-7: персистентная память ── */
+
+    #[test]
+    fn memory_roundtrip_scopes_and_forget() {
+        let store = SqliteStore::in_memory().unwrap();
+        let g1 = store
+            .memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                "  сборка: cargo test --workspace  ",
+            )
+            .unwrap();
+        let g2 = store
+            .memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                "деплой: tools\\build-release.ps1",
+            )
+            .unwrap();
+        let s1 = store
+            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка сессии 1")
+            .unwrap();
+        assert_ne!(g1, g2);
+
+        let globals = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 50).unwrap();
+        assert_eq!(globals.len(), 2, "сессионная строка не попала в глобальные");
+        // Текст пишется trimmed: пробелы вокруг факта — мусор в промпте.
+        assert!(
+            globals
+                .iter()
+                .any(|m| m.text == "сборка: cargo test --workspace"),
+            "{globals:?}"
+        );
+        assert!(globals.iter().all(|m| m.scope == MEMORY_SCOPE_GLOBAL));
+        assert!(globals.iter().all(|m| m.created_ms > 0));
+        // Новые первыми: при переполнении потолка обрезается старьё.
+        assert_eq!(globals[0].id, g2, "свежий факт в начале: {globals:?}");
+
+        let sess = store
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .unwrap();
+        assert_eq!(sess.len(), 1);
+        assert_eq!(sess[0].id, s1);
+        assert_eq!(sess[0].session_id.as_deref(), Some("s-1"));
+        // Чужая сессия не видит заметку.
+        assert!(store
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), 50)
+            .unwrap()
+            .is_empty());
+
+        assert!(store.memory_forget(s1).unwrap());
+        assert!(
+            !store.memory_forget(s1).unwrap(),
+            "повторное удаление — false"
+        );
+        assert!(store
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .unwrap()
+            .is_empty());
+        // Предел выборки соблюдается и не ломает порядок.
+        let one = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, g2);
+    }
+
+    #[test]
+    fn memory_rejects_empty_overlong_and_unknown_scope() {
+        let store = SqliteStore::in_memory().unwrap();
+        let e = store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, "   ")
+            .unwrap_err();
+        assert!(e.to_string().contains("пустая"), "{e}");
+        let e = store
+            .memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                &"ф".repeat(MEMORY_TEXT_MAX_CHARS + 1),
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("длиннее"), "{e}");
+        // Молча превратить заметку сессии в глобальный факт нельзя.
+        let e = store.memory_add("private", None, "факт").unwrap_err();
+        assert!(e.to_string().contains("неизвестная область"), "{e}");
+        let e = store.memory_list("private", None, 10).unwrap_err();
+        assert!(e.to_string().contains("неизвестная область"), "{e}");
+        assert!(store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// База, созданная до F-7 (таблицы `memory` нет), открывается прежним
+    /// путём: SCHEMA добирает таблицу через IF NOT EXISTS, поэтому обновление
+    /// на машине владельца не означает «память не работает».
+    #[test]
+    fn memory_table_appears_on_legacy_database() {
+        let dir = std::env::temp_dir().join(format!("swagcod-mem-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE prefs(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.integrity_check().unwrap(), "ok");
+        let id = store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, "факт после миграции")
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(
+            store
+                .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

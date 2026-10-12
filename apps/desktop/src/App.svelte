@@ -18,6 +18,7 @@
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import CommandRules from './components/CommandRules.svelte'
+  import MemoryTab, { type MemoryItem } from './components/MemoryTab.svelte'
   import RevertDialog from './components/RevertDialog.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
@@ -42,7 +43,7 @@
   let models = $state<string[]>([])
   let modelName = $state(localStorage.getItem('swagcod-model') || 'fable-ultra-promax')
   let showSettings = $state(false)
-  let settingsTab = $state<'general' | 'models' | 'providers' | 'plugins' | 'security' | 'mcp' | 'telemetry'>('general')
+  let settingsTab = $state<'general' | 'models' | 'providers' | 'plugins' | 'security' | 'mcp' | 'telemetry' | 'memory'>('general')
   let activeTab = $state<'chat' | 'trajectory' | 'terminal'>('chat')
 
   /* ────────────────────────────────────────────────────────────────
@@ -948,6 +949,78 @@
     if (activeTab === 'trajectory') void refreshCheckpoints()
   })
 
+  /* ── F-7: память приложения ──────────────────────────────────────────────
+     Та же таблица `memory`, куда пишет агент инструментами memory_*: человек
+     и модель видят один список. Глобальные факты вшиваются в системный промпт
+     каждого хода, заметки сессии — только свои. */
+  let memoryItems = $state<MemoryItem[]>([])
+  let memoryScope = $state<'global' | 'session'>('global')
+  let memoryBusy = $state(false)
+  let memoryStatus = $state<string | null>(null)
+
+  async function refreshMemory(): Promise<void> {
+    if (!tauriAvailable) return
+    memoryBusy = true
+    try {
+      memoryItems = await invoke<MemoryItem[]>('memory_list', {
+        scope: memoryScope,
+        sessionId: currentSession,
+        limit: 200,
+      })
+    } catch (e) {
+      memoryItems = []
+      memoryStatus = t('memoryFailed').replace('{msg}', String(e))
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  async function addMemory(text: string): Promise<void> {
+    if (!tauriAvailable || memoryBusy) return
+    memoryBusy = true
+    try {
+      await invoke<number>('memory_add', {
+        scope: memoryScope,
+        sessionId: currentSession,
+        text,
+      })
+      memoryStatus = t('memoryAdded')
+      await refreshMemory()
+    } catch (e) {
+      // Отказ ядра (пусто, слишком длинно, неизвестная область) — текстом.
+      memoryStatus = t('memoryFailed').replace('{msg}', String(e))
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  async function forgetMemory(id: number): Promise<void> {
+    if (!tauriAvailable || memoryBusy) return
+    memoryBusy = true
+    try {
+      await invoke<boolean>('memory_forget', { id })
+      memoryStatus = t('memoryRemoved')
+      await refreshMemory()
+    } catch (e) {
+      memoryStatus = t('memoryFailed').replace('{msg}', String(e))
+    } finally {
+      memoryBusy = false
+    }
+  }
+
+  /* Смена области перечитывает список: показывать глобальные факты под
+     подписью «заметки сессии» значило бы врать человеку. */
+  function setMemoryScope(scope: 'global' | 'session'): void {
+    if (memoryScope === scope) return
+    memoryScope = scope
+    memoryStatus = null
+    void refreshMemory()
+  }
+
+  $effect(() => {
+    if (showSettings && settingsTab === 'memory') void refreshMemory()
+  })
+
   /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
      «подозрительно тихий», а не вечное «думает». Состояние живёт здесь,
      derived turnQuiet — ниже, рядом с `thinking` (порядок объявлений). */
@@ -1026,6 +1099,9 @@
     { slash: '/perm:never', group: 'palGroupAgent', desc: 'cmdPermNeverDesc', action: () => { void selectPermission('never') } },
     { slash: '/update', group: 'palGroupAgent', desc: 'cmdUpdateDesc', action: () => { showSettings = true; settingsTab = 'general'; void checkUpdate() } },
     { slash: '/tasks', group: 'palGroupAgent', desc: 'cmdTasksDesc', action: () => { showSettings = true; settingsTab = 'telemetry'; void refreshTelemetry() } },
+    /* F-7: память приложения — та же таблица, куда пишет агент через
+       memory_add. Палитра объявлена в плане F-2, содержимое появилось здесь. */
+    { slash: '/memory', group: 'palGroupAgent', desc: 'memoryCmdDesc', action: () => { showSettings = true; settingsTab = 'memory'; void refreshMemory() } },
     { slash: '/theme:dark', group: 'palGroupView', desc: 'cmdThemeDarkDesc', action: () => (appearance = 'dark') },
     { slash: '/theme:light', group: 'palGroupView', desc: 'cmdThemeLightDesc', action: () => (appearance = 'light') },
     { slash: '/theme:contrast', group: 'palGroupView', desc: 'cmdThemeContrastDesc', action: () => (appearance = 'contrast') },
@@ -2134,6 +2210,7 @@
           <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
           <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
           <button class="settings-nav-item" class:active={settingsTab === 'telemetry'} onclick={() => { settingsTab = 'telemetry'; void refreshTelemetry() }}><Icon name="scale" size={14} /> {t('telemetryTab')}</button>
+          <button class="settings-nav-item" class:active={settingsTab === 'memory'} onclick={() => { settingsTab = 'memory'; void refreshMemory() }}><Icon name="brain" size={14} /> {t('memoryTab')}</button>
         </nav>
         <div class="settings-content">
           {#if settingsTab === 'general'}
@@ -2703,6 +2780,28 @@
                   </table>
                 </div>
               {/if}
+            </div>
+          {:else if settingsTab === 'memory'}
+            <div class="settings-section">
+              <MemoryTab
+                title={t('memoryTitle')}
+                desc={t('memoryDesc')}
+                globalLabel={t('memoryGlobal')}
+                sessionLabel={t('memorySession')}
+                globalHint={t('memoryGlobalHint')}
+                sessionHint={t('memorySessionHint')}
+                placeholder={t('memoryPlaceholder')}
+                addLabel={t('memoryAdd')}
+                forgetLabel={t('memoryForget')}
+                emptyLabel={t('memoryEmpty')}
+                items={memoryItems}
+                scope={memoryScope}
+                busy={memoryBusy}
+                status={memoryStatus}
+                onScope={setMemoryScope}
+                onAdd={(text) => void addMemory(text)}
+                onForget={(id) => void forgetMemory(id)}
+              />
             </div>
           {:else}
             <div class="settings-section">

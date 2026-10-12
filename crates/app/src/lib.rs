@@ -1241,7 +1241,13 @@ pub(crate) async fn start_turn_core(
         // Память проекта инжектится в system-промпт каждого запроса хода.
         let memory_md =
             std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md")).unwrap_or_default();
-        let system_msg = context::system_prompt(&summary, &memory_md);
+        /* F-7: факты из базы приложения — второй источник памяти, живущий вне
+        рабочей директории. Читаются один раз на ход: промпт пересобирается на
+        каждом запросе, но факт, добавленный этим же ходом, станет видимым
+        модели со следующего хода (сам вызов memory_add уже вернул
+        подтверждение в истории, так что модель о нём знает). */
+        let memory_facts = memory_facts_for_prompt(&app_state);
+        let system_msg = context::system_prompt(&summary, &memory_md, &memory_facts);
 
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
         let mut fail_reason: Option<String> = None;
@@ -1456,6 +1462,11 @@ pub(crate) async fn start_turn_core(
                     stdio-процесс сервера из реестра AppState. */
                     let tool_outcome = if call.name == "semantic_search" {
                         run_semantic_search(&app_state, &call, &cwd).await
+                    } else if is_memory_tool(&call.name) {
+                        /* F-7: память приложения — нужен стор из AppState.
+                        В whitelist суб-агента этих имён нет, поэтому ветка
+                        писать память не может. */
+                        run_memory_tool(&app_state, sid.as_str(), &call).await
                     } else if call.name.starts_with(mcp::MCP_PREFIX) {
                         run_mcp_call(&app_state, &call).await
                     } else if call.name.starts_with(jsplugins::JS_PREFIX) {
@@ -2623,6 +2634,136 @@ async fn run_subagent(
     ToolOutcome { ok, output }
 }
 
+/* ── F-7: персистентная память приложения ──────────────────────────────────
+ * `memory_append` (B-3) пишет файл проекта и живёт в execute_tool. Эти три
+ * работают с базой приложения: факты переживают смену рабочей директории и
+ * удаление сессии. Исполняются не в execute_tool, а здесь — нужно хранилище
+ * из AppState, а execute_tool остаётся чистой функцией от (call, cwd). */
+
+/// Инструменты памяти приложения (таблица `memory`).
+pub(crate) fn is_memory_tool(name: &str) -> bool {
+    matches!(name, "memory_add" | "memory_list" | "memory_forget")
+}
+
+/// Потолок строк памяти, вшиваемых в системный промпт. Секция всё равно
+/// обрезана `context::FACTS_MAX_CHARS`; предел здесь держит выборку дешёвой.
+const MEMORY_PROMPT_LIMIT: usize = 200;
+
+/// Глобальные факты для системного промпта: `- текст` по строке, свежие
+/// первыми. Пустая строка, если памяти нет или база недоступна — отсутствие
+/// памяти не должно ронять ход.
+pub(crate) fn memory_facts_for_prompt(state: &AppState) -> String {
+    let Ok(store) = state.store.lock() else {
+        return String::new();
+    };
+    let rows = store
+        .memory_list(
+            swagcod_core::store::MEMORY_SCOPE_GLOBAL,
+            None,
+            MEMORY_PROMPT_LIMIT,
+        )
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return String::new();
+    }
+    /* Список свежих первым читается моделью как «актуальнее — выше», а обрезка
+    по потолку откусывает старьё, а не последние решения владельца. */
+    rows.iter()
+        .map(|m| format!("- {}", m.text.replace('\n', " ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Аргумент `scope`: по умолчанию global (как в описании инструмента).
+fn memory_scope_arg(call: &ToolCall) -> String {
+    let s = arg_str(call, "scope");
+    if s.trim().is_empty() {
+        swagcod_core::store::MEMORY_SCOPE_GLOBAL.to_string()
+    } else {
+        s
+    }
+}
+
+/// Выполнить вызов инструмента памяти. Как и у остальных тулзов, отказ — это
+/// результат ok=false, а не Err: модель видит причину и может исправить вызов.
+pub(crate) async fn run_memory_tool(
+    state: &Arc<AppState>,
+    session_id: &str,
+    call: &ToolCall,
+) -> ToolOutcome {
+    let fail = |output: String| ToolOutcome { ok: false, output };
+    let Ok(store) = state.store.lock() else {
+        return fail("память недоступна: хранилище заблокировано".into());
+    };
+    let scope = memory_scope_arg(call);
+    match call.name.as_str() {
+        "memory_add" => {
+            /* Заметка сессии принадлежит сессии: id подставляем сами, иначе
+            модель могла бы записать «сессионный» факт чужой сессии. */
+            let sid = if scope == swagcod_core::store::MEMORY_SCOPE_SESSION {
+                Some(session_id)
+            } else {
+                None
+            };
+            match store.memory_add(&scope, sid, &arg_str(call, "text")) {
+                Ok(id) => ToolOutcome {
+                    ok: true,
+                    output: format!("сохранено в память (id {id}, область {scope})"),
+                },
+                Err(e) => fail(format!("memory_add: {e}")),
+            }
+        }
+        "memory_list" => {
+            let limit = call
+                .arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            let sid = if scope == swagcod_core::store::MEMORY_SCOPE_SESSION {
+                Some(session_id)
+            } else {
+                None
+            };
+            match store.memory_list(&scope, sid, limit) {
+                Ok(rows) if rows.is_empty() => ToolOutcome {
+                    ok: true,
+                    output: format!("память пуста (область {scope})"),
+                },
+                Ok(rows) => {
+                    let mut out = format!("память, область {scope}: {} стр.\n", rows.len());
+                    for m in rows {
+                        let when = m.created_ms / 1000;
+                        out.push_str(&format!("#{} [{}] {}\n", m.id, when, m.text));
+                    }
+                    ToolOutcome {
+                        ok: true,
+                        output: out,
+                    }
+                }
+                Err(e) => fail(format!("memory_list: {e}")),
+            }
+        }
+        "memory_forget" => {
+            let id = match call.arguments.get("id").and_then(|v| v.as_i64()) {
+                Some(v) => v,
+                None => return fail("memory_forget: нужен id (см. memory_list)".into()),
+            };
+            match store.memory_forget(id) {
+                Ok(true) => ToolOutcome {
+                    ok: true,
+                    output: format!("забыто: #{id}"),
+                },
+                /* Несуществующий id — ошибка, а не «готово»: модель должна
+                понять, что факт не удалён (например, перепутала области). */
+                Ok(false) => fail(format!("memory_forget: строка #{id} не найдена")),
+                Err(e) => fail(format!("memory_forget: {e}")),
+            }
+        }
+        other => fail(format!("неизвестный инструмент памяти: {other}")),
+    }
+}
+
 /// Выполнить один вызов. Не паникует и не возвращает Err: любой отказ
 /// становится результатом ok=false, и модель видит его как ответ тулза.
 /// `plugins` — зарегистрированные внешние инструменты (B-5): неизвестное
@@ -3082,6 +3223,52 @@ fn approval_log(
     store
         .approval_log(session_id.as_deref(), limit.unwrap_or(200))
         .map_err(|e| e.to_string())
+}
+
+/* ── F-7: команды памяти для UI (вкладка Настройки → Память) ───────────────
+ * Тот же контракт Store, что у инструментов модели: человек и агент видят
+ * одну память, а не две параллельные. */
+
+/// Список памяти, свежие первыми. `session_id` обязателен для области session.
+#[tauri::command]
+fn memory_list(
+    state: State<'_, Arc<AppState>>,
+    scope: Option<String>,
+    session_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<swagcod_core::store::MemoryEntry>, String> {
+    let scope = scope.unwrap_or_else(|| swagcod_core::store::MEMORY_SCOPE_GLOBAL.to_string());
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .memory_list(&scope, session_id.as_deref(), limit.unwrap_or(200))
+        .map_err(|e| e.to_string())
+}
+
+/// Добавить строку памяти из UI. Возвращает id новой строки.
+#[tauri::command]
+fn memory_add(
+    state: State<'_, Arc<AppState>>,
+    scope: Option<String>,
+    session_id: Option<String>,
+    text: String,
+) -> Result<i64, String> {
+    let scope = scope.unwrap_or_else(|| swagcod_core::store::MEMORY_SCOPE_GLOBAL.to_string());
+    /* Заметка сессии без сессии — бессмыслица: она не найдётся ни одним
+    списком. Отказ понятнее, чем строка с NULL, висящая в базе. */
+    if scope == swagcod_core::store::MEMORY_SCOPE_SESSION && session_id.is_none() {
+        return Err("заметка сессии требует session_id".into());
+    }
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .memory_add(&scope, session_id.as_deref(), &text)
+        .map_err(|e| e.to_string())
+}
+
+/// Забыть строку памяти. false — её уже не было.
+#[tauri::command]
+fn memory_forget(state: State<'_, Arc<AppState>>, id: i64) -> Result<bool, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.memory_forget(id).map_err(|e| e.to_string())
 }
 
 /* ── F-3: allow/deny-списки команд ──────────────────────────────────────────
@@ -4652,6 +4839,9 @@ pub fn run() {
             cmd_rules_save,
             turn_revert,
             turn_checkpoints,
+            memory_list,
+            memory_add,
+            memory_forget,
             save_protected_key,
             clear_protected_key,
             get_diagnostics,
@@ -6343,6 +6533,394 @@ rl.on('line', (l) => {
         .unwrap();
         assert!(p.contains("больше 2 МБ"), "{p}");
         assert!(p.len() < 200, "заглушка короткая: {p}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- F-7: персистентная память (инструменты, контекст, e2e) ----
+
+    fn mem_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn memory_tools_add_list_forget_and_scope_binding() {
+        use swagcod_core::store::{MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
+        let state = mem_state();
+
+        // scope по умолчанию — global: модель не обязана его повторять.
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call(
+                "memory_add",
+                serde_json::json!({"text": "  владелец любит краткость  "}),
+            ),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("id 1"), "{}", out.output);
+        assert!(out.output.contains("global"), "{}", out.output);
+
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call(
+                "memory_add",
+                serde_json::json!({"text": "заметка сессии", "scope": "session"}),
+            ),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+
+        let out = run_memory_tool(&state, "s-1", &call("memory_list", serde_json::json!({}))).await;
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("владелец любит краткость"),
+            "{}",
+            out.output
+        );
+        assert!(
+            out.output.contains("#1"),
+            "id нужен для memory_forget: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("заметка сессии"),
+            "сессионная строка не в глобальном списке: {}",
+            out.output
+        );
+
+        // Заметка сессии видна только своей сессии.
+        let out = run_memory_tool(
+            &state,
+            "s-2",
+            &call("memory_list", serde_json::json!({"scope": "session"})),
+        )
+        .await;
+        assert!(out.output.contains("память пуста"), "{}", out.output);
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call("memory_list", serde_json::json!({"scope": "session"})),
+        )
+        .await;
+        assert!(out.output.contains("заметка сессии"), "{}", out.output);
+
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call("memory_forget", serde_json::json!({"id": 2})),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        // Повтор — ошибка, а не «готово»: иначе модель решит, что удалила
+        // другой факт.
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call("memory_forget", serde_json::json!({"id": 2})),
+        )
+        .await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("не найдена"), "{}", out.output);
+
+        let out =
+            run_memory_tool(&state, "s-1", &call("memory_forget", serde_json::json!({}))).await;
+        assert!(!out.ok && out.output.contains("нужен id"), "{}", out.output);
+
+        // Глобальный факт пережил операции с сессионным.
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_tools_reject_bad_input_without_saving() {
+        use swagcod_core::store::MEMORY_TEXT_MAX_CHARS;
+        let state = mem_state();
+
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call("memory_add", serde_json::json!({"text": "   "})),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("пустая"), "{}", out.output);
+
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call(
+                "memory_add",
+                serde_json::json!({"text": "x", "scope": "private"}),
+            ),
+        )
+        .await;
+        assert!(
+            !out.ok && out.output.contains("неизвестная область"),
+            "{}",
+            out.output
+        );
+
+        let out = run_memory_tool(
+            &state,
+            "s-1",
+            &call(
+                "memory_add",
+                serde_json::json!({"text": "ф".repeat(MEMORY_TEXT_MAX_CHARS + 1)}),
+            ),
+        )
+        .await;
+        assert!(!out.ok && out.output.contains("длиннее"), "{}", out.output);
+
+        // Ничего из отвергнутого не сохранилось.
+        let out = run_memory_tool(&state, "s-1", &call("memory_list", serde_json::json!({}))).await;
+        assert!(out.output.contains("память пуста"), "{}", out.output);
+
+        /* `memory_append` (B-3) — другой инструмент: он пишет файл проекта и
+        исполняется в execute_tool, поэтому в диспетчер памяти не попадает. */
+        assert!(is_memory_tool("memory_add"));
+        assert!(is_memory_tool("memory_forget"));
+        assert!(!is_memory_tool("memory_append"));
+    }
+
+    #[tokio::test]
+    async fn global_facts_are_injected_into_system_prompt() {
+        use swagcod_core::store::{MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
+        let state = mem_state();
+        assert_eq!(
+            memory_facts_for_prompt(&state),
+            "",
+            "пустая память не добавляет секцию"
+        );
+        {
+            let g = state.store.lock().unwrap();
+            g.memory_add(MEMORY_SCOPE_GLOBAL, None, "сборка: cargo test --workspace")
+                .unwrap();
+            g.memory_add(MEMORY_SCOPE_GLOBAL, None, "первая\nвторая строка")
+                .unwrap();
+            g.memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка сессии")
+                .unwrap();
+        }
+        let facts = memory_facts_for_prompt(&state);
+        assert!(
+            facts.contains("- сборка: cargo test --workspace"),
+            "{facts}"
+        );
+        assert!(
+            !facts.contains("заметка сессии"),
+            "сессионное не уезжает в глобальный промпт: {facts}"
+        );
+        /* Многострочный факт схлопывается в одну строку списка: иначе одна
+        «заметка» выглядела бы как несколько фактов. */
+        assert!(facts.contains("- первая вторая строка"), "{facts}");
+        assert_eq!(facts.lines().count(), 2, "{facts}");
+
+        let msg = swagcod_core::context::system_prompt("", "", &facts);
+        assert!(msg.content.contains("Сохранённые факты"), "{}", msg.content);
+        assert!(
+            msg.content.contains("cargo test --workspace"),
+            "{}",
+            msg.content
+        );
+    }
+
+    /// F-7 e2e: ход через fake-провайдер сохраняет факт инструментом, а
+    /// следующий ход получает его в системном промпте. Провайдер настраивается
+    /// prefs-записью (локальный base_url, ключ не нужен), поэтому
+    /// env-переменные не трогаем — тесты идут параллельно.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_fact_saved_by_model_reaches_next_turn_prompt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<std::sync::Mutex<Vec<(usize, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let srv_hits = hits.clone();
+        let srv_bodies = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = srv_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let cap = srv_bodies.clone();
+                tokio::spawn(async move {
+                    // Тело запроса больше списка инструментов: читаем, пока
+                    // сокет что-то отдаёт, иначе ассерт увидит обрезок.
+                    let mut buf = vec![0u8; 262_144];
+                    let mut filled = 0usize;
+                    loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(300),
+                            sock.read(&mut buf[filled..]),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(k)) => {
+                                filled += k;
+                                if filled >= buf.len() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Ok(mut g) = cap.lock() {
+                        g.push((n, String::from_utf8_lossy(&buf[..filled]).to_string()));
+                    }
+                    let body = match n {
+                        1 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"m1\",\"type\":\"function\",\"function\":{\"name\":\"memory_add\",\"arguments\":\"{\\\"text\\\": \\\"владелец любит краткие ответы\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                        _ => "data: {\"choices\":[{\"delta\":{\"content\":\"ГОТОВО\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let state = mem_state();
+        let dir = std::env::temp_dir().join(format!("swagcod-mem-e2e-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "mem-sess";
+        let s = Session::new(
+            SessionId::new(sid),
+            dir.to_string_lossy().to_string(),
+            "test-model".to_string(),
+        );
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+            // Активный провайдер — фейк на 127.0.0.1: ключ не нужен.
+            g.set_pref("provider_active", "fake").unwrap();
+            g.set_pref(
+                "providers_custom",
+                &format!(
+                    "[{{\"id\":\"fake\",\"label\":\"fake\",\"base_url\":\"http://127.0.0.1:{port}/v1\",\"flavor\":\"openai\"}}]"
+                ),
+            )
+            .unwrap();
+        }
+        state.sessions.lock().await.push(s);
+
+        /// Дождаться записи `want` ходов в базу (ход пишется по завершении).
+        async fn wait_turns(state: &Arc<AppState>, sid: &str, want: usize) {
+            for _ in 0..600 {
+                let n = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.load_session(sid).ok().flatten())
+                    .map(|s| s.turns.len())
+                    .unwrap_or(0);
+                if n >= want {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("ходы не записались за 30 с");
+        }
+
+        start_turn_core(
+            state.clone(),
+            sid.to_string(),
+            "запомни, что я люблю краткость".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ход стартовал");
+        wait_turns(&state, sid, 1).await;
+
+        // Факт действительно в базе, а не только в выводе инструмента.
+        {
+            let g = state.store.lock().unwrap();
+            let rows = g
+                .memory_list(swagcod_core::store::MEMORY_SCOPE_GLOBAL, None, 10)
+                .unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].text, "владелец любит краткие ответы");
+        }
+        // Результат инструмента дошёл до истории: модель видит подтверждение.
+        {
+            let g = state.store.lock().unwrap();
+            let ses = g.load_session(sid).unwrap().unwrap();
+            let tool_msg = ses
+                .history
+                .iter()
+                .find(|m| m.role == swagcod_provider::types::Role::Tool)
+                .expect("в истории есть ответ тулза");
+            assert!(
+                tool_msg.content.contains("сохранено"),
+                "{}",
+                tool_msg.content
+            );
+        }
+
+        // Второй ход: промпт обязан содержать сохранённый факт.
+        start_turn_core(
+            state.clone(),
+            sid.to_string(),
+            "продолжим".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("второй ход стартовал");
+        wait_turns(&state, sid, 2).await;
+
+        let captured = bodies.lock().unwrap().clone();
+        assert!(
+            captured.len() >= 3,
+            "ожидано 3 запроса: {:?}",
+            captured.len()
+        );
+        let last = &captured.last().unwrap().1;
+        assert!(
+            last.contains("Сохранённые факты"),
+            "во втором ходе нет секции памяти"
+        );
+        assert!(
+            last.contains("владелец любит краткие ответы"),
+            "факт не доехал до промпта"
+        );
+        let first = &captured.first().unwrap().1;
+        assert!(
+            !first.contains("Сохранённые факты"),
+            "в первом ходе фактов ещё не было"
+        );
+        // Инструмент памяти объявлен модели: без спека она бы его не вызвала.
+        assert!(first.contains("memory_add"), "в запросе нет memory_add");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

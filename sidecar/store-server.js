@@ -98,6 +98,16 @@ CREATE TABLE IF NOT EXISTS metrics(
   value REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts_ms);
+/* F-7: персистентная память (scope global|session). Без FK на sessions:
+   память переживает удаление сессии. */
+CREATE TABLE IF NOT EXISTS memory(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'global',
+  text TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);

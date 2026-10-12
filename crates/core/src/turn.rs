@@ -68,12 +68,17 @@ impl ApprovalPolicy {
     /// инструменты, опасных операций ветка не выполняет.
     /// F-4: `web_search` — встроенный и read-only (сеть на чтение, как
     /// `fetch_url`), поэтому тоже вне опасных.
+    /// F-7: `memory_*` — встроенные: пишут не систему, а базу приложения,
+    /// поэтому подтверждения не требуют (как `memory_append`).
     pub const BUILTIN: &'static [&'static str] = &[
         "read",
         "list",
         "write",
         "bash",
         "memory_append",
+        "memory_add",
+        "memory_list",
+        "memory_forget",
         "grep",
         "glob",
         "patch",
@@ -657,6 +662,43 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["prompt"]
             }),
         },
+        /* F-7: персистентная память приложения (таблица `memory`). Отличие от
+           `memory_append`: та пишет файл в рабочей директории проекта, эти
+           работают с базой приложения и переживают смену рабочей директории.
+           Глобальные факты вшиваются в системный промпт каждого хода, поэтому
+           строки должны быть короткими. */
+        ToolSpec {
+            name: "memory_add".into(),
+            description: "Save a durable fact to the application memory (database, survives sessions and working-directory changes). scope=\"global\" = a fact about the user or the workflow, injected into the system prompt of every turn (keep it short); scope=\"session\" = a note for this session only. Returns the new memory id. Prefer this over memory_append for facts that are not tied to one repository.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "One short fact, up to 2000 chars" },
+                    "scope": { "type": "string", "enum": ["global", "session"], "description": "global (default) or session" }
+                },
+                "required": ["text"]
+            }),
+        },
+        ToolSpec {
+            name: "memory_list".into(),
+            description: "List saved memory entries, newest first, with their ids (the id is what memory_forget needs). scope=\"global\" = application facts, scope=\"session\" = notes of the current session.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["global", "session"], "description": "global (default) or session" },
+                    "limit": { "type": "integer", "description": "Max entries, 1..200, default 50" }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "memory_forget".into(),
+            description: "Delete a memory entry by id (see memory_list). Use it to correct an outdated fact: forget it, then memory_add the new one. Returns whether the entry existed.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "integer", "description": "Memory entry id" } },
+                "required": ["id"]
+            }),
+        },
     ]
 }
 
@@ -1190,6 +1232,44 @@ mod tests {
         assert!(p.requires_approval("my_plugin_tool"));
         assert!(!p.requires_approval("fetch_url"));
         assert!(!p.requires_approval("MEMORY_APPEND"));
+    }
+
+    /// F-7: инструменты памяти — встроенные (значит не «опасные» по
+    /// неизвестному имени) и с обязательными аргументами, иначе модель
+    /// вызовет `memory_forget` без id и получит молчаливый no-op.
+    #[test]
+    fn memory_tools_are_builtin_with_required_args() {
+        let p = ApprovalPolicy::OnDangerous;
+        for name in ["memory_add", "memory_list", "memory_forget"] {
+            assert!(
+                !p.requires_approval(name),
+                "{name} не должен требовать диалога"
+            );
+            let spec = builtin_tool_specs()
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} есть в спеках"));
+            assert!(spec.parameters.get("properties").is_some(), "{name}");
+            assert!(!spec.description.is_empty(), "{name} без описания");
+        }
+        let add = builtin_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "memory_add")
+            .unwrap();
+        let required = add.parameters["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "text"), "{required:?}");
+        // Область — enum, а не свободная строка: «private» молча не сохранится.
+        let scope = &add.parameters["properties"]["scope"]["enum"];
+        assert_eq!(scope.as_array().unwrap().len(), 2, "{scope}");
+        let forget = builtin_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "memory_forget")
+            .unwrap();
+        assert!(forget.parameters["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "id"));
     }
 
     #[test]
