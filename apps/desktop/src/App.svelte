@@ -37,6 +37,9 @@
   } from './components/SettingsTabs.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
   import { type MemoryItem } from './components/MemoryTab.svelte'
+  /* F-10: полнотекстовый поиск по истории. Панель — components/HistorySearch.svelte,
+     разбор сниппета — lib/search.ts; здесь только состояние и вызов команды. */
+  import HistorySearch, { type MessageHitDto } from './components/HistorySearch.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
   import { Transcript as TranscriptModel, type TranscriptItem } from './lib/transcript'
@@ -1084,6 +1087,51 @@
       : items
   )
 
+  /* F-10: поиск по истории всех сессий (FTS5 в ядре). Имена отдельные от
+     showSearch/searchQuery выше: те фильтруют текущую транскрипцию на месте, а эти
+     ходят в ядро по всей базе. Поколение запроса защищает от гонки: ответ на
+     устаревший запрос не должен перекрывать свежий. */
+  const HISTORY_SEARCH_LIMIT = 50
+  let showHistorySearch = $state(false)
+  let historyHits = $state<MessageHitDto[]>([])
+  let historyError = $state('')
+  let historyBusy = $state(false)
+  let historyGen = 0
+
+  async function runHistorySearch(query: string): Promise<void> {
+    const gen = ++historyGen
+    const q = query.trim()
+    if (!q) {
+      historyHits = []
+      historyError = ''
+      historyBusy = false
+      return
+    }
+    historyBusy = true
+    try {
+      const hits = await invoke<MessageHitDto[]>('search_messages', {
+        query: q,
+        limit: HISTORY_SEARCH_LIMIT,
+      })
+      if (gen !== historyGen) return
+      historyHits = hits
+      historyError = ''
+    } catch (err) {
+      if (gen !== historyGen) return
+      historyHits = []
+      historyError = String(err)
+    } finally {
+      if (gen === historyGen) historyBusy = false
+    }
+  }
+
+  /* Находка открывает свою сессию. К самому сообщению не перематываем: в транскрипции
+     нет якоря по ord, а id из F-9 — на ход, а не на строку базы. */
+  function openHistoryHit(hit: MessageHitDto): void {
+    historyError = ''
+    if (hit.session_id !== currentSession) switchSession(hit.session_id)
+  }
+
   let showPalette = $state(false)
 
   /* F-2: палитра уровня DSH-референса — slash-имя, группа, описание.
@@ -1095,6 +1143,7 @@
     { slash: '/new', group: 'palGroupSession', desc: 'cmdNewDesc', action: () => createNewSession() },
     { slash: '/clear', group: 'palGroupSession', desc: 'cmdClearDesc', action: () => { transcriptFor(currentSession ?? '').clear(); items = transcriptFor(currentSession ?? '').items; revision++; eventsTotal = 0; batchesTotal = 0 } },
     { slash: '/compact', group: 'palGroupSession', desc: 'cmdCompactDesc', action: () => void compactNow() },
+    { slash: '/search', group: 'palGroupSession', desc: 'cmdSearchDesc', action: () => { showHistorySearch = true } },
     { slash: '/export', group: 'palGroupExport', desc: 'cmdExportDesc', action: () => exportTranscript() },
     { slash: '/diag', group: 'palGroupExport', desc: 'cmdDiagDesc', action: () => exportDiagnostics() },
     { slash: '/model', group: 'palGroupAgent', desc: 'cmdModelDesc', action: () => { showPermPicker = false; showModelPicker = true; modelQuery = '' } },
@@ -2034,6 +2083,7 @@
         if (showModelPicker) { showModelPicker = false; modelQuery = '' }
         if (showPermPicker) showPermPicker = false
         if (showSearch) { showSearch = false; searchQuery = '' }
+        if (showHistorySearch) showHistorySearch = false
         if (showPalette) showPalette = false
         if (showWorkspaces) showWorkspaces = false
         if (showSettings) showSettings = false
@@ -2306,6 +2356,19 @@
 <!-- F-10: палитра команд — компонент; здесь остаётся только «открыта ли» и
      список команд, чьи действия замкнуты на состояние приложения. -->
 <Palette bind:open={showPalette} {commands} {t} />
+
+<!-- F-10: результаты поиска по истории. Запрос уходит в ядро с задержкой из компонента,
+     здесь — состояние и счётчик поколений. -->
+<HistorySearch
+  bind:open={showHistorySearch}
+  hits={historyHits}
+  error={historyError}
+  busy={historyBusy}
+  limit={HISTORY_SEARCH_LIMIT}
+  {t}
+  onquery={(q) => void runHistorySearch(q)}
+  onpick={openHistoryHit}
+/>
 
 <main
   ondrop={onDrop}

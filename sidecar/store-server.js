@@ -111,7 +111,45 @@ CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);
+/* F-10: полнотекстовый поиск по истории. Индекс — external-content FTS5
+   поверх messages: текст не дублируется, а синхронность держат три триггера
+   (insert/delete/update). Поэтому и save_session со своим «DELETE + INSERT
+   целиком», и каскадное удаление сессии оставляют индекс правильным без
+   ручного сопровождения в коде. unicode61 + remove_diacritics 2: кириллица
+   и регистр работают из коробки: «прив» находит «привет», «ПРИВЕТ» находит
+   «привет». Диакритика сворачивается только латинская (résumé → resume),
+   а кириллическая «ё» остаётся отдельной буквой: «зеленые» НЕ находит
+   «зелёные» — проверено пробой, и это осознанное ограничение (свой
+   токенайзер ради одной буквы не стоит зависимости).
+   DDL обязан байт-в-байт совпадать с crates/core/src/store.rs (SCHEMA) —
+   сверяет тест schema_matches_js_sidecar. */
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  content,
+  reasoning,
+  content='messages',
+  content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content, reasoning) VALUES (new.id, new.content, new.reasoning);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content, reasoning) VALUES ('delete', old.id, old.content, old.reasoning);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content, reasoning) VALUES ('delete', old.id, old.content, old.reasoning);
+  INSERT INTO messages_fts(rowid, content, reasoning) VALUES (new.id, new.content, new.reasoning);
+END;
 `;
+
+/* F-10: тот же текст, что crate::store::FTS_NEEDS_BACKFILL_SQL. Пустота
+   индекса видна по теневой таблице messages_fts_docsize (строка на документ),
+   а не по messages_fts: external-content индекс на полном сканировании читает
+   таблицу-содержимое и выглядит непустым даже незаполненным. Два LIMIT 1
+   вместо COUNT(*): считать строки на каждом запуске значит платить
+   сканированием в бюджете старта (400 мс, D-013). */
+const FTS_NEEDS_BACKFILL = `SELECT (SELECT COUNT(*) FROM (SELECT rowid FROM messages_fts_docsize LIMIT 1)) = 0
+     AND (SELECT COUNT(*) FROM (SELECT id FROM messages LIMIT 1)) = 1`;
 
 /** @type {Database.Database|null} */
 let db = null;
@@ -151,6 +189,16 @@ function openDb(path) {
   try { db.exec('ALTER TABLE turns ADD COLUMN parent_turn_id TEXT'); } catch { /* уже есть */ }
   /* F-5: git-чекпоинт хода (снимок worktree до хода). */
   try { db.exec('ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT'); } catch { /* уже есть */ }
+  /* F-10: индекс FTS5 создаёт SCHEMA, но история могла появиться раньше него
+     (база старше FTS5 или оборвавшийся rebuild) — тогда дозируем один раз.
+     Критерий и текст запроса совпадают с SqliteStore::fts_backfill. */
+  try {
+    const row = db.prepare(FTS_NEEDS_BACKFILL).get();
+    if (row && Object.values(row)[0]) db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  } catch (e) {
+    // Приложение без поиска переживёт, а без открытой базы — нет: не роняем open.
+    process.stderr.write(`store-sidecar: fts backfill пропущен: ${e && e.message}\n`);
+  }
 }
 
 function handle(req) {

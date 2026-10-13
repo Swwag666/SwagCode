@@ -84,10 +84,20 @@ $ping = '{"id":1,"method":"ping"}
 {"id":2,"method":"open","path":":memory:"}
 {"id":3,"method":"exec","sql":"INSERT INTO prefs(key, value) VALUES (?1, ?2)","params":["k","v"]}
 {"id":4,"method":"query","sql":"SELECT value FROM prefs WHERE key = ?1","params":["k"]}
-{"id":5,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
+{"id":5,"method":"exec","sql":"INSERT INTO sessions(id, cwd, model, title, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)","params":["s-vendor","D:/probe","m","vendor",1]}
+{"id":6,"method":"exec","sql":"INSERT INTO messages(session_id, ord, role, content) VALUES (?1, ?2, ?3, ?4)","params":["s-vendor",0,"user","vendorprobe token"]}
+{"id":7,"method":"query","sql":"SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?1","params":["\"vendorprobe\"*"]}
+{"id":8,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
 $ErrorActionPreference = 'Stop'
 $okCount = @($ping | Where-Object { $_ -match '"ok":true' }).Count
-if ($okCount -lt 5) { throw "vendor sidecar did not answer all requests: $ping" }
+if ($okCount -lt 8) { throw "vendor sidecar did not answer all requests: $ping" }
+# F-10: the FTS5 index has to work in the BUNDLED node, not only in the dev
+# one. Request 7 must come back with a count of 1: a vendor assembled against
+# a different better-sqlite3 ABI (or a stale store-server.js without the FTS5
+# schema) can still open the database and answer the prefs roundtrip, while
+# search silently returns nothing on the primary backend.
+$ftsHit = @($ping | Where-Object { $_ -match '"rows":\[\[1\]\]' }).Count
+if ($ftsHit -lt 1) { throw "vendor sidecar FTS5 search did not find the probe row: $ping" }
 
 $size = (Get-ChildItem $vendor -Recurse | Measure-Object -Property Length -Sum).Sum
 $mb = [math]::Round($size / 1MB, 1)

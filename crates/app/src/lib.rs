@@ -2545,6 +2545,39 @@ fn approval_log(
         .map_err(|e| e.to_string())
 }
 
+/* ── F-10: полнотекстовый поиск по истории (палитра → «/search») ───────────
+ * Тонкая прокидка к Store::search_messages: безопасное выражение MATCH,
+ * сниппеты и ранжирование живут в ядре и покрыты тестами там же. Ядро команды
+ * вынесено в `_core`-функцию по общему соглашению (start_turn_core,
+ * list_models_core): tauri::State в юнит-тесте не собрать, а поведение
+ * команды — в том числе текст ошибки, который увидит человек, — проверить
+ * надо. */
+
+/// Сколько находок отдаём по умолчанию: список результатов листают, а не
+/// читают целиком, а ядро всё равно зажимает предел в SEARCH_MAX_LIMIT.
+const SEARCH_DEFAULT_LIMIT: usize = 50;
+
+fn search_messages_core(
+    state: &AppState,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<swagcod_core::store::MessageHit>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .search_messages(query, limit.unwrap_or(SEARCH_DEFAULT_LIMIT))
+        .map_err(|e| e.to_string())
+}
+
+/// Поиск по сообщениям всех сессий. Пустой запрос — ошибка, а не «нашлось всё».
+#[tauri::command]
+fn search_messages(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<swagcod_core::store::MessageHit>, String> {
+    search_messages_core(state.inner(), &query, limit)
+}
+
 /* ── F-7: команды памяти для UI (вкладка Настройки → Память) ───────────────
  * Тот же контракт Store, что у инструментов модели: человек и агент видят
  * одну память, а не две параллельные. */
@@ -4234,6 +4267,7 @@ pub fn run() {
             set_approval_policy,
             set_session_approval_policy,
             approval_log,
+            search_messages,
             cmd_rules_load,
             cmd_rules_save,
             hooks_load,
@@ -4962,6 +4996,69 @@ mod tests {
         );
         let just_under = vec![("t".to_string(), now - QUIET_TURN_MS + 1, false, None)];
         assert!(quiet_turns_to_warn(&just_under, now, QUIET_TURN_MS, QUIET_REWARN_MS).is_empty());
+    }
+
+    // ---- F-10: команда полнотекстового поиска ----
+
+    #[test]
+    fn search_messages_command_finds_history_and_rejects_empty_query() {
+        use swagcod_core::session::{TurnId, TurnRecord};
+
+        /* Команда — тонкая прокидка к ядру, но проверять надо именно её:
+        ошибка хранилища обязана доехать до UI строкой, которую человек
+        поймёт, а не паникой и не молчаливым пустым списком. */
+        let state = AppState {
+            store: std::sync::Mutex::new(swagcod_core::store::open_memory()),
+            ..Default::default()
+        };
+        let mut s = Session::new(
+            SessionId::new("s-search"),
+            "D:/proj".to_string(),
+            "test-model".to_string(),
+        );
+        s.title = "поисковая".to_string();
+        s.push_user_message("найди меня по истории");
+        let turn = TurnRecord {
+            id: TurnId::new("t-1"),
+            started_ms: 100,
+            ended_ms: Some(200),
+            content: "готово".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            est_input_tokens: 1,
+            est_output_tokens: 2,
+            ok: true,
+            failure: None,
+            parent_turn_id: None,
+            checkpoint_sha: None,
+        };
+        {
+            let g = state.store.lock().unwrap();
+            g.create_session(&s).unwrap();
+            g.save_turn("s-search", &turn, &s.history).unwrap();
+        }
+
+        let hits = search_messages_core(&state, "истории", None).unwrap();
+        assert_eq!(hits.len(), 1, "находка из истории сессии");
+        assert_eq!(hits[0].session_title, "поисковая");
+        assert_eq!(hits[0].role, "user");
+        assert!(
+            hits[0].snippet.contains("[истории]"),
+            "сниппет подсвечен: {}",
+            hits[0].snippet
+        );
+        assert_eq!(
+            search_messages_core(&state, "истории", Some(1))
+                .unwrap()
+                .len(),
+            1,
+            "явный предел работает"
+        );
+        // Пустой запрос — ошибка с внятным текстом, а не «нашлось всё».
+        let e = search_messages_core(&state, "   ", None).unwrap_err();
+        assert!(e.contains("пустой"), "{e}");
+        let e = search_messages_core(&state, "*** ---", None).unwrap_err();
+        assert!(e.contains("ни одного слова"), "{e}");
     }
 
     // ---- E-8: сэмплер телеметрии ----

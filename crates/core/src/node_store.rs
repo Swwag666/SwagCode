@@ -27,8 +27,9 @@ use serde_json::{json, Value};
 
 use crate::session::{Session, SessionId, SessionStatus, TurnRecord};
 use crate::store::{
-    memory_check_scope, memory_check_text, policy_from_str_opt, policy_to_str, role_from_str,
-    role_to_str, ApprovalEntry, MemoryEntry, Store, StoreError, StoreResult,
+    fts_match_expr, memory_check_scope, memory_check_text, policy_from_str_opt, policy_to_str,
+    role_from_str, role_to_str, search_limit, ApprovalEntry, MemoryEntry, MessageHit, Store,
+    StoreError, StoreResult, FTS_NEEDS_BACKFILL_SQL, FTS_REBUILD_SQL, SEARCH_MESSAGES_SQL,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall};
 
@@ -100,7 +101,25 @@ impl NodeStore {
         open дают и readiness-гарантию, и инициализацию схемы. */
         store.rpc(json!({"method": "ping"}))?;
         store.rpc(json!({"method": "open", "path": path.to_string_lossy()}))?;
+        /* F-10: схема создаёт индекс FTS5, но история в базе могла появиться
+        раньше него — тогда индекс дозируется один раз. Тот же критерий, что
+        в SqliteStore::fts_backfill: пусто в индексе при непустой messages. */
+        store.fts_backfill()?;
         Ok(store)
+    }
+
+    /// F-10: разовая пересборка FTS-индекса из `messages`.
+    ///
+    /// Условие — [`FTS_NEEDS_BACKFILL_SQL`] (два LIMIT 1, а не COUNT(*)),
+    /// поэтому повторный запуск на живой базе стоит двух коротких запросов и
+    /// не ест бюджет старта (D-013).
+    fn fts_backfill(&self) -> StoreResult<()> {
+        let rows = self.query(FTS_NEEDS_BACKFILL_SQL, vec![])?;
+        let needed = rows.first().map(|r| v_int(col(r, 0))).unwrap_or(0) != 0;
+        if needed {
+            self.exec(FTS_REBUILD_SQL, vec![])?;
+        }
+        Ok(())
     }
 
     /// Один запрос-ответ. Ответов ровно столько, сколько запросов, и они
@@ -689,6 +708,25 @@ impl Store for NodeStore {
             .collect())
     }
 
+    fn search_messages(&self, query: &str, limit: usize) -> StoreResult<Vec<MessageHit>> {
+        // Тот же SQL и та же проверка запроса, что в SqliteStore: выборка не
+        // имеет права разъезжаться между основным хранилищем и аварийным.
+        let expr = fts_match_expr(query)?;
+        let lim = search_limit(limit) as i64;
+        let rows = self.query(SEARCH_MESSAGES_SQL, vec![json!(expr), json!(lim)])?;
+        Ok(rows
+            .iter()
+            .map(|r| MessageHit {
+                session_id: v_text(col(r, 0)),
+                session_title: v_text(col(r, 1)),
+                ord: v_int(col(r, 2)).max(0) as u32,
+                role: v_text(col(r, 3)),
+                snippet: v_text(col(r, 4)),
+                rank: col(r, 5).as_f64().unwrap_or(0.0),
+            })
+            .collect())
+    }
+
     fn shutdown(&mut self) {
         // То же, что Drop: вежливый rpc, затем kill страховки ради.
         // Вызывается перед установкой обновления: работающий node.exe
@@ -1039,6 +1077,63 @@ mod tests {
         assert!(store.memory_list("private", None, 10).is_err());
     }
 
+    /* ── F-10: полнотекстовый поиск — тот же контракт, что в SqliteStore. ── */
+
+    #[test]
+    fn node_fts_search_finds_history_and_reasoning() {
+        let Some(store) = try_memory() else { return };
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn("s-1", &sample_turn(1), &ses.history)
+            .unwrap();
+
+        let hits = store.search_messages("привет", 10).unwrap();
+        assert_eq!(hits.len(), 1, "найдено сообщение пользователя");
+        assert_eq!(hits[0].session_title, "проба");
+        assert_eq!(hits[0].role, "user");
+        assert!(
+            hits[0].snippet.contains('[') && hits[0].snippet.contains(']'),
+            "сниппет подсвечивает совпадение: {}",
+            hits[0].snippet
+        );
+        // Колонка reasoning индексируется и в sidecar-бэкенде.
+        let think = store.search_messages("думаю", 10).unwrap();
+        assert_eq!(think.len(), 1, "{think:?}");
+        assert_eq!(think[0].role, "assistant");
+        // Префикс и регистр — как в rusqlite.
+        assert_eq!(store.search_messages("прив", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages("ПРИВЕТ", 10).unwrap().len(), 1);
+    }
+
+    /// Пустой запрос — ошибка на обоих бэкендах. Без общего `fts_match_expr`
+    /// better-sqlite3 бросил бы «fts5: syntax error», а rusqlite молча вернул
+    /// ноль строк: одно и то же действие значило бы разное.
+    #[test]
+    fn node_fts_search_rejects_empty_and_wordless_queries() {
+        let Some(store) = try_memory() else { return };
+        let e = store.search_messages("", 10).unwrap_err();
+        assert!(e.to_string().contains("пустой"), "{e}");
+        let e = store.search_messages("*** ---", 10).unwrap_err();
+        assert!(e.to_string().contains("ни одного слова"), "{e}");
+    }
+
+    #[test]
+    fn node_fts_search_drops_hits_with_the_session() {
+        let Some(store) = try_memory() else { return };
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn("s-1", &sample_turn(1), &ses.history)
+            .unwrap();
+        assert_eq!(store.search_messages("привет", 10).unwrap().len(), 1);
+        store.delete_session("s-1").unwrap();
+        assert!(
+            store.search_messages("привет", 10).unwrap().is_empty(),
+            "триггер messages_fts_ad чистит индекс и в sidecar-бэкенде"
+        );
+    }
+
     /// Схема не разъезжается с JS-sidecar: одинаковый набор таблиц.
     #[test]
     fn schema_matches_js_sidecar() {
@@ -1077,5 +1172,47 @@ mod tests {
                 "в store-server.js нет миграции колонки turns.{col}"
             );
         }
+        /* F-10: FTS5-индекс — тоже часть схемы, и его DDL обязан совпадать.
+        Расхождение молчаливо: один бэкенд ищет по истории, второй возвращает
+        пусто, а падает только поиск, который никто не запускает в тестах
+        против обеих реализаций. Поэтому сверяем не наличие имени, а текст
+        виртуальной таблицы, токенайзер и тела триггеров. */
+        assert!(
+            js.contains("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("),
+            "в store-server.js нет виртуальной таблицы messages_fts"
+        );
+        assert!(
+            js.contains("tokenize='unicode61 remove_diacritics 2'"),
+            "в store-server.js другой токенайзер FTS5"
+        );
+        assert!(
+            js.contains("content='messages',\n  content_rowid='id',")
+                || js.contains("content='messages', content_rowid='id',"),
+            "в store-server.js external-content FTS5 не над messages"
+        );
+        for trig in ["messages_fts_ai", "messages_fts_ad", "messages_fts_au"] {
+            assert!(
+                js.contains(&format!("CREATE TRIGGER IF NOT EXISTS {trig} ")),
+                "в store-server.js нет триггера {trig}"
+            );
+        }
+        for body in [
+            "INSERT INTO messages_fts(rowid, content, reasoning) VALUES (new.id, new.content, new.reasoning);",
+            "INSERT INTO messages_fts(messages_fts, rowid, content, reasoning) VALUES ('delete', old.id, old.content, old.reasoning);",
+        ] {
+            assert!(
+                js.contains(body),
+                "в store-server.js другое тело триггера FTS5: {body}"
+            );
+        }
+        // Дозация индекса для баз, созданных до FTS5, и её критерий.
+        assert!(
+            js.contains("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"),
+            "в store-server.js нет rebuild-дозации индекса"
+        );
+        assert!(
+            js.contains("(SELECT COUNT(*) FROM (SELECT rowid FROM messages_fts_docsize LIMIT 1)) = 0"),
+            "в store-server.js другой критерий дозации FTS5 (нужна теневая таблица messages_fts_docsize)"
+        );
     }
 }

@@ -59,8 +59,26 @@ if ($Sign) {
 }
 
 # --- 2. vendor payload (bundled node + sidecar = installer resources) ----
-$needVendor = (-not (Test-Path (Join-Path $root 'vendor\node\node.exe'))) -or
-              (-not (Test-Path (Join-Path $root 'vendor\sidecar\store-server.js')))
+# F-10: re-bundle not only when the payload is MISSING but when the vendored
+# sidecar differs from sidecar/store-server.js. The schema lives in both
+# crates/core/src/store.rs and sidecar/store-server.js and they must ship
+# together: a stale vendored copy means the installed exe runs a sidecar
+# without the FTS5 index while the rusqlite fallback has it, so search
+# silently returns nothing on the primary backend. Hash compare, not mtime -
+# mtime lies after a git checkout.
+$sidecarSrc = Join-Path $root 'sidecar\store-server.js'
+$sidecarDst = Join-Path $root 'vendor\sidecar\store-server.js'
+$sidecarStale = -not (Test-Path $sidecarDst)
+if (-not $sidecarStale) {
+    $h1 = (Get-FileHash $sidecarSrc -Algorithm SHA256).Hash
+    $h2 = (Get-FileHash $sidecarDst -Algorithm SHA256).Hash
+    if ($h1 -ne $h2) {
+        $sidecarStale = $true
+        Write-Host 'vendor sidecar is stale (schema changed) - re-bundling' -ForegroundColor Yellow
+    }
+}
+$needVendor = $sidecarStale -or
+              (-not (Test-Path (Join-Path $root 'vendor\node\node.exe')))
 if ($needVendor) {
     Write-Host '== assembling vendor (fetch-node + bundle-sidecar) ==' -ForegroundColor Cyan
     powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'fetch-node.ps1')

@@ -106,6 +106,126 @@ pub(crate) fn memory_check_scope(scope: &str) -> StoreResult<String> {
     }
 }
 
+/// F-10: совпадение полнотекстового поиска по истории сообщений.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MessageHit {
+    pub session_id: String,
+    /// Заголовок сессии — в списке результатов важнее id: по нему человек
+    /// узнаёт разговор.
+    pub session_title: String,
+    /// Позиция сообщения в истории сессии (тот же порядок, что в messages).
+    pub ord: u32,
+    /// "user" | "assistant" | "tool" | "system".
+    pub role: String,
+    /// Фрагмент текста с подсветкой: совпадения заключены в `[`…`]`.
+    pub snippet: String,
+    /// Ранг bm25: чем меньше (отрицательнее), тем лучше совпадение.
+    pub rank: f64,
+}
+
+/// Потолок слов в одном поисковом запросе.
+///
+/// Каждое слово — отдельный префиксный токен MATCH; без потолка запрос из
+/// вставленного абзаца превратился бы в выражение, которое FTS5 разбирает
+/// дольше, чем человек его читал.
+pub const SEARCH_MAX_TOKENS: usize = 16;
+/// Потолок длины запроса в символах.
+pub const SEARCH_MAX_QUERY_CHARS: usize = 200;
+/// Потолок выдачи: список результатов всё равно листают, а не читают весь.
+pub const SEARCH_MAX_LIMIT: usize = 200;
+
+/* F-10: SQL поиска — один на обе реализации Store (rusqlite и sidecar),
+иначе выборки разъехались бы по порядку колонок или по сниппету.
+snippet(-1) сам выбирает колонку с лучшим совпадением: текст ответа и
+рассуждения индексируются разными колонками. `?1`/`?2` — нумерованные
+плейсхолдеры, их понимают и rusqlite, и better-sqlite3. */
+pub(crate) const SEARCH_MESSAGES_SQL: &str = "SELECT m.session_id, s.title, m.ord, m.role,
+       snippet(messages_fts, -1, '[', ']', '…', 12) AS snip,
+       bm25(messages_fts) AS rank
+FROM messages_fts
+JOIN messages m ON m.id = messages_fts.rowid
+JOIN sessions s ON s.id = m.session_id
+WHERE messages_fts MATCH ?1
+ORDER BY rank LIMIT ?2";
+
+/* F-10: нужна ли разовая дозация индекса. Базы, созданные до FTS5, уже
+содержат messages, а новый индекс пуст — без rebuild поиск в них не нашёл
+бы ничего и молча.
+   Пустота индекса проверяется по теневой таблице `messages_fts_docsize`
+   (строка на каждый индексированный документ), а НЕ по `messages_fts`:
+   у external-content индекса полное сканирование читает таблицу-содержимое,
+   поэтому `SELECT rowid FROM messages_fts` вернул бы строки messages даже при
+   пустом индексе, и дозация не запустилась бы никогда. Оба подзапроса —
+   LIMIT 1, то есть O(1) на каждом старте: COUNT(*) по истории съел бы бюджет
+   запуска (400 мс, D-013). */
+pub(crate) const FTS_NEEDS_BACKFILL_SQL: &str =
+    "SELECT (SELECT COUNT(*) FROM (SELECT rowid FROM messages_fts_docsize LIMIT 1)) = 0
+     AND (SELECT COUNT(*) FROM (SELECT id FROM messages LIMIT 1)) = 1";
+/// Пересборка external-content индекса из messages (однократно).
+pub(crate) const FTS_REBUILD_SQL: &str = "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')";
+
+/// Запрос человека → безопасное выражение MATCH.
+///
+/// Проверка одна на обе реализации, и она обязательна: FTS5 на пустой строке
+/// ведёт себя по-разному — rusqlite молча возвращает ноль строк, а
+/// better-sqlite3 бросает «fts5: syntax error». То есть без общего правила
+/// «пустой запрос» значил бы разное на двух бэкендах.
+///
+/// Слово режется по не-буквенно-цифровым символам, каждый кусок кавычится и
+/// получает префикс. Кавычки обязательны: иначе `OR`, `NOT`, `*`, `(` из
+/// запроса человека стали бы синтаксисом FTS5. А резать слово нужно потому,
+/// что токенайзер `unicode61` сам считает пунктуацию разделителем: в индексе
+/// лежит `привет`, а не `"привет"`, поэтому буквальный запрос с кавычками не
+/// нашёл бы ничего (проверено пробой). Отсюда же честное поведение на
+/// вставке: `c++` ищется как `c`, `3.14` — как `3` И `14`, а фраза в кавычках
+/// — как И всех её слов.
+pub(crate) fn fts_match_expr(query: &str) -> StoreResult<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::Invalid("пустой поисковый запрос".into()));
+    }
+    if trimmed.chars().count() > SEARCH_MAX_QUERY_CHARS {
+        return Err(StoreError::Invalid(format!(
+            "поисковый запрос длиннее {SEARCH_MAX_QUERY_CHARS} символов"
+        )));
+    }
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    if toks.len() > SEARCH_MAX_TOKENS {
+        return Err(StoreError::Invalid(format!(
+            "в поисковом запросе больше {SEARCH_MAX_TOKENS} слов"
+        )));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for tok in toks {
+        /* Управляемые символы — не буквы и не цифры, поэтому они работают как
+        разделители и в SQL не доезжают. Кусок без букв и цифр («---», «***»)
+        просто не даёт токена: внутри MATCH он стал бы синтаксической ошибкой. */
+        for piece in tok.split(|c: char| !c.is_alphanumeric()) {
+            if piece.is_empty() {
+                continue;
+            }
+            // Удвоение кавычки — защита в глубину: после разреза по
+            // не-алфавитному её здесь не бывает, но полагаться на это незачем.
+            let quoted = piece.replace('"', "\"\"");
+            // Префикс: «тест» находит и «тесты», иначе поиск по русскому
+            // тексту требовал бы угадать словоформу.
+            parts.push(format!("\"{quoted}\"*"));
+        }
+    }
+    if parts.is_empty() {
+        return Err(StoreError::Invalid(
+            "в поисковом запросе нет ни одного слова".into(),
+        ));
+    }
+    // Пробел между токенами — неявный AND: ищем сообщения, где есть все слова.
+    Ok(parts.join(" "))
+}
+
+/// Предел выдачи: 0 или безумное число — не повод сканировать весь индекс.
+pub(crate) fn search_limit(limit: usize) -> usize {
+    limit.clamp(1, SEARCH_MAX_LIMIT)
+}
+
 /// Схема и режимы. WAL и NORMAL выставляются сразу: после перезапуска
 /// приложения база обязана продолжать писать без настройки извне.
 const SCHEMA: &str = r#"
@@ -201,6 +321,35 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, decided_ms);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(state, next_try_ms);
 CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts_ms);
+/* F-10: полнотекстовый поиск по истории. Индекс — external-content FTS5
+   поверх messages: текст не дублируется, а синхронность держат три триггера
+   (insert/delete/update). Поэтому и save_session со своим «DELETE + INSERT
+   целиком», и каскадное удаление сессии оставляют индекс правильным без
+   ручного сопровождения в коде. unicode61 + remove_diacritics 2: кириллица
+   и регистр работают из коробки: «прив» находит «привет», «ПРИВЕТ» находит
+   «привет». Диакритика сворачивается только латинская (résumé → resume),
+   а кириллическая «ё» остаётся отдельной буквой: «зеленые» НЕ находит
+   «зелёные» — проверено пробой, и это осознанное ограничение (свой
+   токенайзер ради одной буквы не стоит зависимости).
+   DDL обязан байт-в-байт совпадать с sidecar/store-server.js — сверяет тест
+   schema_matches_js_sidecar. */
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  content,
+  reasoning,
+  content='messages',
+  content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content, reasoning) VALUES (new.id, new.content, new.reasoning);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content, reasoning) VALUES ('delete', old.id, old.content, old.reasoning);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content, reasoning) VALUES ('delete', old.id, old.content, old.reasoning);
+  INSERT INTO messages_fts(rowid, content, reasoning) VALUES (new.id, new.content, new.reasoning);
+END;
 "#;
 
 /// Хранилище: синхронный контракт домена над персистентностью.
@@ -291,6 +440,14 @@ pub trait Store: Send {
     /// E-8: токены/день — агрегация оценочных токенов ходов, день UTC:
     /// (day_ms, tokens, turns). Ходы с нулевой оценкой не попадают.
     fn tokens_by_day(&self, since_ms: u64) -> StoreResult<Vec<(u64, u64, u64)>>;
+    /// F-10: полнотекстовый поиск по истории всех сессий (FTS5 поверх
+    /// `messages`), выдача по убыванию качества совпадения.
+    ///
+    /// Запрос приводится к безопасному выражению MATCH общим для обеих
+    /// реализаций [`fts_match_expr`]: пустой запрос или запрос без единого
+    /// слова — ошибка, а не «нашлось всё». `limit` зажимается в
+    /// 1..=[`SEARCH_MAX_LIMIT`].
+    fn search_messages(&self, query: &str, limit: usize) -> StoreResult<Vec<MessageHit>>;
     /// Обновление (rev37): остановить процесс бэкенда перед установкой
     /// новой версии — NSIS не перезапишет работающий node.exe. По
     /// умолчанию нет ничего: бэкендам без внешнего процесса (rusqlite)
@@ -325,6 +482,9 @@ impl SqliteStore {
         let _ = conn.execute("ALTER TABLE turns ADD COLUMN parent_turn_id TEXT", []);
         // Миграция F-5: git-чекпоинт хода (снимок worktree до хода).
         let _ = conn.execute("ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT", []);
+        // F-10: индекс FTS5 создан вместе со схемой, но история в этой базе
+        // могла появиться раньше него.
+        Self::fts_backfill(&conn)?;
         Ok(Self { conn })
     }
 
@@ -332,7 +492,21 @@ impl SqliteStore {
     pub fn in_memory() -> StoreResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        Self::fts_backfill(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// F-10: разовая пересборка FTS-индекса из `messages` — только если индекс
+    /// пуст, а сообщения есть (база старше FTS5 или оборвавшийся rebuild).
+    /// Условие проверяется двумя LIMIT 1, а не COUNT(*): на каждом запуске
+    /// считать строки индекса значит платить за поиск в бюджете старта
+    /// (400 мс, D-013).
+    fn fts_backfill(conn: &Connection) -> StoreResult<()> {
+        let needed: bool = conn.query_row(FTS_NEEDS_BACKFILL_SQL, [], |r| r.get(0))?;
+        if needed {
+            conn.execute_batch(FTS_REBUILD_SQL)?;
+        }
+        Ok(())
     }
 
     /// Целостность базы: используется краш-тестами после обрыва процесса.
@@ -868,6 +1042,23 @@ impl Store for SqliteStore {
             ))
         })?;
         Ok(mapped.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn search_messages(&self, query: &str, limit: usize) -> StoreResult<Vec<MessageHit>> {
+        let expr = fts_match_expr(query)?;
+        let lim = search_limit(limit) as i64;
+        let mut stmt = self.conn.prepare(SEARCH_MESSAGES_SQL)?;
+        let rows = stmt.query_map(params![expr, lim], |r| {
+            Ok(MessageHit {
+                session_id: r.get(0)?,
+                session_title: r.get(1)?,
+                ord: r.get::<_, i64>(2)?.max(0) as u32,
+                role: r.get(3)?,
+                snippet: r.get(4)?,
+                rank: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1466,5 +1657,357 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ── F-10: полнотекстовый поиск по истории (FTS5). ── */
+
+    /// Сессия с историей, записанной в базу через save_turn.
+    fn store_with_history() -> (SqliteStore, Session) {
+        let store = SqliteStore::in_memory().unwrap();
+        let ses = sample_session();
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn(ses.id.as_str(), &sample_turn(1), &ses.history)
+            .unwrap();
+        (store, ses)
+    }
+
+    #[test]
+    fn fts_search_finds_history_with_snippet() {
+        let (store, _ses) = store_with_history();
+        let hits = store.search_messages("привет", 10).unwrap();
+        assert_eq!(hits.len(), 1, "найдено одно сообщение пользователя");
+        let h = &hits[0];
+        assert_eq!(h.session_id, "s-1");
+        assert_eq!(
+            h.session_title, "проба",
+            "заголовок сессии приезжает с находкой"
+        );
+        assert_eq!(h.role, "user");
+        assert_eq!(h.ord, 0, "ord — позиция в истории");
+        assert!(
+            h.snippet.contains('[') && h.snippet.contains(']'),
+            "сниппет подсвечивает совпадение: {}",
+            h.snippet
+        );
+        assert!(
+            h.rank < 0.0,
+            "bm25 лучшего совпадения отрицателен: {}",
+            h.rank
+        );
+    }
+
+    #[test]
+    fn fts_search_covers_reasoning_and_tool_rows() {
+        let (store, _ses) = store_with_history();
+        // «думаю» есть только в reasoning ответа — колонка индексируется.
+        let hits = store.search_messages("думаю", 10).unwrap();
+        assert_eq!(hits.len(), 1, "рассуждение найдено: {hits:?}");
+        assert_eq!(hits[0].role, "assistant");
+        assert!(hits[0].snippet.contains("[думаю]"), "{}", hits[0].snippet);
+        // Вывод инструмента — тоже часть истории, и его можно найти.
+        let tools = store.search_messages("содержимое", 10).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].role, "tool");
+    }
+
+    #[test]
+    fn fts_search_is_prefix_and_case_tolerant() {
+        let (store, _ses) = store_with_history();
+        assert_eq!(
+            store.search_messages("прив", 10).unwrap().len(),
+            1,
+            "префикс находит словоформу"
+        );
+        assert_eq!(
+            store.search_messages("ПРИВЕТ", 10).unwrap().len(),
+            1,
+            "регистр не важен"
+        );
+    }
+
+    /// Ограничение токенайзера зафиксировано тестом, чтобы не выглядело
+    /// багом поиска: `unicode61 remove_diacritics 2` сворачивает латинскую
+    /// диакритику, а кириллическая «ё» остаётся отдельной буквой. То есть
+    /// «зеленые» НЕ находит «зелёные». Обход на стороне человека — искать
+    /// префиксом («зелё»), что и проверяется рядом.
+    #[test]
+    fn fts_search_does_not_fold_cyrillic_yo() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut ses = Session::new(SessionId::new("s-2"), "D:/proj", "test-model");
+        ses.title = "диакритика".to_string();
+        ses.push_user_message("тесты зелёные");
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn("s-2", &sample_turn(2), &ses.history)
+            .unwrap();
+
+        assert_eq!(store.search_messages("зелёные", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.search_messages("зеленые", 10).unwrap().len(),
+            0,
+            "ё и е — разные токены: это ограничение unicode61, а не пропавшая строка"
+        );
+        assert_eq!(
+            store.search_messages("зелё", 10).unwrap().len(),
+            1,
+            "префикс спасает: достаточно первых букв"
+        );
+    }
+
+    #[test]
+    fn fts_search_rejects_empty_punctuation_and_overlong_queries() {
+        let (store, _ses) = store_with_history();
+        // Пустой запрос — ошибка, а не «нашлось всё»: FTS5 на пустой строке
+        // ведёт себя по-разному на двух бэкендах (rusqlite молчит,
+        // better-sqlite3 бросает syntax error), поэтому правило общее.
+        let e = store.search_messages("", 10).unwrap_err();
+        assert!(e.to_string().contains("пустой"), "{e}");
+        let e = store.search_messages("   \t ", 10).unwrap_err();
+        assert!(e.to_string().contains("пустой"), "{e}");
+        let e = store.search_messages("--- *** (((", 10).unwrap_err();
+        assert!(e.to_string().contains("ни одного слова"), "{e}");
+        let e = store
+            .search_messages(&"слово ".repeat(SEARCH_MAX_TOKENS + 1), 10)
+            .unwrap_err();
+        assert!(e.to_string().contains("больше"), "{e}");
+        let e = store
+            .search_messages(&"д".repeat(SEARCH_MAX_QUERY_CHARS + 1), 10)
+            .unwrap_err();
+        assert!(e.to_string().contains("длиннее"), "{e}");
+    }
+
+    #[test]
+    fn fts_search_respects_limit_and_orders_by_rank() {
+        let store = SqliteStore::in_memory().unwrap();
+        for n in 0..5 {
+            let mut ses = Session::new(SessionId::new(format!("s-{n}")), "D:/proj", "test-model");
+            ses.title = format!("сессия {n}");
+            // Одно и то же слово в пяти сессиях: выдача обязана резаться.
+            ses.push_user_message("общий маркер поиска");
+            store.create_session(&ses).unwrap();
+            store
+                .save_turn(ses.id.as_str(), &sample_turn(n), &ses.history)
+                .unwrap();
+        }
+        assert_eq!(store.search_messages("маркер", 100).unwrap().len(), 5);
+        assert_eq!(store.search_messages("маркер", 2).unwrap().len(), 2);
+        // limit=0 не значит «ноль строк»: зажимается в 1, иначе SQL LIMIT 0
+        // выглядел бы как «ничего не нашлось».
+        assert_eq!(store.search_messages("маркер", 0).unwrap().len(), 1);
+        let ranks: Vec<f64> = store
+            .search_messages("маркер", 100)
+            .unwrap()
+            .iter()
+            .map(|h| h.rank)
+            .collect();
+        assert!(
+            ranks.windows(2).all(|w| w[0] <= w[1]),
+            "выдача по убыванию качества: {ranks:?}"
+        );
+    }
+
+    #[test]
+    fn fts_search_drops_hits_with_the_session() {
+        let (store, _ses) = store_with_history();
+        assert_eq!(store.search_messages("привет", 10).unwrap().len(), 1);
+        store.delete_session("s-1").unwrap();
+        assert!(
+            store.search_messages("привет", 10).unwrap().is_empty(),
+            "каскадное удаление сессии чистит индекс триггером"
+        );
+        assert_eq!(store.integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn fts_search_survives_rewrite_of_history() {
+        // save_session пишет историю целиком (DELETE + INSERT): индекс обязан
+        // остаться синхронным, иначе поиск показывал бы удалённые сообщения.
+        let (store, ses) = store_with_history();
+        let mut ses2 = ses.clone();
+        ses2.history.clear();
+        ses2.push_user_message("совершенно другой текст");
+        store
+            .save_turn("s-1", &sample_turn(2), &ses2.history)
+            .unwrap();
+        assert!(
+            store.search_messages("привет", 10).unwrap().is_empty(),
+            "старое сообщение не ищется после перезаписи истории"
+        );
+        assert_eq!(store.search_messages("другой", 10).unwrap().len(), 1);
+    }
+
+    /// База, созданная до F-10 (индекса FTS5 нет, история есть), после
+    /// открытия ищет по старой истории: дозация индекса одноразовая.
+    #[test]
+    fn fts_index_backfills_legacy_database() {
+        /* Схема без FTS5 — ровно то, что было до ревизии 48. Копия намеренная:
+        тест обязан открывать базу прежней формы, а не текущую. */
+        const LEGACY_NO_FTS: &str = r#"
+CREATE TABLE sessions(
+  id TEXT PRIMARY KEY,
+  cwd TEXT NOT NULL,
+  model TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  approval_policy TEXT,
+  created_ms INTEGER NOT NULL
+);
+CREATE TABLE messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ord INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  reasoning TEXT NOT NULL DEFAULT '',
+  tool_call_id TEXT,
+  tool_calls_json TEXT NOT NULL DEFAULT '[]'
+);
+"#;
+        let dir = std::env::temp_dir().join(format!("swagcod-fts-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(LEGACY_NO_FTS).unwrap();
+            conn.execute(
+                "INSERT INTO sessions(id, cwd, model, title, created_ms) VALUES ('s-9','D:/proj','m','старая',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(session_id, ord, role, content) VALUES ('s-9',0,'user','доисторическое сообщение')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let hits = store.search_messages("доисторическое", 10).unwrap();
+        assert_eq!(hits.len(), 1, "старая история найдена после дозации");
+        assert_eq!(hits[0].session_title, "старая");
+        // Повторное открытие не должно ни падать, ни дублировать находки.
+        drop(store);
+        let again = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            again.search_messages("доисторическое", 10).unwrap().len(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fts_match_expr_quotes_specials_and_adds_prefix() {
+        // Каждое слово кавычится и получает префикс; между словами — AND.
+        assert_eq!(fts_match_expr("тест").unwrap(), "\"тест\"*");
+        assert_eq!(
+            fts_match_expr("  тест  буг  ").unwrap(),
+            "\"тест\"* \"буг\"*"
+        );
+        // Спецсимволы FTS5 внутри кавычек — текст, а не синтаксис.
+        assert_eq!(fts_match_expr("a* OR b").unwrap(), "\"a\"* \"OR\"* \"b\"*");
+        // Вставленная фраза в кавычках ищется как И всех её слов.
+        assert_eq!(fts_match_expr("say \"hi\"").unwrap(), "\"say\"* \"hi\"*");
+        // `c++` токенайзер режет на `c` — запрос обязан совпасть с индексом.
+        assert_eq!(fts_match_expr("c++").unwrap(), "\"c\"*");
+        assert_eq!(fts_match_expr("3.14").unwrap(), "\"3\"* \"14\"*");
+        // Спецсимволы FTS5 не доезжают до MATCH: слово режется по
+        // не-алфавитному, поэтому `a*` даёт токен `a`, а `OR` — литерал.
+        // Знаки без букв и цифр пропускаются, а не роняют запрос.
+        assert_eq!(fts_match_expr("тест ---").unwrap(), "\"тест\"*");
+        assert!(fts_match_expr("...").is_err());
+        assert!(fts_match_expr("").is_err());
+        // Управляемые символы работают как разделители и в SQL не доезжают.
+        let e = fts_match_expr("те\u{0}ст").unwrap();
+        assert!(!e.contains('\u{0}'), "{e:?}");
+        assert_eq!(e, "\"те\"* \"ст\"*");
+    }
+
+    /// Пунктуация в запросе — разделитель, а не литерал: иначе вставка фразы
+    /// в кавычках или слова с плюсами молча не находили бы ничего.
+    #[test]
+    fn fts_search_treats_punctuation_as_separators() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut ses = Session::new(SessionId::new("s-3"), "D:/proj", "test-model");
+        ses.title = "пунктуация".to_string();
+        ses.push_user_message("он сказал \"привет мир\" и собрал c++ проект");
+        store.create_session(&ses).unwrap();
+        store
+            .save_turn("s-3", &sample_turn(3), &ses.history)
+            .unwrap();
+
+        assert_eq!(store.search_messages("сказал", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.search_messages("\"привет мир\"", 10).unwrap().len(),
+            1,
+            "фраза в кавычках ищется по словам"
+        );
+        assert_eq!(store.search_messages("c++", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages("проект", 10).unwrap().len(), 1);
+        /* Операторы FTS5 в запросе человека становятся обычными словами:
+        запрос не падает и не меняет смысл. В этом сообщении «OR» и «NOT» нет,
+        поэтому честно ноль находок — а не синтаксическая ошибка и не
+        «нашлось всё». */
+        assert_eq!(
+            store.search_messages("OR NOT (проект)", 10).unwrap().len(),
+            0
+        );
+
+        /* Обратная проверка нейтральности: если бы «OR»/«NOT» доехали до MATCH
+        операторами, такой запрос был бы синтаксической ошибкой (OR без левого
+        операнда). Он находит сообщение, где эти слова — текст. */
+        let mut ses2 = Session::new(SessionId::new("s-4"), "D:/proj", "test-model");
+        ses2.title = "операторы".to_string();
+        ses2.push_user_message("справка: OR NOT AND NEAR — это слова, а не синтаксис");
+        store.create_session(&ses2).unwrap();
+        store
+            .save_turn("s-4", &sample_turn(4), &ses2.history)
+            .unwrap();
+        let hits = store.search_messages("OR NOT", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "операторы ищутся как обычные слова: {hits:?}"
+        );
+        assert_eq!(hits[0].session_id, "s-4");
+        assert!(store.search_messages("***", 10).is_err());
+    }
+
+    /// Семантика зафиксирована тестом, чтобы не выглядела багом в UI: AND
+    /// действует внутри ОДНОГО сообщения, а не внутри сессии. Слова из разных
+    /// сообщений одной сессии вместе не находятся.
+    #[test]
+    fn fts_search_is_per_message_not_per_session() {
+        let (store, _ses) = store_with_history();
+        // «привет» — в сообщении пользователя, «здравствуй» — в ответе.
+        assert_eq!(store.search_messages("привет", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages("здравствуй", 10).unwrap().len(), 1);
+        assert!(
+            store
+                .search_messages("привет здравствуй", 10)
+                .unwrap()
+                .is_empty(),
+            "в одном сообщении обоих слов нет"
+        );
+    }
+
+    #[test]
+    fn fts_search_follows_in_place_update() {
+        // Триггер messages_au: UPDATE на месте (не перезапись истории целиком)
+        // тоже обязан держать индекс в синхроне.
+        let (store, _ses) = store_with_history();
+        assert_eq!(store.search_messages("привет", 10).unwrap().len(), 1);
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET content = 'обновлённый текст' WHERE ord = 0",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store.search_messages("привет", 10).unwrap().is_empty(),
+            "старый текст не ищется после обновления строки"
+        );
+        assert_eq!(store.search_messages("обновлённый", 10).unwrap().len(), 1);
     }
 }
