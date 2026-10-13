@@ -104,4 +104,29 @@ describe('MemoryTab: smoke', () => {
     render(MemoryTab, { ...props, status: STR.ru.memoryAdded })
     expect(screen.getByTestId('memory-status').textContent).toBe(STR.ru.memoryAdded)
   })
+
+  /* F-11: ветка metaKey не была закрыта ни одним тестом. На macOS жест тот же,
+     что Ctrl+Enter — память добавляют одной рукой, не отрываясь от чтения;
+     если при правке оставить один ctrlKey, сохранение молча сломается только
+     на Mac, и прежние тесты этого не заметили бы. */
+  it('Cmd+Enter сохраняет так же, как Ctrl+Enter', async () => {
+    const onAdd = vi.fn()
+    render(MemoryTab, { ...props, onAdd })
+    const input = screen.getByTestId('memory-input')
+    await fireEvent.input(input, { target: { value: 'факт' } })
+    await fireEvent.keyDown(input, { key: 'Enter', metaKey: true })
+    expect(onAdd).toHaveBeenCalledWith('факт')
+    // Enter без модификатора по-прежнему вставляет перевод строки, а не сохраняет.
+    await fireEvent.input(input, { target: { value: 'две\nстроки' } })
+    await fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onAdd).toHaveBeenCalledTimes(1)
+  })
+
+  it('активная область помечена, а не только подсказкой', () => {
+    // Подсказка уже проверялась; сам маркер — единственное, что показывает,
+    // куда попадёт новая строка, когда подсказку не читают.
+    render(MemoryTab, { ...props, scope: 'session' })
+    expect(screen.getByTestId('scope-session').classList.contains('active')).toBe(true)
+    expect(screen.getByTestId('scope-global').classList.contains('active')).toBe(false)
+  })
 })

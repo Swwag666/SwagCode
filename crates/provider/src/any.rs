@@ -9,6 +9,7 @@
 use tokio::sync::mpsc;
 
 use crate::anthropic::AnthropicProvider;
+use crate::echo::{EchoProvider, ECHO_NAME};
 use crate::http::ProviderError;
 use crate::router::{Provider, Router};
 use crate::sse::StreamEvent;
@@ -20,6 +21,10 @@ use crate::types::ChatRequest;
 pub enum AnyProvider {
     OpenAi(Router),
     Anthropic(AnthropicProvider),
+    /// F-11: встроенное эхо для сквозных проверок. Включается env-флагом
+    /// `SWAGCOD_ECHO_PROVIDER` в `build_chat_provider`; сети и ключей не
+    /// требует, поэтому сквозной тест в CI проходит весь ход целиком.
+    Echo(EchoProvider),
 }
 
 impl AnyProvider {
@@ -27,6 +32,7 @@ impl AnyProvider {
         match self {
             Self::OpenAi(r) => r.name().to_string(),
             Self::Anthropic(p) => format!("anthropic({})", p.base_url()),
+            Self::Echo(_) => ECHO_NAME.to_string(),
         }
     }
 
@@ -38,6 +44,7 @@ impl AnyProvider {
         match self {
             Self::OpenAi(r) => r.stream(req),
             Self::Anthropic(p) => p.stream(req).map_err(ProviderError::from),
+            Self::Echo(p) => p.stream(req),
         }
     }
 
@@ -45,6 +52,7 @@ impl AnyProvider {
         match self {
             Self::OpenAi(r) => r.list_models().await,
             Self::Anthropic(p) => p.list_models().await.map_err(ProviderError::from),
+            Self::Echo(p) => p.list_models().await,
         }
     }
 }

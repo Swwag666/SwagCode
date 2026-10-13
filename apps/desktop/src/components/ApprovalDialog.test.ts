@@ -51,6 +51,25 @@ describe('ApprovalDialog: smoke', () => {
     render(ApprovalDialog, { ...props, onRespond: vi.fn() })
     expect(screen.queryByTestId('diff-preview')).toBeNull()
   })
+
+  /* Единственная не закрытая выше часть diff-пути: подпись обрезки должна
+     доехать до человека ЧЕРЕЗ диалог. DiffPreview режет по maxLines=600, и без
+     hiddenLabel длинная правка выглядит показанной целиком — то есть решение
+     принималось бы по неполным данным. Тест держит проброс пропа. */
+  it('пробрасывает подпись обрезки длинного diff', () => {
+    const long = Array.from({ length: 601 }, (_, i) => `+строка ${i}`).join('\n') + '\n'
+    render(ApprovalDialog, {
+      ...props,
+      preview: long,
+      diffHiddenLabel: STR.ru.diffHidden,
+      onRespond: vi.fn(),
+    })
+    expect(screen.getByTestId('dp-hidden').textContent).toBe(
+      STR.ru.diffHidden.replace('{n}', '1'),
+    )
+    // Обрезка режет DOM, но не статистику: иначе «+601» превратилось бы в «+600».
+    expect(screen.getByTestId('dp-adds').textContent).toBe('+601')
+  })
 })
 
 describe('Icon: smoke', () => {

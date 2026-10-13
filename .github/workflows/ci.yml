@@ -86,6 +86,25 @@ jobs:
       - name: unit tests
         run: pnpm --filter swagcod-desktop test
 
+      # F-11: coverage — АРТЕФАКТ, а не ворота (так в плане стадии). Порогов
+      # здесь нет сознательно: само по себе число покрытия ничего не решает, а
+      # красный job из-за «78 % вместо 80 %» учит не писать тесты, а подкручивать
+      # планку. Отчёт нужен, чтобы видеть, ЧТО не покрыто.
+      # Отдельный шаг, а не `test -- --coverage`, ровно поэтому: поломка
+      # генератора отчёта не должна красить ворота, поэтому continue-on-error.
+      - name: coverage report (артефакт, не ворота)
+        continue-on-error: true
+        run: pnpm --filter swagcod-desktop exec vitest run --coverage
+
+      - name: upload coverage artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: apps/desktop/coverage/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: type check
         run: pnpm --filter swagcod-desktop check
 
@@ -150,6 +169,54 @@ jobs:
             echo "::error::Бандл JS вырос сверх бюджета ($TOTAL > $LIMIT байт)"
             exit 1
           fi
+
+  # F-11: сквозная проверка хода. Провайдер подменяется встроенным эхом по
+  # env-флагу SWAGCOD_ECHO_PROVIDER (паттерн fake-mcp: подделка живёт в
+  # репозитории, сети и ключей не требует), поэтому job проверяет ВЕСЬ путь —
+  # loopback HTTP API, драйвер хода, машину хода, шину событий, store и счёт
+  # токенов, — а не упирается в границу с сетью, где в CI всё равно никого нет.
+  # Профиль release: проверяем ту сборку, которую отдаём пользователю.
+  # Собранный .exe здесь сознательно не запускается: нужны WebView2 и оконная
+  # сессия, которых на headless-раннере нет (та же причина, по которой в CI нет
+  # бенчей старта, — см. комментарий внизу файла и D-013).
+  e2e-smoke:
+    name: E2E smoke · ход через HTTP API (echo-провайдер)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # vendor/node и vendor/sidecar нужны самому AppState: состояние
+      # приложения поднимает node-sidecar даже при in-memory базе (в выводе
+      # теста это строки «store-sidecar: готов»). Без них smoke проверил бы не
+      # ту сборку, что уходит в релиз.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: fetch node + bundle sidecar (E-1)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch-node.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/bundle-sidecar.ps1
+
+      - name: Cache cargo (release)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Отдельный ключ от job `rust`: тот кэширует debug-артефакты, а здесь
+          # нужен release. Общий ключ означал бы холодную сборку зависимостей
+          # на каждом прогоне.
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: сквозной ход (release, echo-провайдер)
+        # --nocapture: при падении видно, до какого события дошла лента.
+        run: cargo test --release -p swagcod-app --test e2e_smoke -- --nocapture
 
   # Замеры старта и памяти требуют GUI и WebView2, поэтому гоняются локально:
   #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/bench-startup.ps1 -OutFile bench-out/startup.json

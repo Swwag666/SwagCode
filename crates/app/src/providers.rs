@@ -20,8 +20,8 @@ use tauri::State;
 
 use swagcod_core::store::Store;
 use swagcod_provider::{
-    find_preset, AnthropicProvider, AnyProvider, OpenAiProvider, ProviderFlavor, ProviderPreset,
-    Router, RouterEndpoint, PRESETS,
+    echo_enabled, find_preset, AnthropicProvider, AnyProvider, EchoProvider, OpenAiProvider,
+    ProviderFlavor, ProviderPreset, Router, RouterEndpoint, PRESETS,
 };
 
 use super::{dpapi, short_id, AppState};
@@ -251,6 +251,13 @@ pub fn resolve_active(state: &AppState) -> Result<(ResolvedProvider, Vec<String>
 /// Собрать чат-провайдер для хода. `default` идёт старым путём
 /// (env + SWAGCOD_FALLBACKS); остальные — одиночной точкой.
 pub fn build_chat_provider(state: &AppState) -> Result<AnyProvider, String> {
+    /* F-11: env-флаг включает встроенное эхо — сквозная проверка хода без сети
+    и ключей. Проверяется ДО разбора конфигурации: у эха нет ни endpoint'а,
+    ни ключа, и требовать их значило бы, что флаг бесполезен ровно там, где
+    он нужен — на чистом CI-раннере, где провайдер не настроен вообще. */
+    if echo_enabled() {
+        return Ok(AnyProvider::Echo(EchoProvider::new()));
+    }
     let (cfg, _) = resolve_active(state)?;
     if cfg.id == DEFAULT_PROVIDER_ID {
         let router = Router::from_env_with_key(super::dpapi_key(state))

@@ -147,9 +147,11 @@ cargo build --release -p swagcod-app --features tauri/custom-protocol
 > и покажет ERR_CONNECTION_REFUSED — грабля Tauri v2 (DECISIONS.md §7).
 
 ```powershell
-cargo test --workspace                       # 290 Rust-тестов
-pnpm --filter swagcod-desktop test           # 80 TS-тестов
+cargo test --workspace                       # 418 Rust-тестов (1 ignored)
+pnpm --filter swagcod-desktop test           # 180 TS-тестов
 cargo clippy --workspace --all-targets -- -D warnings
+# F-11: сквозная проверка хода без сети и ключей — эхо вместо провайдера
+cargo test --release -p swagcod-app --test e2e_smoke
 ```
 
 ## Установка и обновление
@@ -203,6 +205,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-release.ps1 -Sig
 | `SWAGCOD_SUBAGENT_MAX_ROUNDS` · `SWAGCOD_SUBAGENT_BUDGET_TOKENS` | E-6: лимиты ветки суб-агента |
 | `SWAGCOD_HTTP_PORT` | E-7: порт loopback REST API (не задан — выключен) |
 | `SWAGCOD_APPEARANCE` · `SWAGCOD_BG_MODE` | оверрайды темы и фона при старте |
+| `SWAGCOD_ECHO_PROVIDER` | F-11: вместо боевого провайдера — встроенное эхо (ответ = «эхо: <сообщение>», счёт токенов честный). Сети и ключа не требует, в журнале провайдер виден как `echo`. Для сквозных проверок и CI; `0`/`false`/`off`/пусто — выключено |
 
 Полный шаблон с комментариями — [`.env.example`](.env.example).
 

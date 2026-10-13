@@ -12,6 +12,7 @@
   import CommandRules from './CommandRules.svelte'
   import HooksEditor from './HooksEditor.svelte'
   import MemoryTab, { type MemoryItem } from './MemoryTab.svelte'
+  import TasksTable from './TasksTable.svelte'
   import Icon, { type IconName } from './Icon.svelte'
   import { type StrKey } from '../lib/strings'
   import { polylinePoints, barHeights } from '../lib/charts'
@@ -56,6 +57,16 @@
   }
   export interface SeriesPoint { ts_ms: number; value: number }
   export interface TokenDay { day_ms: number; tokens: number; turns: number }
+  /* F-11: таблица фоновых задач вынесена в TasksTable.svelte — её можно
+     отрендерить в тесте, не поднимая всё окно настроек со сотней пропсов.
+     Тип строки объявлен там же (приём MemoryTab/MemoryItem) и переэкспортирован:
+     App.svelte по-прежнему берёт TaskRow отсюда, объявление остаётся одним. */
+  /* F-11: сама таблица фоновых задач вынесена в TasksTable.svelte — её можно
+     отрендерить в тесте, не поднимая всё окно настроек со сотней пропсов. Тип
+     строки объявлен ЗДЕСЬ, а не там: App.svelte берёт TaskRow отсюда, а
+     re-export типов из instance-скрипта svelte2tsx не поднимает (проверено
+     svelte-check — «has no exported member»). TasksTable импортирует его как
+     type-only, поэтому объявление остаётся единственным. */
   export interface TaskRow { id: string; kind: string; state: string; attempts: number; next_try_ms: number; last_error: string }
   export interface CmdRules {
     allow: string[]
@@ -941,36 +952,7 @@
                   <span class="label-title">{t('telemetryTasks')}</span>
                 </div>
               </div>
-              {#if telTasks.length === 0}
-                <div class="approval-empty">{t('telemetryEmpty')}</div>
-              {:else}
-                <div class="approval-scroll">
-                  <table class="approval-table">
-                    <thead>
-                      <tr><th>id</th><th>kind</th><th>{t('taskColState')}</th><th>{t('taskColAttempts')}</th><th>{t('taskColNext')}</th><th>{t('taskColLog')}</th><th></th></tr>
-                    </thead>
-                    <tbody>
-                      {#each telTasks as task (task.id)}
-                        <tr>
-                          <td>{task.id}</td>
-                          <td>{task.kind}</td>
-                          <td>{task.state}</td>
-                          <td>{task.attempts}</td>
-                          <td class="log-time">{task.next_try_ms ? new Date(task.next_try_ms).toLocaleString() : '—'}</td>
-                          <td class="tel-err">{task.last_error}</td>
-                          <td>
-                            {#if task.state === 'queued'}
-                              <button class="step-btn text-btn" onclick={() => void cancelTask(task.id)}>{t('taskCancel')}</button>
-                            {:else}
-                              —
-                            {/if}
-                          </td>
-                        </tr>
-                      {/each}
-                    </tbody>
-                  </table>
-                </div>
-              {/if}
+              <TasksTable tasks={telTasks} t={t} onCancel={(id) => void cancelTask(id)} />
             </div>
           {:else if settingsTab === 'memory'}
             <div class="settings-section">
@@ -1130,13 +1112,6 @@
 .tel-bar {
     fill: var(--accent, #7aa2f7);
     opacity: 0.85;
-  }
-
-.tel-err {
-    max-width: 240px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
 .log-time {

@@ -32,6 +32,8 @@ pub mod anthropic;
 #[cfg(feature = "http")]
 pub mod any;
 #[cfg(feature = "http")]
+pub mod echo;
+#[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "http")]
 pub mod router;
@@ -44,6 +46,8 @@ pub use types::{ChatMessage, ChatRequest, Role, ToolCall, ToolSpec};
 pub use anthropic::{anthropic_body, AnthropicError, AnthropicProvider, ANTHROPIC_VERSION};
 #[cfg(feature = "http")]
 pub use any::AnyProvider;
+#[cfg(feature = "http")]
+pub use echo::{echo_enabled, EchoProvider, ECHO_ENV, ECHO_NAME};
 #[cfg(feature = "http")]
 pub use http::{parse_embeddings, OpenAiProvider, ProviderError};
 #[cfg(feature = "http")]

@@ -28,7 +28,7 @@ our private < 40 МБ — D-013), запись в `DECISIONS.md` (ревизия
 | F-8 | 45 | hooks (pre/post turn, pre_tool) | готово |
 | F-9 | 46 | SwagCod Phone: подключить qwe/dsh-phone к HTTP API | готово |
 | F-10 | 47-48 | гигиена фулл: компоненты App.svelte, модули lib.rs, FTS5 | готово |
-| F-11 | 49 | тесты и CI всё: E2E-smoke, компонентные тесты | |
+| F-11 | 49 | тесты и CI всё: E2E-smoke, компонентные тесты | готово |
 
 ## F-1 · tasks_cancel UI (rev38)
 

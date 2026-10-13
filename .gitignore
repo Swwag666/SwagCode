@@ -16,6 +16,8 @@ node_modules/
 apps/desktop/dist/
 apps/desktop/.svelte-kit/
 apps/desktop/build/
+# F-11: coverage-отчёт — артефакт CI, воспроизводится прогоном тестов.
+apps/desktop/coverage/
 
 # Python (F-9: адаптер SwagCod Phone и его тесты живут в tools/phone/)
 __pycache__/

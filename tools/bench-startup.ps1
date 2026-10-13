@@ -45,6 +45,57 @@ Write-Host "exe  : $ExePath"
 Write-Host ("size : {0:N1} MB" -f ($exeInfo.Length / 1MB))
 Write-Host ""
 
+# Pre-flight 1: clear ORPHANED WebView2 processes left behind by a killed
+# instance. build-release.ps1 stops SwagCod.exe with Stop-Process, and WebView2
+# children can outlive their parent; whatever they hold is paid for by the next
+# measurement without appearing in it.
+# Selection is deliberately narrow. The command line must mention THIS app - the
+# live profile is ...\xyz.swagcod.desktop\EBWebView and the browser process also
+# carries --webview-exe-name=SwagCod.exe; 'swagsave' is a previous bundle
+# identifier of this same app and was found once as a genuine orphan - AND the
+# parent process must be dead. WebView2 is shared machinery (Windows Search runs
+# its own msedgewebview2 tree under MicrosoftWindows.Client.CBS), so a live
+# instance and every other application's WebView2 are never touched here.
+$markers = @('swagcod', 'swagsave')
+$orphans = @()
+try {
+    $orphans = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" -ErrorAction Stop |
+        Where-Object { $cl = $_.CommandLine; @($markers | Where-Object { $cl -like "*$_*" }).Count -gt 0 } |
+        Where-Object { -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue) })
+} catch {
+    Write-Host ("note: WebView2 enumeration unavailable ({0})" -f $_.Exception.Message)
+}
+foreach ($o in $orphans) {
+    try {
+        Stop-Process -Id $o.ProcessId -Force -ErrorAction Stop
+        Write-Host ("cleared orphaned WebView2 pid {0} (dead parent)" -f $o.ProcessId)
+    } catch {
+        Write-Host ("note: could not clear WebView2 pid {0}" -f $o.ProcessId)
+    }
+}
+if ($orphans.Count -gt 0) { Start-Sleep -Seconds 2 }
+
+# Pre-flight 2 (a note, not a guard): the FIRST launch after a fresh release
+# build is not representative. The new binary is cold in the file cache and is
+# scanned on first execution, so the WebView2 family comes up only partially and
+# startup reads several times high. Measured in rev49, inside one and the same
+# bench run: 1438 ms with 9 processes and 5.5 MB our private, then 183 ms, then
+# 112 ms with 12 processes and 14.3 MB. So if run 1 is a wild outlier while runs
+# 2-3 agree with each other, that is warm-up and not a regression - re-run and
+# compare medians before believing an "OVER BUDGET" line.
+
+# Pre-flight 3: refuse to pretend a measurement is meaningful while an instance
+# is already up. tauri-plugin-single-instance makes a second launch hand over to
+# the running one and exit, so startupMs would measure a handover and memory
+# would be read off somebody else's window.
+$live = @(Get-Process -Name 'SwagCod', 'swagcod-app' -ErrorAction SilentlyContinue)
+if ($live.Count -gt 0) {
+    $pids = ($live | ForEach-Object { $_.Id }) -join ','
+    Write-Host ("WARNING: SwagCod is already running (pid {0})." -f $pids)
+    Write-Host "         Single-instance handover makes these numbers meaningless."
+    Write-Host "         Close it and re-run, or pass -ExePath to a different build."
+}
+
 $results = @()
 
 for ($i = 1; $i -le $Runs; $i++) {
