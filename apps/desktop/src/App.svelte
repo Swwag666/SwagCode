@@ -13,21 +13,36 @@
   import { Transcript } from './components'
   import BackgroundFX from './components/BackgroundFX.svelte'
   import Splash from './components/Splash.svelte'
-  import SessionList from './components/SessionList.svelte'
+  import Sidebar from './components/Sidebar.svelte'
   import Terminal from './components/Terminal.svelte'
   import FileTree from './components/FileTree.svelte'
   import ApprovalDialog from './components/ApprovalDialog.svelte'
-  import CommandRules from './components/CommandRules.svelte'
-  import HooksEditor from './components/HooksEditor.svelte'
-  import MemoryTab, { type MemoryItem } from './components/MemoryTab.svelte'
   import RevertDialog from './components/RevertDialog.svelte'
+  import Palette from './components/Palette.svelte'
+  /* F-10: окно настроек — компонент; общие с ним типы объявлены там и
+     импортируются сюда (приём MemoryTab/Icon), чтобы не дублировать их. */
+  import SettingsTabs, {
+    type Appearance,
+    type PermissionMode,
+    type UiLang,
+    type ModelSpec,
+    type ProviderInfo,
+    type FetchedModel,
+    type ApprovalRow,
+    type SeriesPoint,
+    type TokenDay,
+    type TaskRow,
+    type CmdRules,
+    type HooksDto,
+  } from './components/SettingsTabs.svelte'
   import Icon, { type IconName } from './components/Icon.svelte'
+  import { type MemoryItem } from './components/MemoryTab.svelte'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
-  import logoGif from './assets/logo.gif'
   import { Transcript as TranscriptModel, type TranscriptItem } from './lib/transcript'
   import { translate, type StrKey } from './lib/strings'
-  import { polylinePoints, barHeights, counterDeltas, groupByName } from './lib/charts'
+  import { type PaletteCommand } from './lib/palette'
+  import { counterDeltas, groupByName } from './lib/charts'
 
   interface BuildInfo {
     version: string
@@ -51,10 +66,6 @@
    * Внешний вид и права. Всё это реально применяется к DOM и
    * переживает перезапуск (localStorage), а не лежит мёртвым контролом.
    * ──────────────────────────────────────────────────────────────── */
-  type Appearance = 'dark' | 'light' | 'contrast' | 'system'
-  /** Значения совпадают с `ApprovalPolicy` в ядре (serde snake_case). */
-  type PermissionMode = 'always' | 'on_dangerous' | 'never'
-  type UiLang = 'ru' | 'en'
 
   function readNum(raw: string | null, min: number, max: number, fallback: number): number {
     const v = parseFloat(raw ?? '')
@@ -101,16 +112,6 @@
     return translate(uiLang, key)
   }
 
-  /* Описание модели: бэкенд отдаёт только id, поэтому способности
-     выводим по имени — этого достаточно, чтобы выбрать осознанно. */
-  interface ModelSpec {
-    id: string
-    ctx: string
-    speed: 'fast' | 'balanced' | 'heavy'
-    reasoning: boolean
-    tools: boolean
-    vision: boolean
-  }
 
   function describeModel(id: string): ModelSpec {
     const low = id.toLowerCase()
@@ -359,18 +360,6 @@
   /* Провайдеры: каталог пресетов + custom, Fetch models с вопросом
      «сохранять или нет», активный провайдер для ходов. Ключи во фронт
      не прилетают — только has_key; ключ уходит лишь в save/fetch. */
-  interface ProviderInfo {
-    id: string
-    label: string
-    base_url: string
-    flavor: string
-    built_in: boolean
-    needs_key: boolean
-    has_key: boolean
-    key_url: string
-    models: string[]
-  }
-  interface FetchedModel { id: string; label: string }
   let provState = $state<{ active: string; providers: ProviderInfo[] } | null>(null)
   let provBusy = $state(false)
   let provNote = $state('')
@@ -628,16 +617,6 @@
   let dpapiStored = $state(false)
   let dpapiStatus = $state<string | null>(null)
   let sessPolicy = $state<'global' | PermissionMode>('global')
-  interface ApprovalRow {
-    session_id: string
-    turn_id: string
-    call_id: string
-    tool: string
-    summary: string
-    decision: string
-    actor: string
-    decided_ms: number
-  }
   let approvalRows = $state<ApprovalRow[]>([])
   let approvalLogLoaded = $state(false)
   /* E-7: loopback REST API — порт и токен показываются здесь (та же
@@ -684,9 +663,6 @@
      лаги шины и отложенный с E-5 список фоновых задач. Данные — из
      таблицы metrics (сэмпл раз в минуту) и агрегации turns. */
   interface MetricPoint { name: string; ts_ms: number; value: number }
-  interface SeriesPoint { ts_ms: number; value: number }
-  interface TokenDay { day_ms: number; tokens: number; turns: number }
-  interface TaskRow { id: string; kind: string; state: string; attempts: number; next_try_ms: number; last_error: string }
   let telTokens = $state<TokenDay[]>([])
   let telLatency = $state<SeriesPoint[]>([])
   let telLagE = $state<SeriesPoint[]>([])
@@ -856,14 +832,6 @@
      Движок, дефолты и порядок (deny > allow > политика) живут в ядре
      (core::rules); prefs-ключи cmd_allow / cmd_deny читаются на каждый ход,
      поэтому сохранение действует сразу. UI только показывает строки. */
-  interface CmdRules {
-    allow: string[]
-    deny: string[]
-    allow_defaults: string[]
-    deny_defaults: string[]
-    errors: string[]
-    active: number
-  }
   let cmdRules = $state<CmdRules | null>(null)
   let cmdRulesBusy = $state(false)
   let cmdRulesStatus = $state<string | null>(null)
@@ -901,15 +869,6 @@
      каждый ход, поэтому сохранение действует без перезапуска. Редактор
      показывает JSON как есть: три события с разными формами в плоские поля
      не раскладываются без потери смысла. */
-  interface HooksDto {
-    raw: string
-    pre_turn: number
-    post_turn: number
-    pre_tool: number
-    errors: string[]
-    timeout_secs: number
-    max_per_event: number
-  }
   let hooksDto = $state<HooksDto | null>(null)
   let hooksBusy = $state(false)
   let hooksStatus = $state<string | null>(null)
@@ -1126,18 +1085,12 @@
   )
 
   let showPalette = $state(false)
-  let paletteQuery = $state('')
-  let paletteIdx = $state(0)
-
-  interface PaletteCommand {
-    slash: string
-    group: StrKey
-    desc: StrKey
-    action: () => void
-  }
 
   /* F-2: палитра уровня DSH-референса — slash-имя, группа, описание.
-     Имена команд языконейтральны, описания локализованы. */
+     Имена команд языконейтральны, описания локализованы.
+     F-10: сам компонент — components/Palette.svelte, скоринг и фильтрация —
+     lib/palette.ts; здесь остаются только команды, потому что их действия
+     замкнуты на состояние приложения. */
   const commands: PaletteCommand[] = [
     { slash: '/new', group: 'palGroupSession', desc: 'cmdNewDesc', action: () => createNewSession() },
     { slash: '/clear', group: 'palGroupSession', desc: 'cmdClearDesc', action: () => { transcriptFor(currentSession ?? '').clear(); items = transcriptFor(currentSession ?? '').items; revision++; eventsTotal = 0; batchesTotal = 0 } },
@@ -1168,29 +1121,6 @@
     { slash: '/sim:2k', group: 'palGroupDev', desc: 'cmdSim2kDesc', action: () => simulateStream(2000) },
     { slash: '/sim:20k', group: 'palGroupDev', desc: 'cmdSim20kDesc', action: () => simulateStream(20000) },
   ]
-
-  /* F-2: скоринг поиска — префикс slash сильнее подстроки slash, та сильнее
-     описания, а дальше аббревиатуры подпоследовательностью («expmd»
-     находит /export). 4 = не совпало совсем. */
-  function paletteScore(c: PaletteCommand, q: string): number {
-    const s = c.slash.slice(1).toLowerCase()
-    if (s.startsWith(q)) return 0
-    if (s.includes(q)) return 1
-    if (t(c.desc).toLowerCase().includes(q)) return 2
-    let i = 0
-    for (const ch of s) if (i < q.length && ch === q[i]) i++
-    return i === q.length ? 3 : 4
-  }
-
-  const filteredCommands = $derived.by(() => {
-    const q = paletteQuery.trim().toLowerCase().replace(/^\//, '')
-    if (!q) return commands
-    return commands
-      .map((c, idx) => ({ c, idx, sc: paletteScore(c, q) }))
-      .filter((x) => x.sc < 4)
-      .sort((a, b) => a.sc - b.sc || a.idx - b.idx)
-      .map((x) => x.c)
-  })
 
   /* F-2: /compact — ручная компакция (B-3 по требованию). Честно: 0 —
      сжимать нечего, ошибка провайдера — во flash-статус. */
@@ -2067,14 +1997,11 @@
           setTimeout(() => document.querySelector<HTMLInputElement>('.search-input')?.focus(), 50)
         }
       }
+      /* F-10: сброс запроса и фокус в поле — забота Palette.svelte, поэтому
+         здесь остаётся только переключение видимости. */
       if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
         e.preventDefault()
         showPalette = !showPalette
-        paletteQuery = ''
-        paletteIdx = 0
-        if (showPalette) {
-          setTimeout(() => document.querySelector<HTMLInputElement>('.palette-input')?.focus(), 50)
-        }
       }
       /* Ctrl+B — свернуть/развернуть панель, Ctrl+M — выбор модели,
          Ctrl+± / Ctrl+0 — масштаб интерфейса. */
@@ -2107,7 +2034,7 @@
         if (showModelPicker) { showModelPicker = false; modelQuery = '' }
         if (showPermPicker) showPermPicker = false
         if (showSearch) { showSearch = false; searchQuery = '' }
-        if (showPalette) { showPalette = false; paletteQuery = '' }
+        if (showPalette) showPalette = false
         if (showWorkspaces) showWorkspaces = false
         if (showSettings) showSettings = false
       }
@@ -2241,755 +2168,144 @@
   />
 {/if}
 
-{#if showSettings}
-  <div class="settings-overlay" onclick={() => (showSettings = false)} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }} role="presentation">
-    <div class="settings-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }} role="dialog" aria-label="настройки" tabindex="-1">
-      <div class="settings-header">
-        <h2>{t('settings')}</h2>
-        <div class="settings-actions">
-          <button class="settings-action-btn" onclick={openConfigFile}>Open configuration file</button>
-          <button class="settings-action-btn" onclick={exportDiagnostics}>Export Diagnostics</button>
-          <button class="settings-close" onclick={() => (showSettings = false)} aria-label="закрыть"><Icon name="close" size={14} /></button>
-        </div>
-      </div>
-      <div class="settings-body">
-        <nav class="settings-nav">
-          <button class="settings-nav-item" class:active={settingsTab === 'general'} onclick={() => (settingsTab = 'general')}><Icon name="gear" size={14} /> General</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'models'} onclick={() => (settingsTab = 'models')}><Icon name="cpu" size={14} /> {t('modelTitle')}</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'providers'} onclick={() => { settingsTab = 'providers'; void loadProviders() }}><Icon name="sliders" size={14} /> {t('provTab')}</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'plugins'} onclick={() => { settingsTab = 'plugins'; void loadJsPlugins() }}><Icon name="plug" size={14} /> Plugins</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'security'} onclick={() => (settingsTab = 'security')}><Icon name="shield" size={14} /> {t('securityTab')}</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'mcp'} onclick={() => { settingsTab = 'mcp'; void loadMcp() }}><Icon name="external" size={14} /> MCP</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'telemetry'} onclick={() => { settingsTab = 'telemetry'; void refreshTelemetry() }}><Icon name="scale" size={14} /> {t('telemetryTab')}</button>
-          <button class="settings-nav-item" class:active={settingsTab === 'memory'} onclick={() => { settingsTab = 'memory'; void refreshMemory() }}><Icon name="brain" size={14} /> {t('memoryTab')}</button>
-        </nav>
-        <div class="settings-content">
-          {#if settingsTab === 'general'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('permTitle')}</span>
-                  <span class="label-desc">{permSpec(permissionMode).desc}</span>
-                </div>
-                <select
-                  class="settings-select"
-                  value={permissionMode}
-                  onchange={(e) => selectPermission(e.currentTarget.value as PermissionMode)}
-                >
-                  {#each permSpecs as p (p.id)}
-                    <option value={p.id}>{p.title}</option>
-                  {/each}
-                </select>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('language')}</span>
-                </div>
-                <select class="settings-select" bind:value={uiLang}>
-                  <option value="ru">Русский</option>
-                  <option value="en">English</option>
-                </select>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('appearance')}</span>
-                  <span class="label-desc">{t('fontSizeDesc')}</span>
-                </div>
-                <div class="appearance-options">
-                  <button class="appearance-btn" class:active={appearance === 'dark'} onclick={() => (appearance = 'dark')}><Icon name="moon" size={14} /> {t('dark')}</button>
-                  <button class="appearance-btn" class:active={appearance === 'light'} onclick={() => (appearance = 'light')}><Icon name="sun" size={14} /> {t('light')}</button>
-                  <button class="appearance-btn" class:active={appearance === 'contrast'} onclick={() => (appearance = 'contrast')}><Icon name="contrast" size={14} /> {t('contrast')}</button>
-                  <button class="appearance-btn" class:active={appearance === 'system'} onclick={() => (appearance = 'system')}><Icon name="monitor" size={14} /> {t('system')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('glowTitle')}</span>
-                  <span class="label-desc">{t('glowDesc')}</span>
-                </div>
-                <div class="appearance-options">
-                  <button class="appearance-btn" class:active={glowLevel === 'soft'} onclick={() => (glowLevel = 'soft')}>{t('glowSoft')}</button>
-                  <button class="appearance-btn" class:active={glowLevel === 'normal'} onclick={() => (glowLevel = 'normal')}>{t('glowNormal')}</button>
-                  <button class="appearance-btn" class:active={glowLevel === 'strong'} onclick={() => (glowLevel = 'strong')}>{t('glowStrong')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('fontSize')}</span>
-                  <span class="label-desc">{t('fontSizeDesc')}</span>
-                </div>
-                <div class="font-size-control">
-                  <button class="step-btn" onclick={() => (fontSize = Math.max(10, fontSize - 1))} aria-label="−">−</button>
-                  <input type="number" bind:value={fontSize} min="10" max="24" class="settings-number" />
-                  <span>px</span>
-                  <button class="step-btn" onclick={() => (fontSize = Math.min(24, fontSize + 1))} aria-label="+">+</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('zoom')}</span>
-                  <span class="label-desc">{t('zoomHotkeys')}</span>
-                </div>
-                <div class="zoom-control settings-zoom">
-                  <button onclick={zoomOut} aria-label="−">−</button>
-                  <button class="zoom-value" onclick={zoomReset}>{Math.round(uiZoom * 100)}%</button>
-                  <button onclick={zoomIn} aria-label="+">+</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('sidebarWidth')}</span>
-                  <span class="label-desc">Ctrl+B — {t('maximize')}</span>
-                </div>
-                <div class="font-size-control">
-                  <input
-                    type="range"
-                    min="200"
-                    max="560"
-                    step="10"
-                    bind:value={sidebarWidth}
-                    class="settings-range"
-                  />
-                  <span>{Math.round(sidebarWidth)}px</span>
-                  <button class="step-btn text-btn" onclick={() => { sidebarWidth = 260; sidebarCollapsed = false }}>{t('reset')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">Background effects</span>
-                  <span class="label-desc">Wireframe sphere, particles, scan lines</span>
-                </div>
-                <label class="toggle-switch">
-                  <input type="checkbox" bind:checked={effectsEnabled} />
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">Background mode</span>
-                </div>
-                <select bind:value={bgMode} class="settings-select">
-                  <option value="sphere">Wireframe sphere</option>
-                  <option value="matrix">Matrix rain</option>
-                </select>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('dshImportTitle')}</span>
-                  <span class="label-desc">{dshImportNote || t('dshImportDesc')}</span>
-                </div>
-                <button class="appearance-btn" disabled={dshImportBusy} onclick={() => void runDshImport()}>
-                  {dshImportBusy ? t('dshImportBusy') : t('dshImportRun')}
-                </button>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('studioAccent')}</span>
-                  <span class="label-desc">{t('studioAccentDesc')}</span>
-                </div>
-                <div class="studio-controls">
-                  <input
-                    type="color"
-                    class="color-well"
-                    value={customAccent || themeAccentHex}
-                    oninput={(e) => (customAccent = (e.target as HTMLInputElement).value)}
-                    title={t('studioAccent')}
-                    aria-label={t('studioAccent')}
-                  />
-                  <button class="step-btn text-btn" onclick={() => (customAccent = '')}>{t('reset')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('studioTint')}</span>
-                  <span class="label-desc">{t('studioTintDesc')}</span>
-                </div>
-                <div class="studio-controls">
-                  <input
-                    type="color"
-                    class="color-well"
-                    value={customTint || '#7a7a88'}
-                    oninput={(e) => (customTint = (e.target as HTMLInputElement).value)}
-                    title={t('studioTint')}
-                    aria-label={t('studioTint')}
-                  />
-                  <button class="step-btn text-btn" onclick={() => (customTint = '')}>{t('reset')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('studioMedia')}</span>
-                  <span class="label-desc" class:label-err={bgMediaError !== ''}>
-                    {bgMediaBusy ? t('studioMediaBusy') : bgMediaError || bgMediaName || t('studioMediaDesc')}
-                  </span>
-                </div>
-                <div class="studio-controls">
-                  <label class="step-btn text-btn media-pick">
-                    {t('studioMediaPick')}
-                    <input
-                      type="file"
-                      accept=".gif,.mp4,.webm,.png,.jpg,.jpeg,.webp,image/*,video/mp4,video/webm"
-                      onchange={onPickBgMedia}
-                    />
-                  </label>
-                  {#if bgMediaName}
-                    <button class="step-btn text-btn" onclick={clearBgMedia}>{t('studioMediaClear')}</button>
-                  {/if}
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('updateTitle')}</span>
-                  <span class="label-desc" class:label-err={updateState === 'error'}>
-                    {#if updateState === 'checking'}
-                      {t('updateChecking')}
-                    {:else if updateState === 'upToDate'}
-                      {updateCurrent ? `${t('updateVersion')} ${updateCurrent} — ` : ''}{t('updateUpToDate')}
-                    {:else if updateState === 'available'}
-                      {t('updateAvailable')}: {updateVersion}{updateNotes ? ` — ${updateNotes}` : ''}
-                    {:else if updateState === 'downloading'}
-                      {t('updateDownloading')}… {updatePercent}%
-                    {:else if updateState === 'ready'}
-                      {t('updateReady')}
-                    {:else if updateState === 'error'}
-                      {t('updateError')}: {updateError}
-                    {:else if updateCurrent}
-                      {t('updateVersion')}: {updateCurrent}
-                    {:else}
-                      {t('updateIdle')}
-                    {/if}
-                  </span>
-                </div>
-                <div class="appearance-options">
-                  {#if updateState === 'available'}
-                    <button class="appearance-btn" onclick={() => void installUpdate()}>{t('updateInstallBtn')}</button>
-                  {:else if updateState === 'ready'}
-                    <button class="appearance-btn" onclick={() => void restartApp()}>{t('updateRestartBtn')}</button>
-                  {:else}
-                    <button
-                      class="appearance-btn"
-                      disabled={updateState === 'checking' || updateState === 'downloading'}
-                      onclick={() => void checkUpdate()}
-                    >
-                      {t('updateCheckBtn')}
-                    </button>
-                  {/if}
-                </div>
-              </div>
-            </div>
-          {:else if settingsTab === 'security'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('dpapiTitle')}</span>
-                  <span class="label-desc">{t('dpapiDesc')}</span>
-                </div>
-                <div class="dpapi-controls">
-                  <input
-                    class="dpapi-input"
-                    type="password"
-                    bind:value={dpapiKey}
-                    placeholder="sk-..."
-                    aria-label={t('dpapiTitle')}
-                    autocomplete="off"
-                  />
-                  <button class="appearance-btn" onclick={() => void saveDpapiKey()} disabled={!dpapiKey.trim()}>{t('dpapiSave')}</button>
-                  <button class="appearance-btn" onclick={() => void clearDpapiKey()} disabled={!dpapiStored}>{t('dpapiForget')}</button>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{dpapiStored ? t('dpapiStored') : t('dpapiNotStored')}</span>
-                </div>
-                {#if dpapiStatus}<span class="dpapi-status">{dpapiStatus}</span>{/if}
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('httpApiTitle')}</span>
-                  <span class="label-desc">{httpApi?.enabled ? `${t('httpApiOn')} 127.0.0.1:${httpApi.port}` : t('httpApiOff')}</span>
-                </div>
-                {#if httpApi?.token}
-                  <button class="appearance-btn" onclick={() => void copyHttpToken()}>{t('httpApiCopy')}</button>
-                {/if}
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('sessPolicyTitle')}</span>
-                  <span class="label-desc">{t('sessPolicyDesc')}</span>
-                </div>
-                <select
-                  class="settings-select"
-                  value={sessPolicy}
-                  onchange={(e) => void applySessPolicy(e.currentTarget.value as 'global' | PermissionMode)}
-                  disabled={!currentSession}
-                >
-                  <option value="global">{t('policyGlobal')}</option>
-                  {#each permSpecs as p (p.id)}
-                    <option value={p.id}>{p.title}</option>
-                  {/each}
-                </select>
-              </div>
-              {#if cmdRules}
-                <div class="settings-row rules-row">
-                  <CommandRules
-                    title={t('cmdRulesTitle')}
-                    desc={t('cmdRulesDesc')}
-                    allowLabel={t('cmdAllowLabel')}
-                    denyLabel={t('cmdDenyLabel')}
-                    allowHint={t('cmdAllowHint')}
-                    denyHint={t('cmdDenyHint')}
-                    saveLabel={t('cmdRulesSave')}
-                    resetLabel={t('cmdRulesReset')}
-                    savedLabel={t('cmdRulesBusy')}
-                    allow={cmdRules.allow}
-                    deny={cmdRules.deny}
-                    allowDefaults={cmdRules.allow_defaults}
-                    denyDefaults={cmdRules.deny_defaults}
-                    busy={cmdRulesBusy}
-                    status={cmdRulesStatus}
-                    onSave={(a, d) => void saveCmdRules(a, d)}
-                  />
-                </div>
-              {/if}
-              {#if hooksDto}
-                <div class="settings-row rules-row">
-                  <HooksEditor
-                    title={t('hooksTitle')}
-                    desc={t('hooksDesc')}
-                    hint={t('hooksHint')}
-                    saveLabel={t('hooksSave')}
-                    savedLabel={t('hooksBusy')}
-                    raw={hooksDto.raw}
-                    counts={{
-                      pre_turn: hooksDto.pre_turn,
-                      post_turn: hooksDto.post_turn,
-                      pre_tool: hooksDto.pre_tool,
-                    }}
-                    timeoutSecs={hooksDto.timeout_secs}
-                    maxPerEvent={hooksDto.max_per_event}
-                    busy={hooksBusy}
-                    status={hooksStatus}
-                    error={hooksError ?? (hooksDto.errors.length > 0 ? hooksDto.errors.join('; ') : null)}
-                    onSave={(raw) => void saveHooks(raw)}
-                  />
-                </div>
-              {/if}
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('approvalLogTitle')}</span>
-                </div>
-                <button class="appearance-btn" onclick={() => void loadApprovalLog()}>{t('approvalLogBtn')}</button>
-              </div>
-              {#if approvalLogLoaded}
-                {#if approvalRows.length === 0}
-                  <div class="approval-empty">{t('approvalLogEmpty')}</div>
-                {:else}
-                  <div class="approval-scroll">
-                    <table class="approval-table">
-                      <thead>
-                        <tr>
-                          <th>{t('logColTime')}</th>
-                          <th>{t('logColTool')}</th>
-                          <th></th>
-                          <th>{t('logColDecision')}</th>
-                          <th>{t('logColActor')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {#each approvalRows as r, i (i)}
-                          <tr>
-                            <td class="log-time">{fmtLogTime(r.decided_ms)}</td>
-                            <td>{r.tool}</td>
-                            <td class="log-summary" title={r.summary}>{r.summary}</td>
-                            <td>
-                              <span class="log-decision" class:ok={r.decision === 'approved'}>
-                                {r.decision === 'approved' ? t('decisionApproved') : t('decisionDenied')}
-                              </span>
-                            </td>
-                            <!-- F-8: отказ хука — отдельный actor. Показывать
-                            его «системой» значило бы стереть разницу между
-                            «запретило правило из списка» и «не пустил скрипт
-                            владельца» — в аудите это разные решения. -->
-                            <td>
-                              {#if r.actor === 'user'}
-                                {t('actorUser')}
-                              {:else if r.actor === 'hook'}
-                                {t('actorHook')}
-                              {:else}
-                                {t('actorSystem')}
-                              {/if}
-                            </td>
-                          </tr>
-                        {/each}
-                      </tbody>
-                    </table>
-                  </div>
-                {/if}
-              {/if}
-            </div>
-          {:else if settingsTab === 'models'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('modelTitle')}</span>
-                  <span class="label-desc">{currentSpec.ctx} {t('ctx')} · {currentSpec.speed === 'fast' ? t('speedFast') : currentSpec.speed === 'heavy' ? t('speedHeavy') : t('speedBalanced')}</span>
-                </div>
-                <select id="model-select" bind:value={modelName} class="settings-select">
-                  {#each models as m (m)}
-                    <option value={m}>{m}</option>
-                  {/each}
-                </select>
-                <button class="appearance-btn" onclick={() => void reloadModels()} title={t('modelRefresh')}>{t('modelRefresh')}</button>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('tempAuto')}</span>
-                  <span class="label-desc">{t('tempAutoDesc')}</span>
-                </div>
-                <span class="auto-badge">{t('auto')}</span>
-              </div>
-              <div class="model-cards">
-                {#each modelSpecs as m (m.id)}
-                  <button
-                    class="model-card"
-                    class:selected={m.id === modelName}
-                    onclick={() => (modelName = m.id)}
-                  >
-                    <span class="model-name">{m.id}</span>
-                    {#if m.id === modelName}<span class="model-current">{t('currentModel')}</span>{/if}
-                    <span class="model-chips">
-                      <span class="chip">{t('ctx')} {m.ctx}</span>
-                      <span class="chip" class:fast={m.speed === 'fast'} class:heavy={m.speed === 'heavy'}>
-                        {m.speed === 'fast' ? t('speedFast') : m.speed === 'heavy' ? t('speedHeavy') : t('speedBalanced')}
-                      </span>
-                      {#if m.tools}<span class="chip cap">{t('capTools')}</span>{/if}
-                      {#if m.reasoning}<span class="chip cap">{t('capReasoning')}</span>{/if}
-                      {#if m.vision}<span class="chip cap">{t('capVision')}</span>{/if}
-                    </span>
-                  </button>
-                {/each}
-              </div>
-            </div>
-          {:else if settingsTab === 'providers'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('provTitle')}</span>
-                  <span class="label-desc">{t('provDesc')}</span>
-                </div>
-                <button class="appearance-btn" onclick={() => void loadProviders()}>{t('modelRefresh')}</button>
-              </div>
-              {#if provState}
-                {#each provState.providers as p (p.id)}
-                  <div class="settings-row">
-                    <div class="settings-label">
-                      <span class="label-title">
-                        {#if p.id === provState.active}<span class="model-current">{t('provActive')}</span>{/if}
-                        {p.label}
-                        <span class="chip">{p.flavor}</span>
-                      </span>
-                      <span class="label-desc">{p.base_url} · {p.models.length} {t('provModelsN')} · {p.needs_key ? (p.has_key ? t('provKeySet') : t('provKeyMissing')) : t('provLocalFree')}</span>
-                      {#if p.key_url}<span class="label-desc">{t('provGetKey')}: {p.key_url}</span>{/if}
-                    </div>
-                  </div>
-                  <div class="settings-row">
-                    <div class="settings-label">
-                      {#if p.needs_key && !p.has_key}
-                        <input
-                          class="settings-number"
-                          style="width:200px"
-                          type="password"
-                          value={provKeys[p.id] ?? ''}
-                          oninput={(e) => (provKeys[p.id] = (e.target as HTMLInputElement).value)}
-                          placeholder={t('provKeyPh')}
-                          aria-label={t('provKeyPh')}
-                        />
-                      {/if}
-                    </div>
-                    {#if p.id !== provState.active}
-                      <button class="appearance-btn" disabled={provBusy} onclick={() => void useProvider(p.id)}>{t('provUse')}</button>
-                    {/if}
-                    <button
-                      class="appearance-btn"
-                      disabled={provFetching !== ''}
-                      onclick={() => void fetchModels({ id: p.id, label: p.label, base_url: '', flavor: p.flavor }, provKeys[p.id] ?? '')}
-                    >{provFetching === p.id ? t('provFetching') : t('provFetch')}</button>
-                    {#if !p.built_in}
-                      <button class="appearance-btn" disabled={provBusy} onclick={() => void deleteProvider(p.id)}>{t('provDelete')}</button>
-                    {/if}
-                  </div>
-                {/each}
-              {/if}
-              {#if provPreview}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-title">{t('provPreviewTitle')} ({provPreview.models.length}) — {provPreview.label}</span>
-                    <span class="label-desc">{provPreview.models.slice(0, 200).map((m) => m.label === m.id ? m.id : `${m.label} (${m.id})`).join(', ')}</span>
-                  </div>
-                </div>
-                <div class="settings-row">
-                  <div class="settings-label"></div>
-                  <button class="appearance-btn" disabled={provBusy} onclick={() => void savePreview()}>{t('provSave')}</button>
-                  <button class="appearance-btn" onclick={() => (provPreview = null)}>{t('provCancel')}</button>
-                </div>
-              {/if}
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('provCustomTitle')}</span>
-                </div>
-              </div>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <input class="settings-number" style="width:150px" bind:value={customLabel} placeholder={t('provNamePh')} aria-label={t('provNamePh')} />
-                  <input class="settings-number" style="width:260px" bind:value={customBase} placeholder={t('provBasePh')} aria-label={t('provBasePh')} />
-                  <input class="settings-number" style="width:200px" type="password" bind:value={customKey} placeholder={t('provKeyPh')} aria-label={t('provKeyPh')} />
-                  <select class="settings-select" bind:value={customFlavor}>
-                    <option value="openai">{t('provFlavorOpenAi')}</option>
-                    <option value="anthropic">{t('provFlavorAnthropic')}</option>
-                  </select>
-                </div>
-                <button
-                  class="appearance-btn"
-                  disabled={provFetching !== '' || !customBase.trim()}
-                  onclick={() => void fetchModels({ id: null, label: customLabel.trim() || 'custom', base_url: customBase, flavor: customFlavor }, customKey)}
-                >{provFetching === 'custom-new' ? t('provFetching') : t('provFetch')}</button>
-              </div>
-              {#if provNote}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-desc">{provNote}</span>
-                  </div>
-                </div>
-              {/if}
-            </div>
-          {:else if settingsTab === 'mcp'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('mcpTitle')}</span>
-                  <span class="label-desc">{t('mcpDesc')}</span>
-                </div>
-              </div>
-              {#each mcpServers as s (s.name)}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-title">{s.name}</span>
-                    <span class="label-desc">{s.state} — {s.tools} {t('mcpToolsWord')}</span>
-                  </div>
-                  <button class="appearance-btn" onclick={() => void removeMcp(s.name)}>{t('mcpRemove')}</button>
-                </div>
-              {/each}
-              <div class="settings-row">
-                <div class="settings-label">
-                  <input class="settings-number" style="width:110px" bind:value={mcpName} placeholder={t('mcpNamePh')} aria-label={t('mcpNamePh')} />
-                  <input class="settings-number" style="width:240px" bind:value={mcpCommand} placeholder={t('mcpCommandPh')} aria-label={t('mcpCommandPh')} />
-                </div>
-                <button class="appearance-btn" disabled={mcpBusy} onclick={() => void addMcp()}>
-                  {mcpBusy ? t('mcpBusy') : t('mcpAdd')}
-                </button>
-              </div>
-              {#if mcpNote}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-desc">{mcpNote}</span>
-                  </div>
-                </div>
-              {/if}
-            </div>
-          {:else if settingsTab === 'telemetry'}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('telemetryTokens')}</span>
-                </div>
-                <button class="appearance-btn" onclick={() => void refreshTelemetry()}>{t('telemetryRefresh')}</button>
-              </div>
-              {#if telTokens.length > 0}
-                {@const hs = barHeights(telTokens.map((d) => d.tokens), 56)}
-                <svg class="tel-chart" viewBox="0 0 {telTokens.length * 10} 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryTokens')}>
-                  {#each telTokens as d, i (d.day_ms)}
-                    <rect x={i * 10 + 1} y={58 - hs[i]} width="8" height={Math.max(hs[i], 1)} class="tel-bar" />
-                  {/each}
-                </svg>
-              {:else}
-                <div class="approval-empty">{t('telemetryEmpty')}</div>
-              {/if}
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('telemetryLatency')}</span>
-                </div>
-              </div>
-              <svg class="tel-chart" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryLatency')}>
-                <polyline points={polylinePoints(telLatency.map((p) => p.value), 300, 56)} class="tel-line" />
-              </svg>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('telemetryLag')}</span>
-                </div>
-              </div>
-              <svg class="tel-chart" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label={t('telemetryLag')}>
-                <polyline points={polylinePoints(telLagE.map((p) => p.value), 300, 56)} class="tel-line" />
-                <polyline points={polylinePoints(telLagD.map((p) => p.value), 300, 56)} class="tel-line tel-line2" />
-              </svg>
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('telemetryTasks')}</span>
-                </div>
-              </div>
-              {#if telTasks.length === 0}
-                <div class="approval-empty">{t('telemetryEmpty')}</div>
-              {:else}
-                <div class="approval-scroll">
-                  <table class="approval-table">
-                    <thead>
-                      <tr><th>id</th><th>kind</th><th>{t('taskColState')}</th><th>{t('taskColAttempts')}</th><th>{t('taskColNext')}</th><th>{t('taskColLog')}</th><th></th></tr>
-                    </thead>
-                    <tbody>
-                      {#each telTasks as task (task.id)}
-                        <tr>
-                          <td>{task.id}</td>
-                          <td>{task.kind}</td>
-                          <td>{task.state}</td>
-                          <td>{task.attempts}</td>
-                          <td class="log-time">{task.next_try_ms ? new Date(task.next_try_ms).toLocaleString() : '—'}</td>
-                          <td class="tel-err">{task.last_error}</td>
-                          <td>
-                            {#if task.state === 'queued'}
-                              <button class="step-btn text-btn" onclick={() => void cancelTask(task.id)}>{t('taskCancel')}</button>
-                            {:else}
-                              —
-                            {/if}
-                          </td>
-                        </tr>
-                      {/each}
-                    </tbody>
-                  </table>
-                </div>
-              {/if}
-            </div>
-          {:else if settingsTab === 'memory'}
-            <div class="settings-section">
-              <MemoryTab
-                title={t('memoryTitle')}
-                desc={t('memoryDesc')}
-                globalLabel={t('memoryGlobal')}
-                sessionLabel={t('memorySession')}
-                globalHint={t('memoryGlobalHint')}
-                sessionHint={t('memorySessionHint')}
-                placeholder={t('memoryPlaceholder')}
-                addLabel={t('memoryAdd')}
-                forgetLabel={t('memoryForget')}
-                emptyLabel={t('memoryEmpty')}
-                items={memoryItems}
-                scope={memoryScope}
-                busy={memoryBusy}
-                status={memoryStatus}
-                onScope={setMemoryScope}
-                onAdd={(text) => void addMemory(text)}
-                onForget={(id) => void forgetMemory(id)}
-              />
-            </div>
-          {:else}
-            <div class="settings-section">
-              <div class="settings-row">
-                <div class="settings-label">
-                  <span class="label-title">{t('jsPlugTitle')}</span>
-                  <span class="label-desc">{jsPlugDir}</span>
-                </div>
-                <button class="appearance-btn" disabled={jsPlugBusy} onclick={() => void reloadJsPlugins()}>
-                  {jsPlugBusy ? t('jsPlugBusy') : t('jsPlugReload')}
-                </button>
-              </div>
-              {#each jsPlugTools as p (p.name)}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-title">{p.name}</span>
-                    <span class="label-desc">{p.description}{p.file ? ` — ${p.file}` : ''}</span>
-                  </div>
-                </div>
-              {/each}
-              {#each jsPlugErrors as e, i (`err-${i}`)}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-desc">{e}</span>
-                  </div>
-                </div>
-              {/each}
-              {#if !jsPlugBusy && jsPlugTools.length === 0 && jsPlugErrors.length === 0}
-                <div class="settings-row">
-                  <div class="settings-label">
-                    <span class="label-desc">{t('jsPlugNone')}</span>
-                  </div>
-                </div>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
+<!-- F-10: настройки — компонент; App остаётся оркестратором состояния и
+     передаёт его вниз пропсами (тот же приём, что в Palette). -->
+<SettingsTabs
+  /* окно и вкладки */
+  bind:showSettings={showSettings}
+  bind:settingsTab={settingsTab}
+  {t}
 
-{#if showPalette}
-  <div class="palette-overlay" onclick={() => (showPalette = false)} role="presentation">
-    <div
-      class="palette"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') showPalette = false }}
-      role="dialog"
-      aria-label="палитра команд"
-      tabindex="-1"
-    >
-      <input
-        type="text"
-        class="palette-input"
-        placeholder={t('palPlaceholder')}
-        bind:value={paletteQuery}
-        oninput={() => (paletteIdx = 0)}
-        onkeydown={(e) => {
-          if (e.key === 'ArrowDown') { e.preventDefault(); paletteIdx = Math.min(paletteIdx + 1, filteredCommands.length - 1) }
-          else if (e.key === 'ArrowUp') { e.preventDefault(); paletteIdx = Math.max(paletteIdx - 1, 0) }
-          else if (e.key === 'Enter' && filteredCommands[paletteIdx]) {
-            filteredCommands[paletteIdx].action()
-            showPalette = false
-            paletteQuery = ''
-          }
-        }}
-        spellcheck="false"
-      />
-      <div class="palette-list" role="listbox">
-        {#each filteredCommands as cmd, i (cmd.slash)}
-          {#if i === 0 || filteredCommands[i - 1].group !== cmd.group}
-            <div class="palette-group">{t(cmd.group)}</div>
-          {/if}
-          <div
-            class="palette-item"
-            class:selected={i === paletteIdx}
-            onclick={() => { cmd.action(); showPalette = false; paletteQuery = '' }}
-            onmouseenter={() => (paletteIdx = i)}
-            onkeydown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                cmd.action()
-                showPalette = false
-                paletteQuery = ''
-              }
-            }}
-            role="option"
-            tabindex="0"
-            aria-selected={i === paletteIdx}
-          >
-            <span class="palette-cmd">{cmd.slash}</span>
-            <span class="palette-desc">{t(cmd.desc)}</span>
-          </div>
-        {/each}
-        {#if filteredCommands.length === 0}
-          <div class="palette-empty">{t('palEmpty')}</div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
+  /* общие: внешний вид, студия тем, фон, масштаб */
+  bind:appearance={appearance}
+  bind:fontSize={fontSize}
+  bind:glowLevel={glowLevel}
+  {uiZoom}
+  bind:uiLang={uiLang}
+  bind:effectsEnabled={effectsEnabled}
+  bind:bgMode={bgMode}
+  {bgMediaName}
+  {bgMediaBusy}
+  {bgMediaError}
+  bind:customAccent={customAccent}
+  bind:customTint={customTint}
+  {themeAccentHex}
+  bind:sidebarWidth={sidebarWidth}
+  bind:sidebarCollapsed={sidebarCollapsed}
+  {zoomIn}
+  {zoomOut}
+  {zoomReset}
+  {onPickBgMedia}
+  {clearBgMedia}
+  {openConfigFile}
+  {exportDiagnostics}
+  {restartApp}
+
+  /* безопасность: политика, журнал подтверждений, DPAPI, HTTP API, правила команд, хуки, импорт */
+  {permissionMode}
+  {permSpecs}
+  {permSpec}
+  {selectPermission}
+  {sessPolicy}
+  {applySessPolicy}
+  {approvalRows}
+  {approvalLogLoaded}
+  {loadApprovalLog}
+  {fmtLogTime}
+  bind:dpapiKey={dpapiKey}
+  {dpapiStored}
+  {dpapiStatus}
+  {saveDpapiKey}
+  {clearDpapiKey}
+  {httpApi}
+  {copyHttpToken}
+  {cmdRules}
+  {cmdRulesBusy}
+  {cmdRulesStatus}
+  {saveCmdRules}
+  {hooksDto}
+  {hooksBusy}
+  {hooksStatus}
+  {hooksError}
+  {saveHooks}
+  {currentSession}
+  {dshImportBusy}
+  {dshImportNote}
+  {runDshImport}
+
+  /* модели */
+  {models}
+  bind:modelName={modelName}
+  {modelSpecs}
+  {currentSpec}
+  {reloadModels}
+
+  /* провайдеры */
+  {provState}
+  {provBusy}
+  {provNote}
+  {provFetching}
+  {provKeys}
+  bind:customLabel={customLabel}
+  bind:customBase={customBase}
+  bind:customKey={customKey}
+  bind:customFlavor={customFlavor}
+  bind:provPreview={provPreview}
+  {loadProviders}
+  {useProvider}
+  {deleteProvider}
+  {fetchModels}
+  {savePreview}
+
+  /* MCP-серверы */
+  {mcpServers}
+  bind:mcpName={mcpName}
+  bind:mcpCommand={mcpCommand}
+  {mcpBusy}
+  {mcpNote}
+  {loadMcp}
+  {addMcp}
+  {removeMcp}
+
+  /* телеметрия и обновления */
+  {telTokens}
+  {telLatency}
+  {telLagE}
+  {telLagD}
+  {telTasks}
+  {refreshTelemetry}
+  {cancelTask}
+  {updateState}
+  {updateCurrent}
+  {updateVersion}
+  {updateNotes}
+  {updateError}
+  {updatePercent}
+  {checkUpdate}
+  {installUpdate}
+
+  /* память */
+  {memoryItems}
+  {memoryScope}
+  {memoryBusy}
+  {memoryStatus}
+  {refreshMemory}
+  {addMemory}
+  {forgetMemory}
+  {setMemoryScope}
+
+  /* js-плагины */
+  {jsPlugTools}
+  {jsPlugErrors}
+  {jsPlugDir}
+  {jsPlugBusy}
+  {loadJsPlugins}
+  {reloadJsPlugins}
+/>
+
+<!-- F-10: палитра команд — компонент; здесь остаётся только «открыта ли» и
+     список команд, чьи действия замкнуты на состояние приложения. -->
+<Palette bind:open={showPalette} {commands} {t} />
 
 <main
   ondrop={onDrop}
@@ -3000,194 +2316,48 @@
   class:media-on={bgMediaUrl !== ''}
   style:grid-template-columns={sidebarCollapsed ? '0px 0px 1fr' : `${sidebarWidth}px 5px 1fr`}
 >
-  <aside class="sidebar" aria-hidden={sidebarCollapsed}>
-    <div class="sidebar-header" data-tauri-drag-region>
-      <div class="brand" data-tauri-drag-region>
-        <div class="eye" aria-hidden="true">
-          <!-- Чёрный фон кадра вырезаем luminance-маской, а не blend-mode:
-               blend ломается от filter/zoom на предках, маска — нет.
-               Альфа после маски повторяет форму глаза, поэтому drop-shadow
-               светит по контуру зрачка, а не прямоугольником. -->
-          <span
-            class="eye-img"
-            style="-webkit-mask-image: url('{logoGif}'); mask-image: url('{logoGif}'); -webkit-mask-mode: luminance; mask-mode: luminance; -webkit-mask-size: contain; mask-size: contain; -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;"
-          ></span>
-        </div>
-        <span class="name">SwagCod</span>
-        <button
-          class="brand-collapse"
-          onclick={() => (sidebarCollapsed = true)}
-          title={t('collapseSidebar')}
-          aria-label={t('collapseSidebar')}
-        ><Icon name="panel" size={14} /></button>
-      </div>
-      <button class="new-session-btn" onclick={() => void createNewSession()} disabled={creatingSession} title={t('newSession')}>
-        {#if creatingSession}
-          <span class="spinner"></span>
-        {:else}
-          <Icon name="plus" size={14} />
-        {/if}
-        {t('newSession')}
-      </button>
-    </div>
+  <!-- F-10: левая панель — компонент; состояние осталось в App и приходит
+       пропсами (тот же приём, что в Palette и SettingsTabs). -->
+  <Sidebar
+    /* шапка: бренд, сворачивание, новая сессия */
+    {t}
+    bind:sidebarCollapsed={sidebarCollapsed}
+    {creatingSession}
+    {createNewSession}
 
-    <div class="sidebar-section">
-      <div class="section-header">
-        <span>{t('workspaces')}</span>
-        <div class="section-actions">
-          <button
-            title={t('filterSessions')}
-            aria-label={t('filterSessions')}
-            aria-pressed={sessionFilterOpen}
-            onclick={() => (sessionFilterOpen = !sessionFilterOpen)}
-          ><Icon name="search" size={13} /></button>
-          <button
-            title={t('groupOrder')}
-            aria-label={t('groupOrder')}
-            aria-expanded={groupPop}
-            onclick={() => (groupPop = !groupPop)}
-          ><Icon name="sliders" size={13} /></button>
-          <button
-            title={t('wsTitle')}
-            aria-label={t('wsTitle')}
-            aria-expanded={showWorkspaces}
-            onclick={() => {
-              showWorkspaces = !showWorkspaces
-              if (showWorkspaces) void loadWorkspaces()
-            }}
-          ><Icon name="folder" size={13} /></button>
-          <button
-            title={t('openFolder')}
-            aria-label={t('openFolder')}
-            onclick={() => void openActiveFolder()}
-          ><Icon name="external" size={13} /></button>
-        </div>
-      </div>
-      {#if groupPop}
-        <!-- Наполнение второго значка из референса: группировка и порядок. -->
-        <div class="group-pop" role="dialog" aria-label={t('groupOrder')}>
-          <div class="gp-cap">{t('groupBy')}</div>
-          <button
-            class="gp-row"
-            class:on={groupMode === 'workspace'}
-            onclick={() => setGroupMode('workspace')}
-          >
-            <span>{t('groupWs')}</span>
-            {#if groupMode === 'workspace'}<Icon name="check" size={12} />{/if}
-          </button>
-          <button class="gp-row" class:on={groupMode === 'list'} onclick={() => setGroupMode('list')}>
-            <span>{t('groupList')}</span>
-            {#if groupMode === 'list'}<Icon name="check" size={12} />{/if}
-          </button>
-          <div class="gp-cap">{t('orderBy')}</div>
-          <button class="gp-row" class:on={orderMode === 'manual'} onclick={() => setOrderMode('manual')}>
-            <span>{t('orderManual')}</span>
-            {#if orderMode === 'manual'}<Icon name="check" size={12} />{/if}
-          </button>
-          <button class="gp-row" class:on={orderMode === 'updated'} onclick={() => setOrderMode('updated')}>
-            <span>{t('orderUpdated')}</span>
-            {#if orderMode === 'updated'}<Icon name="check" size={12} />{/if}
-          </button>
-        </div>
-      {/if}
-      {#if sessionFilterOpen}
-        <div class="session-filter">
-          <input
-            type="text"
-            class="search-input"
-            placeholder={t('filterPlaceholder')}
-            bind:value={sessionFilter}
-            onkeydown={(e) => {
-              if (e.key === 'Escape') {
-                sessionFilterOpen = false
-                sessionFilter = ''
-              }
-            }}
-          />
-        </div>
-      {/if}
-      {#if showWorkspaces}
-        <div class="ws-popover" role="dialog" aria-label={t('wsTitle')}>
-          <div class="ws-title">{t('wsTitle')}</div>
-          {#if workspaces.length === 0}
-            <div class="ws-empty">{t('wsEmpty')}</div>
-          {:else}
-            {#each workspaces as w (w.id)}
-              <div class="ws-row">
-                <Icon name="folder" size={12} />
-                <span class="ws-path" title={w.cwd}>{w.cwd}</span>
-                <button
-                  class="ws-act"
-                  title={t('wsOpen')}
-                  aria-label={t('wsOpen')}
-                  onclick={() => openWorkspace(w.cwd, w.id)}
-                ><Icon name="expand" size={11} /></button>
-                <button
-                  class="ws-act"
-                  title={t('wsCopy')}
-                  aria-label={t('wsCopy')}
-                  onclick={() => copyWorkspace(w.cwd)}
-                ><Icon name="clipboard" size={11} /></button>
-              </div>
-            {/each}
-          {/if}
-          <div class="ws-browse-row">
-            <button class="ws-browse" onclick={() => void browseFolder()} title={t('browse')}>
-              <Icon name="folder" size={12} /> {t('browse')}
-            </button>
-            {#if browseError}
-              <span class="ws-err">{browseError}</span>
-            {/if}
-          </div>
-        </div>
-      {/if}
-      <SessionList
-        activeId={currentSession}
-        onSelect={switchSession}
-        refreshTick={sessionRefreshTick}
-        liveStates={liveStates}
-        groupMode={groupMode}
-        orderMode={orderMode}
-        filter={sessionFilter}
-        onCreateIn={(cwd) => void createNewSession(cwd)}
-      />
-    </div>
+    /* список сессий: фильтр, группировка, порядок */
+    bind:sessionFilterOpen={sessionFilterOpen}
+    bind:sessionFilter={sessionFilter}
+    bind:groupPop={groupPop}
+    {groupMode}
+    {orderMode}
+    {setGroupMode}
+    {setOrderMode}
+    {currentSession}
+    {sessionRefreshTick}
+    {liveStates}
+    {switchSession}
 
-    <div class="sidebar-footer">
-      {#if thinking}
-        <div class="waveform" aria-hidden="true">
-          {#each Array(20) as _, i (i)}
-            <span class="wave-bar" style="animation-delay: {i * 0.05}s"></span>
-          {/each}
-        </div>
-      {/if}
-      <div class="sidebar-stats">
-        <div class="stat">
-          <span class="stat-value">{eventsTotal}</span>
-          <span class="stat-label">events</span>
-        </div>
-        <div class="stat">
-          <span class="stat-value">{turnsCount}</span>
-          <span class="stat-label">turns</span>
-        </div>
-        <div class="stat">
-          <span class="stat-value">{items.length}</span>
-          <span class="stat-label">items</span>
-        </div>
-      </div>
-      <div class="status-line">
-        <span class:ok={connected} class:warn={!connected}>
-          {connected ? '●' : '○'} {connected ? t('connected') : tauriAvailable ? t('connecting') : t('browser')}
-        </span>
-        {#if logNote}
-          <span class="log-note" title={logNote}>{logNote}</span>
-        {/if}
-      </div>
-      <button class="settings-btn" onclick={() => (showSettings = !showSettings)}>
-        <Icon name="gear" size={13} /> {t('settings')}
-      </button>
-    </div>
-  </aside>
+    /* рабочие области */
+    bind:showWorkspaces={showWorkspaces}
+    {workspaces}
+    {loadWorkspaces}
+    {openWorkspace}
+    {copyWorkspace}
+    {browseFolder}
+    {browseError}
+    {openActiveFolder}
+
+    /* нижняя статусная строка и вход в настройки */
+    {thinking}
+    {items}
+    {turnsCount}
+    {eventsTotal}
+    {connected}
+    {tauriAvailable}
+    {logNote}
+    bind:showSettings={showSettings}
+  />
 
   <!-- Ручка ресайза сайдбара: тянем мышью, двойной клик сбрасывает ширину.
        Всегда в разметке — иначе ломается число колонок grid. -->
@@ -3553,12 +2723,10 @@
           bind:value={inputText}
           onkeydown={(e) => {
             // F-2: «/» в пустом вводе открывает палитру команд, как в DSH.
+            // F-10: фокус и сброс запроса — внутри Palette.svelte.
             if (e.key === '/' && inputText === '') {
               e.preventDefault()
               showPalette = true
-              paletteQuery = ''
-              paletteIdx = 0
-              setTimeout(() => document.querySelector<HTMLInputElement>('.palette-input')?.focus(), 50)
               return
             }
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -3773,593 +2941,8 @@
     box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
   }
 
-  .sidebar {
-    display: flex;
-    flex-direction: column;
-    background: var(--surface-sidebar);
-    border-right: 1px solid var(--border);
-    min-height: 0;
-    animation: sidebar-in 0.3s ease-out;
-    transition: all 0.15s;
-  }
-
-  .sidebar:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.008 * var(--glow-k)));
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .sidebar:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.008);
-    box-shadow: inset 0 0 16px rgba(255, 255, 255, 0.02);
-  }
-
-  .sidebar:hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-  }
-
-  @keyframes sidebar-in {
-    from {
-      opacity: 0;
-      transform: translateX(-10px);
-    }
-    to {
-      opacity: 1;
-      transform: translateX(0);
-    }
-  }
-
-  .sidebar-header {
-    padding: 16px;
-    border-bottom: 1px solid var(--border);
-    transition: background 0.15s;
-  }
-
-  .sidebar-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    border-bottom-color: var(--accent-dim);
-    transform: translateY(-2px);
-  }
-
-  .sidebar-header:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
-    border-bottom-color: var(--accent-dim);
-    transform: translateY(-1px);
-  }
-
-  .sidebar-header:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 12px;
-    transition: all 0.15s;
-  }
-
-  .brand:nth-child(odd):hover {
-    gap: 16px;
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    transform: translateY(-2px);
-  }
-
-  .brand:nth-child(even):hover {
-    gap: 14px;
-    background: rgba(255, 255, 255, 0.02);
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.03);
-    transform: translateY(-1px);
-  }
-
-  .brand:hover {
-    gap: 10px;
-  }
-
-  .eye {
-    color: var(--accent);
-    display: flex;
-    transition: all 0.15s;
-  }
-
-  /* Глаз логотипа: сплошной акцентный прямоугольник, из которого luminance-
-     маска гифки вырезает форму зрачка (чёрный фон кадра исчезает). Маска,
-     а не blend-mode: blend ломается от filter/zoom на предках. */
-  .eye-img {
-    display: block;
-    width: 26px;
-    height: 21px;
-    background: var(--accent);
-    filter: drop-shadow(0 0 6px var(--accent-glow));
-  }
-
-  .brand:hover .eye {
-    transform: scale(1.1);
-    filter: drop-shadow(0 0 8px var(--accent-glow));
-  }
-
-  .name {
-    font-family: var(--mono);
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text);
-    transition: all 0.15s;
-  }
-
-  .name:nth-child(odd):hover {
-    color: var(--accent-hover);
-    text-shadow: 0 0 16px var(--accent-glow);
-    transform: scale(1.02);
-  }
-
-  .name:nth-child(even):hover {
-    color: var(--accent);
-    text-shadow: 0 0 12px var(--accent-glow);
-    transform: scale(1.01);
-  }
-
-  .brand:hover .name {
-    color: var(--accent);
-    text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .new-session-btn {
-    width: 100%;
-    padding: 10px 14px;
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    border: 1px solid var(--accent-dim);
-    border-radius: 8px;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 12px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    transition: all 0.2s;
-  }
-
-  .new-session-btn:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
-    box-shadow: 0 0 32px rgba(var(--accent-rgb), calc(0.45 * var(--glow-k)));
-    transform: translateY(-4px) scale(1.02);
-  }
-
-  .new-session-btn:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.4 * var(--glow-k)));
-    transform: translateY(-3px) scale(1.01);
-  }
-
-  .new-session-btn:hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    border-color: var(--accent);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
-    transform: translateY(-2px);
-  }
-
-  .new-session-btn:active {
-    transform: translateY(0);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-  }
-
-  .new-session-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
   .new-session-btn:hover :global(.icon) {
     transform: rotate(90deg);
-  }
-
-  .spinner {
-    width: 14px;
-    height: 14px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    transition: all 0.15s;
-  }
-
-  .spinner:nth-child(odd):hover {
-    border-top-color: var(--accent-hover);
-    box-shadow: 0 0 20px var(--accent-glow);
-    transform: scale(1.15);
-    animation-duration: 0.5s;
-  }
-
-  .spinner:nth-child(even):hover {
-    border-top-color: var(--accent);
-    box-shadow: 0 0 16px var(--accent-glow);
-    transform: scale(1.1);
-    animation-duration: 0.6s;
-  }
-
-  .new-session-btn:hover .spinner {
-    border-top-color: var(--accent-hover);
-    box-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  .sidebar-section {
-    flex: 1;
-    overflow-y: auto;
-    padding: 12px;
-    transition: background 0.15s;
-  }
-
-  .sidebar-section:hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-  }
-
-  .sidebar-section:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    border-radius: 8px;
-  }
-
-  .sidebar-section:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.02);
-    box-shadow: inset 0 0 20px rgba(255, 255, 255, 0.03);
-    border-radius: 6px;
-  }
-
-  .sidebar-section:first-child {
-    padding-top: 16px;
-    transition: all 0.15s;
-  }
-
-  .sidebar-section:first-child:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .sidebar-section:last-child {
-    border-bottom: none;
-  }
-
-  .sidebar-section:last-child:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .section-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--text-faint);
-    text-transform: uppercase;
-    transition: color 0.15s;
-  }
-
-  .section-header:hover {
-    color: var(--accent);
-    text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .section-actions {
-    display: flex;
-    gap: 4px;
-    transition: all 0.15s;
-  }
-
-  .section-actions:nth-child(odd):hover {
-    gap: 12px;
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    border-radius: 6px;
-  }
-
-  .section-actions:nth-child(even):hover {
-    gap: 10px;
-    background: rgba(255, 255, 255, 0.02);
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.03);
-    border-radius: 4px;
-  }
-
-  .section-actions:hover {
-    gap: 6px;
-  }
-
-  .section-actions button {
-    background: none;
-    border: none;
-    color: var(--text-faint);
-    cursor: pointer;
-    font-size: 12px;
-    padding: 2px 4px;
-    opacity: 0.6;
-    transition: all 0.15s;
-  }
-
-  .section-actions button:nth-child(odd):hover {
-    opacity: 1;
-    color: var(--accent-hover);
-    transform: scale(1.3) translateY(-2px);
-    filter: drop-shadow(0 0 12px var(--accent-glow));
-  }
-
-  .section-actions button:nth-child(even):hover {
-    opacity: 1;
-    color: var(--accent);
-    transform: scale(1.2) translateY(-1px);
-    filter: drop-shadow(0 0 10px var(--accent-glow));
-  }
-
-  .section-actions button:hover {
-    opacity: 1;
-    color: var(--accent);
-    transform: scale(1.1);
-    filter: drop-shadow(0 0 6px var(--accent-glow));
-  }
-
-  .sidebar-footer {
-    padding: 12px 16px;
-    border-top: 1px solid var(--border);
-    transition: background 0.15s;
-  }
-
-  .sidebar-footer:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    border-top-color: var(--accent-dim);
-    transform: translateY(-2px);
-  }
-
-  .sidebar-footer:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
-    border-top-color: var(--accent-dim);
-    transform: translateY(-1px);
-  }
-
-  .sidebar-footer:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .waveform {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 2px;
-    height: 24px;
-    margin-bottom: 12px;
-    animation: fade-in 0.3s ease-out;
-    transition: all 0.15s;
-  }
-
-  .waveform:nth-child(odd):hover {
-    gap: 8px;
-    transform: scale(1.15);
-    filter: drop-shadow(0 0 16px var(--accent-glow));
-  }
-
-  .waveform:nth-child(even):hover {
-    gap: 6px;
-    transform: scale(1.1);
-    filter: drop-shadow(0 0 12px var(--accent-glow));
-  }
-
-  .waveform:hover {
-    gap: 4px;
-    transform: scale(1.05);
-  }
-
-  .wave-bar {
-    width: 3px;
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-    animation: wave 1s ease-in-out infinite;
-    transform-origin: center;
-    transition: all 0.15s;
-  }
-
-  .wave-bar:nth-child(odd):hover {
-    background: var(--accent-hover);
-    box-shadow: 0 0 16px var(--accent-glow);
-    transform: scaleY(1.3);
-  }
-
-  .wave-bar:nth-child(even):hover {
-    background: var(--accent);
-    box-shadow: 0 0 12px var(--accent-glow);
-    transform: scaleY(1.2);
-  }
-
-  .waveform:hover .wave-bar {
-    background: var(--accent-hover);
-    box-shadow: 0 0 6px var(--accent-glow);
-  }
-
-  @keyframes wave {
-    0%, 100% { transform: scaleY(0.3); opacity: 0.4; }
-    50% { transform: scaleY(1); opacity: 1; }
-  }
-
-  .sidebar-stats {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    margin-bottom: 12px;
-    padding: 10px;
-    background: var(--surface-inset);
-    border-radius: 8px;
-    animation: fade-in 0.3s ease-out 0.2s both;
-    transition: all 0.15s;
-  }
-
-  .sidebar-stats:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: scale(1.06);
-    border-color: var(--accent-dim);
-  }
-
-  .sidebar-stats:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    transform: scale(1.04);
-    border-color: var(--accent-dim);
-  }
-
-  .sidebar-stats:hover {
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    transform: scale(1.02);
-  }
-
-  .stat {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    transition: all 0.15s;
-  }
-
-  .stat:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: translateY(-3px) scale(1.08);
-  }
-
-  .stat:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.08);
-    box-shadow: 0 0 16px rgba(255, 255, 255, 0.1);
-    transform: translateY(-2px) scale(1.06);
-  }
-
-  .stat:hover {
-    transform: translateY(-2px) scale(1.05);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    border-radius: 4px;
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-  }
-
-  .stat:hover .stat-value {
-    color: var(--accent);
-  }
-
-  .stat-value {
-    font-family: var(--mono);
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text);
-    transition: all 0.15s;
-  }
-
-  .stat:hover .stat-value {
-    transform: scale(1.1);
-    text-shadow: 0 0 8px currentColor;
-  }
-
-  .stat-label {
-    font-family: var(--mono);
-    font-size: 9px;
-    color: var(--text-faint);
-    text-transform: uppercase;
-    transition: color 0.15s;
-  }
-
-  .stat:hover .stat-label {
-    color: var(--text-dim);
-  }
-
-  .status-line {
-    font-family: var(--mono);
-    font-size: 10px;
-    color: var(--text-faint);
-    margin-bottom: 8px;
-    transition: all 0.15s;
-  }
-
-  .status-line:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: translateX(5px);
-    border-left-color: var(--accent);
-  }
-
-  .status-line:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    transform: translateX(4px);
-    border-left-color: var(--accent-dim);
-  }
-
-  .status-line:hover {
-    color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-    transform: translateX(2px);
-    padding: 2px 4px;
-    border-radius: 4px;
-  }
-
-  .status-line .ok {
-    color: var(--ok);
-    transition: all 0.15s;
-  }
-
-  .status-line:hover .ok {
-    text-shadow: 0 0 8px currentColor;
-  }
-
-  .status-line .warn {
-    color: var(--warn);
-    transition: all 0.15s;
-  }
-
-  .status-line:hover .warn {
-    text-shadow: 0 0 8px currentColor;
-  }
-
-  .settings-btn {
-    width: 100%;
-    padding: 8px 12px;
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 12px;
-    cursor: pointer;
-    text-align: left;
-    border-radius: 6px;
-    transition: all 0.15s;
-  }
-
-  .settings-btn:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-    transform: translateX(5px);
-    border-color: var(--accent);
-  }
-
-  .settings-btn:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
-    transform: translateX(4px);
-    border-color: var(--accent-dim);
-  }
-
-  .settings-btn:hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    color: var(--accent);
-    transform: translateX(2px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
   }
 
   .content {
@@ -4398,7 +2981,6 @@
      виден только в щелях между панелями и выглядит как баг. Панели становятся
      стеклом: сюжет читается сквозь интерфейс, как в референсных плеерах.
      Плотность стекла — переменная темы: светлая не темнеет в тряпку. */
-  .media-on .sidebar,
   .media-on .content,
   .media-on .content-header,
   .media-on .input-area,
@@ -4591,134 +3173,24 @@
     animation: none;
   }
 
-  /* B-7/B-8: вкладка «Безопасность» в настройках */
-  /* F-3: редактор списков команд занимает всю ширину ряда — две колонки
-     regex-строк в половину ширины нечитаемы. */
-  .rules-row {
-    display: block;
-    padding-top: 14px;
-  }
 
-  .dpapi-controls {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
 
-  .dpapi-input {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    color: inherit;
-    border-radius: 8px;
-    padding: 6px 10px;
-    width: 220px;
-    font-size: 12px;
-  }
 
-  .dpapi-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
 
-  .dpapi-status {
-    font-size: 12px;
-    opacity: 0.75;
-  }
 
-  .approval-empty {
-    font-size: 12px;
-    opacity: 0.6;
-    padding: 4px 2px;
-  }
 
-  .approval-scroll {
-    max-height: 260px;
-    overflow-y: auto;
-    margin-top: 4px;
-  }
 
-  .approval-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
 
-  .approval-table th {
-    text-align: left;
-    opacity: 0.6;
-    font-weight: 500;
-    padding: 4px 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-    position: sticky;
-    top: 0;
-    background: inherit;
-  }
 
-  .approval-table td {
-    padding: 4px 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    vertical-align: top;
-  }
 
-  /* E-8: графики телеметрии — компактный SVG без библиотек. */
-  .tel-chart {
-    width: 100%;
-    height: 60px;
-    margin: 4px 0 10px;
-    border-radius: 6px;
-    background: rgba(127, 127, 127, 0.07);
-  }
 
-  .tel-line {
-    fill: none;
-    stroke: var(--accent, #7aa2f7);
-    stroke-width: 1.5;
-    vector-effect: non-scaling-stroke;
-  }
 
-  .tel-line2 {
-    stroke: #e06c75;
-  }
 
-  .tel-bar {
-    fill: var(--accent, #7aa2f7);
-    opacity: 0.85;
-  }
 
-  .tel-err {
-    max-width: 240px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 
-  .log-time {
-    white-space: nowrap;
-    opacity: 0.7;
-  }
 
-  .log-summary {
-    max-width: 340px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    opacity: 0.85;
-  }
 
-  .log-decision {
-    padding: 1px 8px;
-    border-radius: 999px;
-    background: rgba(255, 90, 90, 0.14);
-    color: #ff8a8a;
-    white-space: nowrap;
-  }
 
-  .log-decision.ok {
-    background: rgba(90, 220, 130, 0.12);
-    color: #6fdc8c;
-  }
 
   .tabs {
     display: flex;
@@ -5701,209 +4173,6 @@
     75% { content: '...'; }
   }
 
-  .palette-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 500;
-    background: var(--surface-overlay);
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    padding-top: 15vh;
-    transition: background 0.15s;
-  }
-
-  .palette-overlay:nth-child(odd):hover {
-    background: rgba(0, 0, 0, 0.75);
-    backdrop-filter: blur(8px);
-  }
-
-  .palette-overlay:nth-child(even):hover {
-    background: rgba(0, 0, 0, 0.7);
-    backdrop-filter: blur(6px);
-  }
-
-  .palette-overlay:hover {
-    background: rgba(0, 0, 0, 0.6);
-  }
-
-  .palette {
-    width: 400px;
-    max-width: 90vw;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    box-shadow: var(--shadow-strong);
-    animation: palette-in 0.2s ease-out;
-    transition: all 0.15s;
-  }
-
-  .palette:hover {
-    border-color: var(--accent-dim);
-    box-shadow: 0 16px 56px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    transform: scale(1.01);
-  }
-
-  @keyframes palette-in {
-    from {
-      opacity: 0;
-      transform: scale(0.95) translateY(-10px);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1) translateY(0);
-    }
-  }
-
-  .palette-input {
-    width: 100%;
-    padding: 12px 16px;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--border);
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 14px;
-    outline: none;
-    transition: all 0.15s;
-  }
-
-  .palette-input:focus {
-    border-bottom-color: var(--accent);
-    box-shadow: 0 1px 0 0 var(--accent);
-  }
-
-  .palette-input:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    border-bottom-color: var(--accent-dim);
-  }
-
-  .palette-list {
-    max-height: 300px;
-    overflow-y: auto;
-    padding: 4px;
-    transition: background 0.15s;
-  }
-
-  .palette-list:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: inset 0 0 20px rgba(var(--accent-rgb), calc(0.06 * var(--glow-k)));
-    border-radius: 8px;
-  }
-
-  .palette-list:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.04);
-    box-shadow: inset 0 0 16px rgba(255, 255, 255, 0.04);
-    border-radius: 6px;
-  }
-
-  .palette-list:hover {
-    background: rgba(255, 255, 255, 0.01);
-  }
-
-  .palette-item {
-    padding: 8px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--text);
-    transition: all 0.15s;
-  }
-
-  .palette-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    transform: translateX(8px);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-  }
-
-  .palette-item:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: translateX(6px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
-  }
-
-  .palette-item:hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    transform: translateX(4px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .palette-item.selected {
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    color: var(--accent);
-    border-left: 2px solid var(--accent);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .palette-item.selected:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
-  }
-
-  .palette-item.selected:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.18 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
-  }
-
-  .palette-item.selected:hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-  }
-
-  .palette-empty {
-    padding: 16px;
-    text-align: center;
-    color: var(--text-faint);
-    font-size: 12px;
-    transition: color 0.15s;
-  }
-
-  /* F-2: группы и пара «slash-имя + описание» как в DSH-референсе. */
-  .palette-group {
-    padding: 8px 12px 2px;
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    user-select: none;
-  }
-
-  .palette-item {
-    display: flex;
-    align-items: baseline;
-  }
-
-  .palette-cmd {
-    font-weight: 600;
-    margin-right: 10px;
-    white-space: nowrap;
-    color: var(--text);
-  }
-
-  .palette-desc {
-    color: var(--text-faint);
-    font-size: 11px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .palette-empty:nth-child(odd):hover {
-    color: var(--text);
-    text-shadow: 0 0 8px rgba(255, 255, 255, 0.1);
-  }
-
-  .palette-empty:nth-child(even):hover {
-    color: var(--text-dim);
-    text-shadow: 0 0 6px rgba(255, 255, 255, 0.08);
-  }
-
-  .palette-empty:hover {
-    color: var(--text-dim);
-  }
-
   .glitch-overlay {
     position: fixed;
     inset: 0;
@@ -5971,617 +4240,99 @@
     transform: translateY(0) scale(0.985);
   }
 
-  .settings-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 600;
-    background: var(--surface-overlay);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    backdrop-filter: blur(2px);
-    transition: background 0.15s;
-  }
-
-  .settings-overlay:nth-child(odd):hover {
-    background: rgba(0, 0, 0, 0.85);
-    backdrop-filter: blur(8px);
-  }
-
-  .settings-overlay:nth-child(even):hover {
-    background: rgba(0, 0, 0, 0.8);
-    backdrop-filter: blur(6px);
-  }
-
-  .settings-overlay:hover {
-    background: rgba(0, 0, 0, 0.7);
-  }
-
-  .settings-dialog {
-    width: 780px;
-    max-width: 90vw;
-    max-height: 80vh;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: var(--shadow-strong);
-    display: flex;
-    flex-direction: column;
-    animation: dialog-in 0.25s ease-out;
-    transition: all 0.15s;
-  }
-
-  .settings-dialog:hover {
-    border-color: var(--accent-dim);
-    box-shadow: 0 24px 72px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-    transform: scale(1.01);
-  }
-
-  @keyframes dialog-in {
-    from {
-      opacity: 0;
-      transform: scale(0.95);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1);
-    }
-  }
-
-  .settings-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-    transition: background 0.15s;
-  }
-
-  .settings-header:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-  }
-
-  .settings-header:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.01);
-  }
-
-  .settings-header:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .settings-header h2 {
-    font-family: var(--mono);
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--text);
-    margin: 0;
-    transition: color 0.15s;
-  }
-
-  .settings-header:hover h2 {
-    color: var(--accent);
-  }
-
-  .settings-actions {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    transition: all 0.15s;
-  }
-
-  .settings-actions:nth-child(odd):hover {
-    gap: 12px;
-  }
-
-  .settings-actions:nth-child(even):hover {
-    gap: 10px;
-  }
-
-  .settings-actions:hover {
-    gap: 10px;
-  }
-
-  .settings-action-btn {
-    padding: 6px 12px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 11px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .settings-action-btn:nth-child(odd):hover {
-    transform: translateY(-2px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-  }
-
-  .settings-action-btn:nth-child(even):hover {
-    transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .settings-action-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .settings-close {
-    background: none;
-    border: none;
-    color: var(--text-faint);
-    font-size: 16px;
-    cursor: pointer;
-    padding: 4px 8px;
-    transition: all 0.15s;
-  }
-
-  .settings-close:nth-child(odd):hover {
-    transform: rotate(180deg) scale(1.2);
-  }
-
-  .settings-close:nth-child(even):hover {
-    transform: rotate(90deg) scale(1.1);
-  }
-
-  .settings-close:hover {
-    color: var(--err);
-    background: rgba(255, 0, 0, 0.1);
-    border-radius: 4px;
-    transform: rotate(90deg) scale(1.1);
-    box-shadow: 0 0 12px rgba(255, 0, 0, 0.2);
-  }
-
-  .settings-body {
-    display: grid;
-    grid-template-columns: 180px 1fr;
-    min-height: 0;
-    flex: 1;
-    transition: background 0.15s;
-  }
-
-  .settings-body:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-  }
-
-  .settings-body:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.005);
-  }
-
-  .settings-body:hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-  }
-
-  .settings-nav {
-    padding: 12px;
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    transition: background 0.15s;
-  }
-
-  .settings-nav:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-  }
-
-  .settings-nav:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.03);
-    box-shadow: inset 0 0 12px rgba(255, 255, 255, 0.03);
-  }
-
-  .settings-nav:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .settings-nav-item {
-    padding: 10px 12px;
-    background: none;
-    border: none;
-    border-radius: 6px;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 12px;
-    cursor: pointer;
-    text-align: left;
-    transition: all 0.15s;
-  }
-
-  .settings-nav-item:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    transform: translateX(6px);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .settings-nav-item:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.1);
-    transform: translateX(4px);
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.1);
-  }
-
-  .settings-nav-item:hover {
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--text);
-    transform: translateX(2px);
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.05);
-  }
-
-  .settings-nav-item.active {
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    color: var(--accent);
-    transition: all 0.15s;
-  }
-
-  .settings-nav-item.active:hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .settings-nav-item.active:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
-    box-shadow: 0 0 24px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
-    transform: translateX(6px);
-  }
-
-  .settings-nav-item.active:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.28 * var(--glow-k)));
-    transform: translateX(5px);
-  }
-
-  .settings-content {
-    padding: 20px;
-    overflow-y: auto;
-    animation: fade-in 0.2s ease-out;
-    transition: all 0.15s;
-  }
-
-  .settings-content:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-  }
-
-  .settings-content:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.02);
-    box-shadow: inset 0 0 20px rgba(255, 255, 255, 0.03);
-  }
-
-  .settings-content:hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-  }
-
-  .settings-section {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-    transition: background 0.15s;
-  }
-
-  .settings-section:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    box-shadow: inset 0 0 24px rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    border-radius: 12px;
-    padding: 12px;
-    margin: -12px;
-  }
-
-  .settings-section:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.02);
-    box-shadow: inset 0 0 20px rgba(255, 255, 255, 0.03);
-    border-radius: 10px;
-    padding: 10px;
-    margin: -10px;
-  }
-
-  .settings-section:hover {
-    background: rgba(var(--accent-rgb), calc(0.005 * var(--glow-k)));
-    box-shadow: inset 0 0 16px rgba(var(--accent-rgb), calc(0.02 * var(--glow-k)));
-    border-radius: 8px;
-    padding: 8px;
-    margin: -8px;
-  }
-
-  .settings-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    /* Перенос: ряды с широкими контролами (темы, слайдер ширины) не должны
-       выползать за край диалога и обрезаться overflow: hidden. */
-    flex-wrap: wrap;
-    gap: 16px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--border);
-    transition: all 0.15s;
-  }
-
-  .settings-row:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    transform: translateX(4px);
-  }
-
-  .settings-row:nth-child(even):hover {
-    background: rgba(255, 255, 255, 0.04);
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.06);
-    transform: translateX(3px);
-  }
-
-  .settings-row:hover {
-    background: rgba(var(--accent-rgb), calc(0.01 * var(--glow-k)));
-    padding-left: 8px;
-    padding-right: 8px;
-    border-radius: 6px;
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.03 * var(--glow-k)));
-  }
-
-  .settings-label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    transition: all 0.15s;
-  }
-
-  .settings-label:nth-child(odd):hover {
-    transform: translateX(5px);
-    text-shadow: 0 0 8px rgba(255, 255, 255, 0.1);
-  }
-
-  .settings-label:nth-child(even):hover {
-    transform: translateX(4px);
-    text-shadow: 0 0 6px rgba(255, 255, 255, 0.08);
-  }
-
-  .settings-label:hover {
-    transform: translateX(2px);
-  }
-
-  .settings-label:hover .label-title {
-    color: var(--accent);
-    text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .label-title {
-    font-family: var(--mono);
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text);
-    transition: color 0.15s;
-  }
-
-  .label-title:nth-child(odd):hover {
-    text-shadow: 0 0 16px var(--accent-glow);
-    transform: scale(1.02);
-  }
-
-  .label-title:nth-child(even):hover {
-    text-shadow: 0 0 12px var(--accent-glow);
-    transform: scale(1.01);
-  }
-
-  .settings-row:hover .label-title {
-    color: var(--accent);
-    text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .label-desc {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--text-faint);
-    transition: all 0.15s;
-  }
-
-  .label-desc:nth-child(odd):hover {
-    transform: translateX(5px);
-    text-shadow: 0 0 8px rgba(255, 255, 255, 0.1);
-    color: var(--text);
-  }
-
-  .label-desc:nth-child(even):hover {
-    transform: translateX(4px);
-    text-shadow: 0 0 6px rgba(255, 255, 255, 0.08);
-    color: var(--text-dim);
-  }
-
-  .settings-row:hover .label-desc {
-    color: var(--text-dim);
-    transform: translateX(2px);
-  }
-
-  .settings-select {
-    padding: 8px 12px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 12px;
-    min-width: 150px;
-    outline: none;
-    transition: all 0.15s;
-  }
-
-  .settings-select:nth-child(odd):hover {
-    border-color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    transform: translateY(-2px);
-  }
-
-  .settings-select:nth-child(even):hover {
-    border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: translateY(-1px);
-  }
-
-  .settings-select:hover {
-    border-color: var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-  }
-
-  .settings-select:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .appearance-options {
-    display: flex;
-    flex-wrap: wrap;
-    /* Своим рядом под подписью: четыре кнопки не влезают в колонку значения. */
-    flex: 1 1 100%;
-    gap: 8px;
-    transition: all 0.15s;
-  }
-
-  .appearance-options:hover {
-    gap: 10px;
-  }
-
-  .appearance-btn {
-    padding: 12px 20px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 12px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .appearance-btn:nth-child(odd):hover {
-    border-color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .appearance-btn:nth-child(even):hover {
-    border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-  }
-
-  .appearance-btn:hover {
-    border-color: var(--accent-dim);
-    color: var(--text);
-    transform: translateY(-1px);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .appearance-btn.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
-
-  .appearance-btn.active:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.25 * var(--glow-k)));
-  }
-
-  .appearance-btn.active:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.22 * var(--glow-k)));
-  }
-
-  .appearance-btn.active:hover {
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-  }
-
-  .font-size-control {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--text-dim);
-    transition: color 0.15s;
-  }
-
-  .font-size-control:nth-child(odd):hover {
-    color: var(--accent-hover);
-    text-shadow: 0 0 8px var(--accent-glow);
-  }
-
-  .font-size-control:nth-child(even):hover {
-    color: var(--accent);
-    text-shadow: 0 0 6px var(--accent-glow);
-  }
-
-  .font-size-control:hover {
-    color: var(--text);
-    text-shadow: 0 0 6px rgba(255, 255, 255, 0.08);
-  }
-
-  .settings-number {
-    width: 60px;
-    padding: 6px 8px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 12px;
-    text-align: center;
-    outline: none;
-    transition: all 0.15s;
-  }
-
-  .settings-number:nth-child(odd):hover {
-    border-color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-    transform: translateY(-2px);
-  }
-
-  .settings-number:nth-child(even):hover {
-    border-color: var(--accent-dim);
-    background: rgba(var(--accent-rgb), calc(0.04 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-    transform: translateY(-1px);
-  }
-
-  .settings-number:hover {
-    border-color: var(--accent-dim);
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-  }
-
-  .settings-number:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .settings-range {
-    width: 200px;
-    accent-color: var(--accent);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .settings-range:hover {
-    transform: scaleY(1.2);
-  }
-
-  .settings-range::-webkit-slider-thumb {
-    cursor: grab;
-  }
-
-  .settings-range::-webkit-slider-thumb:active {
-    cursor: grabbing;
-  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   .settings-empty {
     font-family: var(--mono);
@@ -6606,151 +4357,33 @@
     color: var(--text-dim);
   }
 
-  .toggle-switch:nth-child(odd):hover {
-    transform: scale(1.08);
-    filter: drop-shadow(0 0 12px var(--accent-glow));
-  }
 
-  .toggle-switch:nth-child(even):hover {
-    transform: scale(1.06);
-    filter: drop-shadow(0 0 10px var(--accent-glow));
-  }
 
-  .toggle-switch {
-    position: relative;
-    display: inline-block;
-    width: 44px;
-    height: 24px;
-    transition: all 0.15s;
-  }
 
-  .toggle-switch:hover {
-    transform: scale(1.05);
-    filter: drop-shadow(0 0 8px var(--accent-glow));
-  }
 
-  .toggle-switch input:nth-child(odd):hover {
-    opacity: 0.1;
-  }
 
-  .toggle-switch input:nth-child(even):hover {
-    opacity: 0.05;
-  }
 
-  .toggle-switch input {
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
 
-  .toggle-switch input:hover {
-    opacity: 0.02;
-  }
 
-  .toggle-slider {
-    position: absolute;
-    cursor: pointer;
-    inset: 0;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 24px;
-    transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  }
 
-  .toggle-slider:nth-child(odd):hover {
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
 
-  .toggle-slider:nth-child(even):hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-  }
 
-  .toggle-slider:hover {
-    background: rgba(var(--accent-rgb), calc(0.05 * var(--glow-k)));
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
 
-  .toggle-slider:before:nth-child(odd):hover {
-    background: var(--accent-hover);
-    box-shadow: 0 0 12px var(--accent-glow);
-    transform: translateX(2px);
-  }
 
-  .toggle-slider:before:nth-child(even):hover {
-    background: var(--accent);
-    box-shadow: 0 0 10px var(--accent-glow);
-    transform: translateX(1px);
-  }
 
-  .toggle-slider:before {
-    position: absolute;
-    content: "";
-    height: 18px;
-    width: 18px;
-    left: 2px;
-    bottom: 2px;
-    background: var(--text-faint);
-    border-radius: 50%;
-    transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  }
 
-  .toggle-slider:before:hover {
-    background: var(--accent);
-    box-shadow: 0 0 8px var(--accent-glow);
-  }
 
-  .toggle-switch:hover .toggle-slider:before {
-    background: var(--accent);
-    box-shadow: 0 0 8px var(--accent-glow);
-  }
 
-  .toggle-switch input:checked + .toggle-slider {
-    background: var(--accent-dim);
-    border-color: var(--accent);
-    box-shadow: 0 0 12px rgba(var(--accent-rgb), calc(0.2 * var(--glow-k)));
-    transition: all 0.15s;
-  }
 
-  .toggle-switch:hover input:checked + .toggle-slider {
-    background: var(--accent);
-    box-shadow: 0 0 20px rgba(var(--accent-rgb), calc(0.3 * var(--glow-k)));
-  }
 
-  .toggle-switch input:checked + .toggle-slider:before {
-    transform: translateX(20px);
-    background: var(--accent);
-    transition: all 0.15s;
-  }
 
-  .toggle-switch:hover input:checked + .toggle-slider:before {
-    background: #fff;
-    box-shadow: 0 0 12px var(--accent-glow);
-  }
 
-  .toggle-switch:hover .toggle-slider {
-    border-color: var(--accent);
-    box-shadow: 0 0 16px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
 
   @keyframes screen-glitch {
     0% { opacity: 1; transform: translateX(0); }
     20% { transform: translateX(-3px); }
     40% { transform: translateX(3px); }
     100% { opacity: 0; }
-  }
-
-  /* ──────────────────────────────────────────────────────────────
-   * Ресайс и сворачивание сайдбара
-   * ────────────────────────────────────────────────────────────── */
-  .sidebar {
-    overflow: hidden;
-  }
-
-  main.dsh-layout.collapsed .sidebar {
-    opacity: 0;
-    pointer-events: none;
   }
 
   main.dsh-layout.resizing {
@@ -6799,39 +4432,9 @@
     gap: 12px;
   }
 
-  .zoom-control {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    padding: 2px;
-    background: var(--surface-inset);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-  }
 
-  .zoom-control button {
-    background: none;
-    border: none;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--text-dim);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
 
-  .zoom-control button:hover {
-    color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-    box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.12 * var(--glow-k)));
-  }
 
-  .zoom-control .zoom-value {
-    min-width: 46px;
-    text-align: center;
-    color: var(--text);
-  }
 
   .header-icon-btn {
     padding: 4px 9px;
@@ -6948,12 +4551,6 @@
     gap: 4px;
   }
 
-  .model-cards {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding-top: 12px;
-  }
 
   .model-card {
     display: flex;
@@ -7057,17 +4654,6 @@
     color: var(--text-faint);
   }
 
-  .auto-badge {
-    font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--ok);
-    border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
-    background: color-mix(in srgb, var(--ok) 10%, transparent);
-    border-radius: 999px;
-    padding: 2px 10px;
-  }
 
   .popover-link {
     background: none;
@@ -7191,256 +4777,17 @@
     color: var(--err);
   }
 
-  /* Мелкие контролы в Settings */
-  .step-btn {
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 13px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
 
-  .step-btn:hover {
-    color: var(--accent);
-    border-color: var(--accent-dim);
-    box-shadow: 0 0 10px rgba(var(--accent-rgb), calc(0.15 * var(--glow-k)));
-  }
 
-  .settings-zoom {
-    min-width: 150px;
-    justify-content: center;
-  }
 
-  /* Студия тем: круглые палитры и текстовые кнопки рядом с ними. */
-  .studio-controls {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
 
-  .color-well {
-    width: 34px;
-    height: 34px;
-    padding: 0;
-    border: 2px solid var(--border);
-    border-radius: 50%;
-    background: none;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
 
-  .color-well:hover {
-    border-color: var(--accent);
-    box-shadow: 0 0 14px rgba(var(--accent-rgb), calc(0.35 * var(--glow-k)));
-    transform: scale(1.06);
-  }
 
-  /* Системную рамку swatch прячем: остаётся чистый круг цвета. */
-  .color-well::-webkit-color-swatch-wrapper {
-    padding: 2px;
-  }
 
-  .color-well::-webkit-color-swatch {
-    border: none;
-    border-radius: 50%;
-  }
 
-  .text-btn {
-    width: auto;
-    height: 26px;
-    padding: 0 10px;
-  }
 
-  .media-pick {
-    display: inline-flex;
-    align-items: center;
-    cursor: pointer;
-  }
 
-  .media-pick input {
-    display: none;
-  }
 
-  .label-err {
-    color: var(--err);
-  }
-
-  /* Поповер рабочих областей: пути cwd открытых сессий, как в референсе. */
-  .sidebar-section {
-    position: relative;
-  }
-
-  .ws-popover {
-    position: absolute;
-    top: 30px;
-    left: 8px;
-    right: 8px;
-    z-index: 60;
-    padding: 8px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    max-height: 240px;
-    overflow-y: auto;
-  }
-
-  .ws-title {
-    font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
-  }
-
-  .ws-browse-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 8px;
-  }
-  .ws-browse {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 10px;
-    border-radius: 7px;
-    cursor: pointer;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-dim);
-    font-size: 11.5px;
-    transition: background 0.13s ease, color 0.13s ease, transform 0.13s ease,
-      border-color 0.13s ease;
-  }
-  .ws-browse:hover {
-    color: var(--text);
-    border-color: rgba(var(--accent-rgb), calc(0.5 * var(--glow-k)));
-    transform: translateY(-1px);
-  }
-  .ws-browse:active {
-    transform: translateY(0) scale(0.98);
-  }
-  .ws-err {
-    color: var(--err);
-    font-size: 11px;
-  }
-
-  .ws-empty {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--text-faint);
-    padding: 4px 0;
-  }
-
-  .ws-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-dim);
-  }
-
-  .ws-path {
-    flex: 1;
-    min-width: 0;
-    font-family: var(--mono);
-    font-size: 10px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .ws-act {
-    flex: none;
-    display: inline-flex;
-    background: none;
-    border: none;
-    padding: 2px;
-    color: var(--text-faint);
-    cursor: pointer;
-    transition: color 0.15s;
-  }
-
-  .ws-act:hover {
-    color: var(--accent);
-  }
-
-  /* ── Ревизия 12: сайдбар и шапка как в референсе ─────────────────── */
-
-  .brand-collapse {
-    margin-left: auto;
-    background: none;
-    border: none;
-    color: var(--text-faint);
-    cursor: pointer;
-    padding: 3px;
-    border-radius: 5px;
-    display: flex;
-    align-items: center;
-    transition: all 0.15s;
-  }
-
-  .brand-collapse:hover {
-    color: var(--accent);
-    background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
-  }
-
-  .session-filter {
-    padding: 4px 10px 6px;
-  }
-
-  .group-pop {
-    margin: 2px 10px 8px;
-    padding: 6px;
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-    z-index: 30;
-  }
-
-  .gp-cap {
-    color: var(--text-faint);
-    font-size: 9px;
-    font-family: var(--mono);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    padding: 4px 6px 2px;
-  }
-
-  .gp-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    font-size: 11px;
-    font-family: var(--mono);
-    padding: 5px 6px;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .gp-row:hover {
-    background: rgba(var(--accent-rgb), calc(0.08 * var(--glow-k)));
-    color: var(--text);
-  }
-
-  .gp-row.on {
-    color: var(--accent);
-  }
 
   .header-tools-right {
     margin-left: auto;
@@ -7800,14 +5147,4 @@
     min-width: 0;
   }
 
-  .log-note {
-    margin-left: auto;
-    color: var(--text-faint);
-    font-size: 9px;
-    font-family: var(--mono);
-    max-width: 60%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 </style>

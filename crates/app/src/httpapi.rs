@@ -364,7 +364,7 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
                     &json_error("нужен session_id"),
                 ));
             }
-            match crate::start_turn_core(
+            match crate::turn_driver::start_turn_core(
                 state.clone(),
                 session_id.to_string(),
                 message.to_string(),
@@ -393,7 +393,7 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             if session_id.trim().is_empty() {
                 return Some(bad_request("нужен session_id"));
             }
-            match crate::stop_turn_core(state, session_id).await {
+            match crate::turn_driver::stop_turn_core(state, session_id).await {
                 Ok(()) => Some(response(200, "OK", "{}")),
                 Err(e) => Some(bad_request(&e)),
             }

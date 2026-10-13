@@ -18,6 +18,7 @@ pub mod jsplugins;
 pub mod mcp;
 pub mod providers;
 pub mod stdio_rpc;
+pub mod turn_driver;
 
 use serde::Serialize;
 use swagcod_core::bus::{Bus, Event, EventKind};
@@ -26,8 +27,7 @@ use swagcod_core::tasks::{
     task_backoff_ms, Task, TASK_CANCELLED, TASK_DONE, TASK_FAILED, TASK_QUEUED,
 };
 use swagcod_core::turn::{
-    builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ApprovalPolicy,
-    ToolOutcome, TurnConfig, TurnMachine, TurnOutcome, TurnStep,
+    builtin_tool_specs, truncate_output, ApprovalDecision, ApprovalPolicy, ToolOutcome, TurnConfig,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall, ToolSpec};
 use swagcod_provider::{AnyProvider, ChatRequest, Router, StreamEvent};
@@ -116,7 +116,7 @@ pub struct SessionMeta {
     pub last_activity_ms: u64,
 }
 
-fn meta_of(s: &Session) -> SessionMeta {
+pub(crate) fn meta_of(s: &Session) -> SessionMeta {
     SessionMeta {
         turns: s.turns.len(),
         est_context_tokens: s.estimate_context_tokens(),
@@ -148,7 +148,7 @@ fn light_sessions(
 /// D-121: подгрузить историю и журнал сессии из store, если в памяти их
 /// нет. Вызывается перед началом хода и при показе транскрипта — двум
 /// командам нужна полная сессия, остальным достаточно лёгкой.
-fn rehydrate_session(state: &AppState, session: &mut Session) {
+pub(crate) fn rehydrate_session(state: &AppState, session: &mut Session) {
     if !session.history.is_empty() || !session.turns.is_empty() {
         return;
     }
@@ -906,62 +906,10 @@ fn pty_kill(state: State<'_, Arc<AppState>>, pty_id: String) -> Result<(), Strin
     Ok(())
 }
 
-/// Вложения пользователя (скрепка в UI): текстовые файлы подшиваются к
-/// сообщению блоками с содержимым. Провайдер текстовый — картинки и
-/// бинарщина честно помечаются неприкреплёнными, а не молча теряются.
-/// Лимит 200 КБ на файл бережёт контекст (B-3) от одного жирного лога.
-const ATTACH_MAX_BYTES: u64 = 200 * 1024;
-
-fn render_attachments(paths: &[String]) -> String {
-    let mut out = String::new();
-    for p in paths {
-        let name = std::path::Path::new(p)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| p.clone());
-        let ext = std::path::Path::new(p)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
-        ) {
-            out.push_str(&format!(
-                "\n\n---\nВложение {name}: не прикреплено — картинки пока не поддерживаются (текстовый провайдер)."
-            ));
-            continue;
-        }
-        match std::fs::metadata(p) {
-            Ok(md) if md.len() > ATTACH_MAX_BYTES => {
-                out.push_str(&format!(
-                    "\n\n---\nВложение {name}: не прикреплено — файл больше {} КБ.",
-                    ATTACH_MAX_BYTES / 1024
-                ));
-            }
-            Ok(_) => match std::fs::read_to_string(p) {
-                Ok(text) => {
-                    out.push_str(&format!(
-                        "\n\n---\nВложение: {name} ({p})\n```\n{text}\n```"
-                    ));
-                }
-                Err(_) => {
-                    out.push_str(&format!(
-                        "\n\n---\nВложение {name}: не прикреплено — бинарный файл."
-                    ));
-                }
-            },
-            Err(e) => {
-                out.push_str(&format!("\n\n---\nВложение {name}: не прикреплено — {e}."));
-            }
-        }
-    }
-    out
-}
-
 /// Запустить ход: сообщение пользователя → агентский цикл → журнал сессии.
 ///
-/// Цикл ведёт [`TurnMachine`] из swagcod-core: эта задача лишь выполняет
+/// Цикл ведёт [`swagcod_core::turn::TurnMachine`] из swagcod-core: эта задача
+/// лишь выполняет
 /// шаги, которые машина просит (стрим модели, подтверждение человеком,
 /// тулз), и публикует всё в шину. Поэтому лимит итераций и approval
 /// невозможно обойти из UI: решений в фронтенде нет.
@@ -974,7 +922,7 @@ async fn start_turn(
     temperature: Option<f64>,
     attachments: Option<Vec<String>>,
 ) -> Result<String, String> {
-    start_turn_core(
+    turn_driver::start_turn_core(
         state.inner().clone(),
         session_id,
         message,
@@ -985,752 +933,13 @@ async fn start_turn(
     .await
 }
 
-/* ── F-6: diff-review перед применением правки ─────────────────────────────
- * Диалог подтверждения показывал «write {"path":…,"content":…}» — по такому
- * тексту человек одобряет не глядя, а именно это подтверждение и должно
- * предотвращать. Поэтому вместе со сводкой уходит unified-diff того, что
- * произойдёт с файлом: посчитанный ДО записи, из текущего содержимого и
- * предложенного. */
-
-/// Инструменты, у которых есть что показать до применения.
-const PREVIEWABLE_TOOLS: [&str; 2] = ["write", "patch"];
-
-/// Файлы больше этого не диффим: LCS на мегабайтах съел бы секунды прямо в
-/// ходе, а диалог всё равно обрезан 64 КБ.
-const PREVIEW_SOURCE_MAX_BYTES: usize = 2 * 1024 * 1024;
-
-/// Строка-заглушка: показываем причину, а не пустоту.
-fn preview_note(text: &str) -> String {
-    format!("@@ {text} @@\n")
-}
-
-/// Unified-diff того, что сделает вызов, либо None.
-///
-/// None — «нечего показывать»: не файловый инструмент или путь не
-/// резолвится. Ошибку применения (old_string не найден, файл не читается)
-/// тоже не прячем за выдуманным diff: preview=None, а сводка и результат
-/// исполнения остаются честными.
-pub(crate) fn approval_preview(call: &ToolCall, cwd: &std::path::Path) -> Option<String> {
-    if !PREVIEWABLE_TOOLS.contains(&call.name.as_str()) {
-        return None;
-    }
-    let path = sandbox_path(cwd, &arg_str(call, "path")).ok()?;
-    let exists = path.exists();
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    /* Огромный файл отсекаем до patch_text: и LCS, и поиск вхождений на
-    мегабайтах стоили бы секунд прямо в ходе, а показать их всё равно нельзя
-    (предел preview — 64 КБ). */
-    if current.len() > PREVIEW_SOURCE_MAX_BYTES {
-        return Some(preview_note(
-            "файл больше 2 МБ: diff не считался, решение по сводке",
-        ));
-    }
-
-    let proposed = match call.name.as_str() {
-        "write" => arg_str(call, "content"),
-        /* patch несуществующего файла — ошибка исполнения («old_string не
-        найден»), а не «создадим файл»: показывать все строки добавленными
-        было бы ложью о поведении инструмента. */
-        "patch" if exists => {
-            let old = arg_str(call, "old_string");
-            let new = arg_str(call, "new_string");
-            let replace_all = call
-                .arguments
-                .get("replace_all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            match swagcod_fsx::tools::patch_text(&current, &old, &new, replace_all) {
-                Ok((patched, _)) => patched,
-                Err(e) => return Some(preview_note(&format!("правка не применима: {e}"))),
-            }
-        }
-        _ => return None,
-    };
-
-    if current.len() + proposed.len() > PREVIEW_SOURCE_MAX_BYTES {
-        return Some(preview_note(
-            "файл больше 2 МБ: diff не считался, решение по сводке",
-        ));
-    }
-    let d = swagcod_fsx::diff_text(&current, &proposed);
-    if d.is_empty() {
-        return Some(preview_note("изменений нет: содержимое совпадает"));
-    }
-    let (mut text, truncated) =
-        swagcod_fsx::format_unified_preview(&d, swagcod_fsx::PREVIEW_MAX_BYTES);
-    if truncated {
-        text.push_str(&preview_note(&format!(
-            "diff обрезан: предел {} КБ, всего +{} -{}",
-            swagcod_fsx::PREVIEW_MAX_BYTES / 1024,
-            d.added,
-            d.removed
-        )));
-    }
-    Some(text)
-}
-
-/* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
-loopback REST API. Поведение идентично: та же машина хода, та же шина. */
-pub(crate) async fn start_turn_core(
-    state: Arc<AppState>,
-    session_id: String,
-    message: String,
-    model: Option<String>,
-    temperature: Option<f64>,
-    attachments: Option<Vec<String>>,
-) -> Result<String, String> {
-    /* Скрепка: вложения подшиваются к тексту одним сообщением — история
-    и контекст видят их как часть реплики пользователя. */
-    let mut message = message.trim().to_string();
-    if let Some(paths) = attachments.as_ref().filter(|a| !a.is_empty()) {
-        message.push_str(&render_attachments(paths));
-        message = message.trim().to_string();
-    }
-    if message.is_empty() {
-        return Err("сообщение не может быть пустым".into());
-    }
-
-    // C1-фикс: создаём провайдер ДО мутации статуса сессии.
-    // Активный провайдер из настроек (default = .env/DPAPI как раньше).
-    let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
-
-    /* F-3: allow/deny-списки команд читаются из prefs на каждый ход —
-    правка списка в настройках действует сразу, без перезапуска. */
-    let cmd_rules = state
-        .store
-        .lock()
-        .map(|s| load_command_rules(s.as_ref()))
-        // Отравленный мьютекс не должен снимать запреты: дефолты F-3.
-        .unwrap_or_else(|_| swagcod_core::rules::CommandRules::defaults());
-
-    let (turn_id, history, session_summary, session_model, cwd, cfg) = {
-        let mut sessions = state.sessions.lock().await;
-        let session = sessions
-            .iter_mut()
-            .find(|s| s.id.to_string() == session_id)
-            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
-
-        if !session.status.can_start_turn() {
-            return Err(format!("сессия занята: {:?}", session.status));
-        }
-
-        /* D-121: второй потребитель полной сессии — ход. История грузится
-        из базы лениво: в покое RAM не держит чужие транскрипты. */
-        rehydrate_session(&state, session);
-
-        let ok = session.push_user_message(&message);
-        if !ok {
-            return Err("не удалось начать ход".into());
-        }
-
-        let turn_id = swagcod_core::TurnId::new(format!("t-{}", short_id()));
-        session.current_turn = Some(turn_id.clone());
-        session.status = swagcod_core::session::SessionStatus::Running;
-
-        let mut cfg = state.config.lock().await.clone();
-        // B-7: per-session политика подтверждений перекрывает глобальную.
-        if let Some(p) = session.approval_policy {
-            cfg.approval_policy = p;
-        }
-        // F-3: списки команд — свои на каждый ход (свежие из prefs).
-        cfg.rules = cmd_rules;
-        (
-            turn_id.to_string(),
-            session.history.clone(),
-            session.summary.clone(),
-            session.model.clone(),
-            session.cwd.clone(),
-            cfg,
-        )
-    };
-
-    // W-6 фикс: используем переданную модель если есть, иначе из сессии.
-    let effective_model = model.unwrap_or(session_model);
-    // Тулзы уходят в каждом запросе: без определений модель не может их вызвать.
-    // B-5: встроенные плюс зарегистрированные плагины — модель видит один список.
-    let plugins: Vec<PluginTool> = state.plugins.lock().map(|p| p.clone()).unwrap_or_default();
-    let mut specs = builtin_tool_specs();
-    specs.extend(plugins.iter().map(|p| ToolSpec {
-        name: p.name.clone(),
-        description: p.description.clone(),
-        parameters: p.parameters.clone(),
-    }));
-    /* E-3: инструменты MCP-серверов видны модели одним списком с
-    встроенными и плагинами B-5. */
-    {
-        let reg = state.mcp.lock().await;
-        specs.extend(reg.tools.iter().map(|t| ToolSpec {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            parameters: t.parameters.clone(),
-        }));
-    }
-    /* E-4: JS-плагины sidecar — тот же единый список (имена js:*). */
-    if let Ok(tools) = state.js_tools.lock() {
-        specs.extend(tools.iter().map(|t| ToolSpec {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            parameters: t.parameters.clone(),
-        }));
-    }
-    let tool_wire: Vec<serde_json::Value> = ChatRequest::new(&effective_model, Vec::new())
-        .with_tools(&specs)
-        .tools;
-    let temperature = temperature.map(|t| t as f32);
-
-    let bus = state.bus.clone();
-    let turn = turn_id.clone();
-    let sid = session_id.clone();
-    let app_state = state.clone();
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancelled_in_task = cancelled.clone();
-
-    let task = tauri::async_runtime::spawn(async move {
-        let tid = swagcod_core::TurnId::new(&turn);
-        let cwd = std::path::PathBuf::from(&cwd);
-        let tool_timeout = cfg.tool_timeout;
-        /* TurnStarted обязан уходить в шину ПЕРВЫМ: фронт строит по нему
-        карту turn→session, и без неё стрим либо терялся, либо (раньше)
-        сваливался в активный чат — отсюда росли «слияния» чатов. */
-        bus.publish(EventKind::TurnStarted {
-            turn: tid.clone(),
-            session: swagcod_core::SessionId::new(&sid),
-            parent: None,
-        });
-        /* F-8: хуки владельца. Конфигурация читается один раз на ход: правка в
-        настройках действует со следующего хода, а перечитывать prefs на каждом
-        инструменте значило бы платить запросом к базе внутри цикла.
-        pre_turn идёт ДО снимка git: отказавший ход не должен оставлять
-        артефактов (лишних объектов в .git). */
-        let hooks_cfg = hooks::load_hooks(&app_state);
-        let mut pre_turn_refusal: Option<String> = None;
-        if !hooks_cfg.pre_turn.is_empty() {
-            let ctx = hooks::HookCtx {
-                session: sid.as_str(),
-                event: swagcod_core::hooks::EVENT_PRE_TURN,
-                tool: "",
-                cwd: &cwd,
-                ok: None,
-            };
-            let run = hooks::run_event_hooks(&app_state, &hooks_cfg.pre_turn, &ctx).await;
-            if !run.ok {
-                bus.publish(EventKind::Error {
-                    turn: Some(tid.clone()),
-                    message: run.message.clone(),
-                });
-                pre_turn_refusal = Some(run.message);
-            }
-        }
-        /* F-5: снимок worktree ДО первого инструмента хода. Не репозиторий
-        или чистое дерево → None (нечего откатывать), и ход идёт как раньше.
-        Ошибка git — не повод ронять ход: сообщаем в статус и работаем без
-        страховки, но честно. */
-        let checkpoint_sha = match swagcod_fsx::git::create_checkpoint(&cwd).await {
-            Ok(sha) => sha,
-            Err(e) => {
-                bus.publish(EventKind::Status {
-                    message: format!("чекпоинт git не создан: {e}"),
-                });
-                None
-            }
-        };
-        /* E-2: в начале каждого хода фоном освежаем семантический индекс.
-        Кулдаун 5 минут + busy-флаг: частые ходы не гоняют обход
-        репозитория и не толкаются в одной базе. */
-        spawn_semantic_index(app_state.clone(), cwd.clone(), false);
-        /* B-8: watchdog получает запись о живом ходе. Время — now_ms из
-        шины: диагностика и журнал живут на одних часах. */
-        if let Ok(mut activity) = app_state.turn_activity.lock() {
-            let now = swagcod_core::bus::now_ms();
-            activity.insert(
-                turn.clone(),
-                TurnActivity {
-                    session: sid.clone(),
-                    started_ms: now,
-                    last_ms: now,
-                    waiting_human: false,
-                    warned_ms: None,
-                },
-            );
-        }
-
-        /* B-3: контекст — калиброванный счёт, компакция сайд-запросом и
-        память проекта. Всё до старта машины: машина получает уже
-        подготовленную историю. F-2: компакция вынесена в run_compaction —
-        её же дёргает /compact из палитры команд. */
-        use swagcod_core::context;
-        let calib = app_state
-            .store
-            .lock()
-            .ok()
-            .and_then(|s| s.get_pref("token_calibration").ok().flatten());
-        let cpt = context::chars_per_token(&effective_model, calib.as_deref());
-        let (summary, history, _) = run_compaction(
-            &app_state,
-            &provider,
-            &sid,
-            &effective_model,
-            false,
-            session_summary,
-            history,
-        )
-        .await;
-        // Память проекта инжектится в system-промпт каждого запроса хода.
-        let memory_md =
-            std::fs::read_to_string(cwd.join(".swagcod").join("MEMORY.md")).unwrap_or_default();
-        /* F-7: факты из базы приложения — второй источник памяти, живущий вне
-        рабочей директории. Читаются один раз на ход: промпт пересобирается на
-        каждом запросе, но факт, добавленный этим же ходом, станет видимым
-        модели со следующего хода (сам вызов memory_add уже вернул
-        подтверждение в истории, так что модель о нём знает). */
-        let memory_facts = memory_facts_for_prompt(&app_state);
-        let system_msg = context::system_prompt(&summary, &memory_md, &memory_facts);
-
-        let (mut machine, mut step) = TurnMachine::new(cfg, history);
-        let mut fail_reason: Option<String> = None;
-        // B-3: точный счёт от провайдера, если он отдаёт usage в стриме.
-        let mut last_usage: Option<(u32, u32)> = None;
-
-        let outcome = loop {
-            /* F-8: отказ pre_turn-хука закрывает ход до первого запроса
-            модели. Охранник, который не может остановить ход, бесполезен:
-            «не запускай агента на грязной ветке» — именно такой случай. */
-            if let Some(reason) = pre_turn_refusal.take() {
-                fail_reason = Some(reason);
-                break TurnOutcome::Failed;
-            }
-            // B-8: каждый шаг машины — признак жизни для watchdog.
-            touch_turn(&app_state, &turn, None);
-            if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
-                step = machine.cancel();
-            }
-            match step {
-                TurnStep::RequestModel { history } => {
-                    // System не хранится в истории сессии: подставляется
-                    // свежим в каждый запрос, иначе сообщения множились бы.
-                    let messages = {
-                        let mut v = Vec::with_capacity(history.len() + 1);
-                        v.push(system_msg.clone());
-                        v.extend(history);
-                        v
-                    };
-                    let request = ChatRequest {
-                        model: effective_model.clone(),
-                        messages,
-                        stream: true,
-                        temperature,
-                        max_tokens: None,
-                        tools: tool_wire.clone(),
-                    };
-                    let stream_started = std::time::Instant::now();
-                    let (mut rx, handle) = match provider.stream(request) {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            fail_reason = Some(format!("ошибка стрима: {e}"));
-                            bus.publish(EventKind::Error {
-                                turn: Some(tid.clone()),
-                                message: format!("ошибка стрима: {e}"),
-                            });
-                            step = TurnStep::Finish {
-                                outcome: TurnOutcome::Failed,
-                            };
-                            continue;
-                        }
-                    };
-                    let mut acc = swagcod_core::turn::StreamAccumulator::default();
-                    let mut stopped = false;
-                    let mut latency_recorded = false;
-                    let mut stream_error: Option<String> = None;
-                    while let Some(event) = rx.recv().await {
-                        // B-8: токен — событие. Долгая генерация reasoning не
-                        // должна выглядеть для watchdog как зависание.
-                        touch_turn(&app_state, &turn, None);
-                        /* E-8: латентность провайдера — время до первого
-                        события стрима. Одна точка на запрос, fire-and-
-                        forget: телеметрия не должна ломать ход. */
-                        if !latency_recorded {
-                            latency_recorded = true;
-                            let ms = stream_started.elapsed().as_secs_f64() * 1000.0;
-                            if let Ok(g) = app_state.store.lock() {
-                                let _ = g.metrics_insert(
-                                    swagcod_core::bus::now_ms(),
-                                    "provider_latency_ms",
-                                    ms,
-                                );
-                            }
-                        }
-                        if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
-                            stopped = true;
-                            handle.abort();
-                            break;
-                        }
-                        match &event {
-                            StreamEvent::Reasoning(text) => {
-                                acc.reasoning.push_str(text);
-                                bus.publish(EventKind::Reasoning {
-                                    turn: tid.clone(),
-                                    text: text.clone(),
-                                });
-                            }
-                            StreamEvent::Content(text) => {
-                                acc.content.push_str(text);
-                                bus.publish(EventKind::Content {
-                                    turn: tid.clone(),
-                                    text: text.clone(),
-                                });
-                            }
-                            StreamEvent::ToolCallStart { id, name, .. } => {
-                                bus.publish(EventKind::ToolCallStart {
-                                    turn: tid.clone(),
-                                    call_id: id.clone(),
-                                    name: name.clone(),
-                                });
-                            }
-                            StreamEvent::ToolCallComplete(tc) => {
-                                acc.tool_calls.push(tc.clone());
-                                bus.publish(EventKind::ToolCall {
-                                    turn: tid.clone(),
-                                    call_id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    arguments: serde_json::Value::Object(tc.arguments.clone()),
-                                });
-                            }
-                            StreamEvent::Done { .. } => {}
-                            StreamEvent::Error(msg) => stream_error = Some(msg.clone()),
-                            StreamEvent::Usage {
-                                input_tokens,
-                                output_tokens,
-                            } => {
-                                last_usage = Some((*input_tokens, *output_tokens));
-                            }
-                        }
-                    }
-                    if stopped {
-                        step = machine.cancel();
-                    } else if let Some(msg) = stream_error {
-                        fail_reason = Some(msg.clone());
-                        bus.publish(EventKind::Error {
-                            turn: Some(tid.clone()),
-                            message: msg,
-                        });
-                        step = TurnStep::Finish {
-                            outcome: TurnOutcome::Failed,
-                        };
-                    } else {
-                        step = machine.on_stream(acc);
-                    }
-                }
-                TurnStep::AwaitApproval { call } => {
-                    let call_id = call.id.clone();
-                    /* F-6: diff считается только здесь — то есть только когда
-                    диалог действительно будет показан. При политике Never и
-                    при совпадении с allow-списком (F-3) машина до этого шага
-                    не доходит, и лишней работы с файлами нет. */
-                    let preview = approval_preview(&call, &cwd);
-                    bus.publish(EventKind::ApprovalRequired {
-                        turn: tid.clone(),
-                        call_id: call_id.clone(),
-                        tool: call.name.clone(),
-                        summary: describe_call(&call),
-                        preview,
-                    });
-                    let (tx, rx) = oneshot::channel();
-                    {
-                        let mut approvals = app_state.approvals.lock().await;
-                        // Каналы завершившихся ходов выметаем, чтобы карта не росла.
-                        approvals.retain(|_, sender| !sender.is_closed());
-                        approvals.insert(call_id.clone(), tx);
-                    }
-                    // Потеря канала (ход остановлен) считаем отказом: молчаливое
-                    // «одобрено» было бы дырой в политике подтверждений.
-                    // B-8: на время ожидания человека watchdog замолкает —
-                    // диалог подтверждения не зависание.
-                    touch_turn(&app_state, &turn, Some(true));
-                    let res = rx.await;
-                    touch_turn(&app_state, &turn, Some(false));
-                    let actor = if res.is_ok() { "user" } else { "system" };
-                    let decision = res.unwrap_or(ApprovalDecision::Denied);
-                    /* B-7: журнал подтверждений — кто, что, когда. actor=system
-                    означает решение без человека (канал потерян). */
-                    if let Ok(store) = app_state.store.lock() {
-                        let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
-                            session_id: sid.clone(),
-                            turn_id: tid.to_string(),
-                            call_id: call_id.clone(),
-                            tool: call.name.clone(),
-                            summary: describe_call(&call),
-                            decision: match decision {
-                                ApprovalDecision::Approved => "approved",
-                                ApprovalDecision::Denied => "denied",
-                            }
-                            .into(),
-                            actor: actor.into(),
-                            decided_ms: swagcod_core::bus::now_ms(),
-                        });
-                    }
-                    app_state.approvals.lock().await.remove(&call_id);
-                    step = machine.on_approval(decision);
-                }
-                /* F-3: вызов запрещён deny-списком. Диалога нет — решение
-                принято правилом заранее. В журнал пишем actor=system:
-                автоматический отказ должен быть виден в аудите наравне с
-                человеческими, иначе «кто запретил» останется загадкой. */
-                TurnStep::Blocked { call, reason } => {
-                    bus.publish(EventKind::ToolResult {
-                        turn: tid.clone(),
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: truncate_output(&reason),
-                        elapsed_ms: 0,
-                    });
-                    if let Ok(store) = app_state.store.lock() {
-                        let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
-                            session_id: sid.clone(),
-                            turn_id: tid.to_string(),
-                            call_id: call.id.clone(),
-                            tool: call.name.clone(),
-                            summary: describe_call(&call),
-                            decision: "denied".into(),
-                            actor: "system".into(),
-                            decided_ms: swagcod_core::bus::now_ms(),
-                        });
-                    }
-                    step = machine.on_blocked(&reason);
-                }
-                TurnStep::ExecuteTool { call } => {
-                    let started = std::time::Instant::now();
-                    /* F-8: pre_tool-хук решает до исполнения вызова. Отказ
-                    оформляется как blocked (тот же путь, что у deny-списка
-                    F-3): вызов закрывается сообщением tool с причиной, ход
-                    продолжается, и модель может сделать иначе. В журнал
-                    подтверждений пишем actor=system — автоматический отказ
-                    должен быть виден в аудите наравне с человеческим. */
-                    if let Some(reason) = hooks::run_pre_tool_hooks(
-                        &app_state,
-                        &hooks_cfg,
-                        sid.as_str(),
-                        &call.name,
-                        &cwd,
-                    )
-                    .await
-                    {
-                        bus.publish(EventKind::ToolResult {
-                            turn: tid.clone(),
-                            call_id: call.id.clone(),
-                            ok: false,
-                            output: truncate_output(&reason),
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        });
-                        if let Ok(store) = app_state.store.lock() {
-                            let _ = store.log_approval(&swagcod_core::store::ApprovalEntry {
-                                session_id: sid.clone(),
-                                turn_id: tid.to_string(),
-                                call_id: call.id.clone(),
-                                tool: call.name.clone(),
-                                summary: describe_call(&call),
-                                decision: "denied".into(),
-                                actor: "hook".into(),
-                                decided_ms: swagcod_core::bus::now_ms(),
-                            });
-                        }
-                        step = machine.on_blocked(&reason);
-                        continue;
-                    }
-                    /* E-2: semantic_search исполняется здесь, а не в
-                    execute_tool — ему нужны AppState (индекс, DPAPI-ключ)
-                    и сеть, а execute_tool остаётся чистой и тестируемой.
-                    E-3: то же для mcp:* — вызов идёт в живой
-                    stdio-процесс сервера из реестра AppState. */
-                    let tool_outcome = if call.name == "semantic_search" {
-                        run_semantic_search(&app_state, &call, &cwd).await
-                    } else if is_memory_tool(&call.name) {
-                        /* F-7: память приложения — нужен стор из AppState.
-                        В whitelist суб-агента этих имён нет, поэтому ветка
-                        писать память не может. */
-                        run_memory_tool(&app_state, sid.as_str(), &call).await
-                    } else if call.name.starts_with(mcp::MCP_PREFIX) {
-                        run_mcp_call(&app_state, &call).await
-                    } else if call.name.starts_with(jsplugins::JS_PREFIX) {
-                        run_js_call(&app_state, &call).await
-                    } else if call.name == "subagent" {
-                        /* E-6: ветка суб-агента — собственный стрим и история;
-                        снимок истории сессии нужен её save_turn (messages
-                        заменяются целиком). */
-                        run_subagent(
-                            &app_state,
-                            &provider,
-                            &call,
-                            &sid,
-                            &turn,
-                            &effective_model,
-                            temperature,
-                            &cwd,
-                            &summary,
-                            tool_timeout,
-                            machine.history(),
-                        )
-                        .await
-                    } else {
-                        execute_tool(&call, &cwd, tool_timeout, &plugins).await
-                    };
-                    let elapsed_ms = started.elapsed().as_millis() as u64;
-                    bus.publish(EventKind::ToolResult {
-                        turn: tid.clone(),
-                        call_id: call.id.clone(),
-                        ok: tool_outcome.ok,
-                        output: truncate_output(&tool_outcome.output),
-                        elapsed_ms,
-                    });
-                    step = machine.on_tool_result(tool_outcome);
-                }
-                TurnStep::Finish { outcome: o } => break o,
-            }
-        };
-
-        // TurnEnded публикуется ровно один раз и только из исхода цикла:
-        // UI закрывает строки хода по нему и не дедуплирует несколько финалов.
-        let reason = match outcome {
-            TurnOutcome::Completed => None,
-            TurnOutcome::IterationLimit => Some("превышен лимит итераций".to_string()),
-            TurnOutcome::Cancelled => Some(
-                fail_reason
-                    .clone()
-                    .unwrap_or_else(|| "остановлено пользователем".to_string()),
-            ),
-            TurnOutcome::Failed => Some(
-                fail_reason
-                    .clone()
-                    .unwrap_or_else(|| "ошибка хода".to_string()),
-            ),
-        };
-        bus.publish(EventKind::TurnEnded {
-            turn: tid.clone(),
-            session: swagcod_core::SessionId::new(&sid),
-            ok: outcome == TurnOutcome::Completed,
-            reason,
-        });
-
-        let ended_ms = swagcod_core::bus::now_ms();
-        let report = machine.report(outcome, ended_ms);
-        let calls: Vec<ToolCall> = machine
-            .history()
-            .iter()
-            .flat_map(|m| m.tool_calls.clone())
-            .collect();
-        /* B-3: счёт токенов — точный usage от провайдера, когда он его
-        отдаёт, иначе калиброванная оценка. Честный ноль в журнале больше
-        не живёт. */
-        let (est_in, est_out) = match last_usage {
-            Some((i, o)) => (i, o),
-            None => (
-                swagcod_core::context::estimate_history_tokens(machine.history(), cpt),
-                swagcod_core::context::estimate_tokens(&report.content, cpt)
-                    + swagcod_core::context::estimate_tokens(&report.reasoning, cpt),
-            ),
-        };
-        let mut record = report.into_record(tid.clone(), calls, est_in, est_out);
-        // F-5: снимок принадлежит этому ходу — вместе с ним и хранится.
-        record.checkpoint_sha = checkpoint_sha;
-        /* F-8: конкретная причина (отказ хука, ошибка провайдера) важнее
-        общей «ошибка хода» из машины: журнал читают и после перезапуска,
-        когда событие TurnEnded уже никто не увидит. */
-        if let Some(reason) = fail_reason.clone() {
-            record.failure = Some(reason);
-        }
-        {
-            let mut sessions = app_state.sessions.lock().await;
-            if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
-                // История сессии — это история машины: assistant с tool_calls
-                // всегда закрыт ответами tool, следующий запрос валиден.
-                session.history = machine.history().to_vec();
-                session.turns.push(record.clone());
-                session.status = match outcome {
-                    TurnOutcome::Cancelled => swagcod_core::session::SessionStatus::Cancelled,
-                    TurnOutcome::Failed => swagcod_core::session::SessionStatus::Failed,
-                    _ => swagcod_core::session::SessionStatus::Idle,
-                };
-                session.current_turn = None;
-                /* B-1: ход и снимок истории уходят в store одной транзакцией
-                прямо здесь, в конце хода. */
-                if let Ok(store) = app_state.store.lock() {
-                    if let Err(e) = store.save_turn(&sid, &record, &session.history) {
-                        eprintln!("store: ход не записан: {e}");
-                    }
-                }
-                // D-121: сайдбар видит свежие счётчики без полной сессии.
-                if let Ok(mut m) = app_state.session_meta.lock() {
-                    m.insert(sid.clone(), meta_of(session));
-                }
-            }
-        }
-
-        // Ход закончился — убираем ручку, чтобы «стоп» не бил по прошлому.
-        let mut turns = app_state.turns.lock().await;
-        turns.remove(&turn);
-        // B-8: watchdog больше не следит за мёртвым ходом.
-        if let Ok(mut activity) = app_state.turn_activity.lock() {
-            activity.remove(&turn);
-        }
-        /* F-8: post_turn — после записи хода, поэтому хук видит полный
-        журнал. Код возврата ни на что не влияет (ход уже случился): отказ
-        попадает в шину и метрику. Ругаться на владельца за упавший линтер,
-        спрятав от него результат хода, было бы самонадеянно. */
-        if !hooks_cfg.post_turn.is_empty() {
-            let ctx = hooks::HookCtx {
-                session: sid.as_str(),
-                event: swagcod_core::hooks::EVENT_POST_TURN,
-                tool: "",
-                cwd: &cwd,
-                ok: Some(record.ok),
-            };
-            let _ = hooks::run_event_hooks(&app_state, &hooks_cfg.post_turn, &ctx).await;
-        }
-    });
-
-    // Ручка хода доступна команде stop_turn сразу после старта.
-    {
-        let mut turns = state.turns.lock().await;
-        turns.insert(
-            turn_id.clone(),
-            TurnHandle {
-                session: session_id.clone(),
-                cancelled,
-                task,
-            },
-        );
-    }
-
-    Ok(turn_id)
-}
-
 /// Остановка живого хода: флаг в задачу стрима + аборт HTTP-задачи.
 ///
 /// UI после этого показывает ход как завершённый («остановлено пользователем»)
 /// и разблокирует ввод; очередь сообщений продолжает работать.
 #[tauri::command]
 async fn stop_turn(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
-    stop_turn_core(&state, session_id).await
-}
-
-/* F-9: ядро остановки — общее для IPC и loopback REST: кнопка «стоп» на
-телефоне обязана останавливать ход ровно так же, как на десктопе. */
-pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Result<(), String> {
-    let handle = {
-        let mut turns = state.turns.lock().await;
-        let victim = turns
-            .iter()
-            .find(|(_, h)| h.session == session_id)
-            .map(|(tid, _)| tid.clone());
-        victim.and_then(|tid| turns.remove(&tid))
-    };
-    let Some(handle) = handle else {
-        return Err("нет живого хода у сессии".into());
-    };
-    handle
-        .cancelled
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    handle.task.abort();
-    Ok(())
+    turn_driver::stop_turn_core(&state, session_id).await
 }
 
 /// Список файлов и директорий (для файлового дерева UI).
@@ -2006,7 +1215,7 @@ fn list_plugin_tools(state: State<'_, Arc<AppState>>) -> Result<Vec<PluginTool>,
  * а агентскому циклу хватает этого исполнителя. */
 
 /// Резолвить путь внутри cwd сессии; всё снаружи отклоняется.
-fn sandbox_path(cwd: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn sandbox_path(cwd: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(raw);
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -2019,7 +1228,7 @@ fn sandbox_path(cwd: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, 
     Ok(abs)
 }
 
-fn arg_str(call: &ToolCall, key: &str) -> String {
+pub(crate) fn arg_str(call: &ToolCall, key: &str) -> String {
     call.arguments
         .get(key)
         .and_then(|v| v.as_str())
@@ -2097,7 +1306,11 @@ fn is_semantic_candidate(rel: &str) -> bool {
 
 /// Запустить фоновую индексацию, если она не идёт и кулдаун истёк
 /// (или `force`). Возвращает true, когда задача действительно поднята.
-fn spawn_semantic_index(state: Arc<AppState>, cwd: std::path::PathBuf, force: bool) -> bool {
+pub(crate) fn spawn_semantic_index(
+    state: Arc<AppState>,
+    cwd: std::path::PathBuf,
+    force: bool,
+) -> bool {
     use std::sync::atomic::Ordering;
     let now = swagcod_core::bus::now_ms();
     let last = state.semantic_last_ms.load(Ordering::Relaxed);
@@ -2298,7 +1511,7 @@ fn finish_indexing(
 /// по индексу → топ-k фрагментов с путями, строками и оценкой. Обновление
 /// индекса запускается фоном и ответ не блокирует: поиск идёт по тому,
 /// что уже есть. Пустой индекс — честный ответ «повторите позже».
-async fn run_semantic_search(
+pub(crate) async fn run_semantic_search(
     state: &Arc<AppState>,
     call: &ToolCall,
     cwd: &std::path::Path,
@@ -2473,7 +1686,7 @@ pub fn subagent_model(args: &serde_json::Map<String, serde_json::Value>, parent:
 /// СЕССИИ для save_turn: messages заменяются целиком, поэтому изолированную
 /// историю ветки туда писать нельзя (затрёт wire-историю родителя).
 #[allow(clippy::too_many_arguments)]
-async fn run_subagent(
+pub(crate) async fn run_subagent(
     state: &Arc<AppState>,
     provider: &AnyProvider,
     call: &ToolCall,
@@ -2877,7 +2090,7 @@ pub(crate) async fn run_memory_tool(
 /// встроенное имя ищется там и исполняется отдельной командой.
 /// E-2: `semantic_search` исполняется НЕ здесь, а в `run_semantic_search`
 /// (нужны AppState и сеть); диспетчер хода ветвит по имени до вызова.
-async fn execute_tool(
+pub(crate) async fn execute_tool(
     call: &ToolCall,
     cwd: &std::path::Path,
     timeout: std::time::Duration,
@@ -3711,7 +2924,7 @@ pub const WATCHDOG_TICK_MS: u64 = 30 * 1000;
 
 /// Отметить признак жизни хода. `waiting_human` — Some при входе/выходе
 /// из ожидания человека (диалог подтверждения).
-fn touch_turn(state: &AppState, turn: &str, waiting_human: Option<bool>) {
+pub(crate) fn touch_turn(state: &AppState, turn: &str, waiting_human: Option<bool>) {
     let Ok(mut activity) = state.turn_activity.lock() else {
         return;
     };
@@ -4088,7 +3301,7 @@ pub(crate) fn silent_cmd(program: &str) -> tokio::process::Command {
 ///
 /// Счётчик обязателен: два вызова в одну наносекунду иначе дали бы
 /// одинаковый id, а коллизия id сессий — это перемешанные истории.
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4227,7 +3440,7 @@ fn save_mcp_configs(state: &AppState, cfgs: &[mcp::McpServerConfig]) -> Result<(
 /// в BUILTIN, поэтому подтверждение при OnDangerous уже спросила машина
 /// хода, а журнал B-7 получил tool с префиксом `mcp:` — здесь только
 /// исполнение с таймаутом.
-async fn run_mcp_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
+pub(crate) async fn run_mcp_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
     let fail = |output: String| ToolOutcome { ok: false, output };
     let Some((server, tool)) = mcp::split_tool_name(&call.name) else {
         return fail(format!("mcp: неверное имя инструмента: {}", call.name));
@@ -4365,7 +3578,7 @@ async fn start_js_plugins(state: &AppState) {
 /// E-4: вызов JS-плагина из хода. Имя `js:<name>` не входит в BUILTIN —
 /// подтверждение при OnDangerous спрашивает машина хода, журнал B-7 пишет
 /// tool с префиксом `js:`. Дедлайн гарантирует vm на стороне sidecar.
-async fn run_js_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
+pub(crate) async fn run_js_call(state: &AppState, call: &ToolCall) -> ToolOutcome {
     let fail = |output: String| ToolOutcome { ok: false, output };
     let Some(short) = call.name.strip_prefix(jsplugins::JS_PREFIX) else {
         return fail(format!("js: неверное имя инструмента: {}", call.name));
@@ -4677,7 +3890,7 @@ async fn run_task_handler(state: &Arc<AppState>, task: &Task) -> Result<String, 
 /// (/compact из палитры, force = всегда). Возвращает (сводка, история,
 /// число свёрнутых старых сообщений). Ошибка саммаризатора не роняет
 /// вызывающего: остаёмся на полном контексте, как в B-3.
-async fn run_compaction(
+pub(crate) async fn run_compaction(
     app_state: &Arc<AppState>,
     provider: &AnyProvider,
     sid: &str,
@@ -5061,6 +4274,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn_driver::{
+        approval_preview, render_attachments, start_turn_core, ATTACH_MAX_BYTES,
+        PREVIEW_SOURCE_MAX_BYTES,
+    };
 
     #[test]
     fn subagent_model_override_and_fallback() {
