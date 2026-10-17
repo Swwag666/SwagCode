@@ -33,6 +33,11 @@ const plugins = new Map();
 let lastErrors = [];
 let currentDb = null;
 let prefsDb = null;
+/* Причина, по которой prefs-мост не поднялся. Молчаливый null из
+ * prefs.get() неотличим от «такого ключа нет», поэтому причина
+ * запоминается и уходит в errors загрузки: владелец видит «мост не
+ * поднят», а не думает, что prefs пустой. */
+let prefsError = null;
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -49,12 +54,17 @@ function openPrefs(db) {
     if (prefsDb) prefsDb.close();
   } catch (_) {}
   prefsDb = null;
+  prefsError = null;
   currentDb = db;
   try {
+    /* require() резолвится от пути ЭТОГО скрипта: расклад без
+     * node_modules/better-sqlite3 (pnpm install --ignore-scripts) мост не
+     * поднимет, и это видно в errors, а не только в пустом prefs.get(). */
     const Database = require('better-sqlite3');
     prefsDb = new Database(db, { fileMustExist: true });
   } catch (e) {
     prefsDb = null; // нет базы или модуля — prefs.get вернёт null честно
+    prefsError = String((e && e.message) || e).split('\n')[0];
   }
   return prefsDb;
 }
@@ -101,6 +111,15 @@ function doLoad(params) {
   }
   plugins.clear();
   lastErrors = [];
+  /* База передана — пробуем prefs-мост сразу, на загрузке: ошибка
+   * всплывает в errors рядом с ошибками плагинов, а не в момент вызова
+   * handler'а молчаливым null. */
+  if (currentDb !== null && openPrefs(currentDb) === null) {
+    lastErrors.push({
+      file: 'prefs',
+      error: 'prefs-мост не поднят (better-sqlite3 недоступен из ' + __filename + '): ' + prefsError,
+    });
+  }
   const list = [];
   let files = [];
   try {

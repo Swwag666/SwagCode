@@ -212,17 +212,19 @@ pub fn node_binary() -> String {
     "node".to_string()
 }
 
-/// E-4: найти любой файл sidecar-расклада (store-server.js,
-/// plugin-server.js) по тем же кандидатам: рядом с exe (бандл) → vendor
-/// рядом с exe → от cwd и вверх по предкам, включая vendor.
-pub fn sidecar_file(name: &str) -> Option<PathBuf> {
-    const CANDIDATES: &[&str] = &["sidecar", "vendor/sidecar", "vendor\\sidecar"];
+/// E-4: каталоги sidecar-расклада в порядке предпочтения.
+const SIDECAR_CANDIDATES: &[&str] = &["sidecar", "vendor/sidecar", "vendor\\sidecar"];
+
+/// Все существующие кандидаты `dir/<расклад>/<name>`: рядом с exe (бандл),
+/// затем от cwd и вверх по предкам (разработка, тесты cargo).
+fn sidecar_candidates(name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for rel in CANDIDATES {
+            for rel in SIDECAR_CANDIDATES {
                 let p = dir.join(rel).join(name);
                 if p.is_file() {
-                    return Some(p);
+                    out.push(p);
                 }
             }
         }
@@ -230,10 +232,10 @@ pub fn sidecar_file(name: &str) -> Option<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         let mut dir = cwd.as_path();
         for _ in 0..6 {
-            for rel in CANDIDATES {
+            for rel in SIDECAR_CANDIDATES {
                 let p = dir.join(rel).join(name);
                 if p.is_file() {
-                    return Some(p);
+                    out.push(p);
                 }
             }
             match dir.parent() {
@@ -242,7 +244,104 @@ pub fn sidecar_file(name: &str) -> Option<PathBuf> {
             }
         }
     }
+    out
+}
+
+/// Расклад способен поднять better-sqlite3: рядом со скриптом лежит
+/// собранный нативный бинарник. `require()` в Node резолвится ОТ ПУТИ
+/// СКРИПТА, а не от cwd процесса, поэтому «store-server.js найден» ещё не
+/// значит «стор поднимется»: `pnpm install --ignore-scripts` (CI)
+/// оставляет в `sidecar/node_modules` симлинк пакета БЕЗ бинарника, а
+/// prebuilt качает только `tools/bundle-sidecar.ps1` и только в
+/// `vendor/sidecar`.
+fn layout_has_sqlite(script: &Path) -> bool {
+    script
+        .parent()
+        .is_some_and(|dir| sqlite_binding(dir).is_file())
+}
+
+/// Расклад ещё и НЕ УСТАРЕЛ: его копия скрипта не старше исходника в
+/// `sidecar/` того же дерева. `vendor/sidecar` собирает скрипт, и в рабочем
+/// дереве разработчика он легко оказывается вчерашним; выбрать его значило
+/// бы запустить старую схему стора (и сравнить в тесте схемы не то с не
+/// тем). В бандле рядом с exe исходника нет вовсе — там сравнивать не с
+/// чем, расклад пригоден по одному бинарнику.
+fn layout_is_viable(script: &Path) -> bool {
+    if !layout_has_sqlite(script) {
+        return false;
+    }
+    let Some(source) = repo_sidecar_source(script) else {
+        return true;
+    };
+    match (mtime(&source), mtime(script)) {
+        (Some(src), Some(dst)) => dst >= src,
+        // Время не читается — не повод браковать расклад: бинарник на
+        // месте, а расхождение схемы поймает тест `schema_matches_js_sidecar`.
+        _ => true,
+    }
+}
+
+/// Исходник того же скрипта в `sidecar/` репозитория: от каталога расклада
+/// вверх по предкам (`vendor/sidecar/x.js` → `vendor` → корень). Для копии
+/// в бандле рядом с exe такого файла нет — None.
+fn repo_sidecar_source(script: &Path) -> Option<PathBuf> {
+    let name = script.file_name()?;
+    let mut dir = script.parent()?;
+    for _ in 0..6 {
+        let candidate = dir.join("sidecar").join(name);
+        if candidate != script && candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
     None
+}
+
+/// Время последней записи; None, если метаданные не читаются.
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Путь нативного бинарника better-sqlite3 в раскладе `dir`.
+fn sqlite_binding(dir: &Path) -> PathBuf {
+    dir.join("node_modules")
+        .join("better-sqlite3")
+        .join("build")
+        .join("Release")
+        .join("better_sqlite3.node")
+}
+
+/// Выбор расклада из кандидатов: первый пригодный (бинарник на месте и
+/// копия не старше исходника). Чистая функция — порядок и критерии
+/// тестируются на списках путей.
+fn pick_viable_layout(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| layout_is_viable(p)).cloned()
+}
+
+/// E-4: найти любой файл sidecar-расклада (store-server.js,
+/// plugin-server.js) по тем же кандидатам: рядом с exe (бандл) → vendor
+/// рядом с exe → от cwd и вверх по предкам, включая vendor.
+///
+/// Непригодный расклад (нет нативного бинарника better-sqlite3 либо копия
+/// скрипта устарела) отбрасывается, если есть пригодный: иначе скрипт из
+/// репозитория затенял собранный `vendor/sidecar`, а `require` падал уже
+/// внутри Node, где Rust видит только «закрыл stdout» — стор тихо падал в
+/// rusqlite, а prefs-мост плагинов возвращал null.
+pub fn sidecar_file(name: &str) -> Option<PathBuf> {
+    let candidates = sidecar_candidates(name);
+    pick_viable_layout(&candidates)
+        .or_else(|| candidates.iter().find(|p| layout_has_sqlite(p)).cloned())
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// То же, но расклад ОБЯЗАН уметь поднять better-sqlite3. Для стора это
+/// не «предпочтение», а условие работы: скрипт без бинарника отвечает
+/// ошибкой `require`, а не данными. Свежесть копии здесь не проверяется:
+/// устаревший, но рабочий бандл лучше честного отказа (схему сверяет тест).
+pub fn sidecar_sqlite_file(name: &str) -> Option<PathBuf> {
+    let candidates = sidecar_candidates(name);
+    pick_viable_layout(&candidates)
+        .or_else(|| candidates.into_iter().find(|p| layout_has_sqlite(p)))
 }
 
 /// Где искать скрипт sidecar'а: env → рядом с exe (бандл) → vendor рядом
@@ -252,10 +351,20 @@ fn sidecar_script() -> StoreResult<PathBuf> {
     if let Ok(p) = std::env::var("SWAGCOD_STORE_SIDECAR") {
         return Ok(PathBuf::from(p));
     }
-    sidecar_file("store-server.js").ok_or_else(|| {
-        StoreError::Sidecar(
-            "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe, vendor или cwd)".into(),
-        )
+    sidecar_sqlite_file("store-server.js").ok_or_else(|| match sidecar_file("store-server.js") {
+        // Скрипт есть, а бинарника в его раскладе нет: stor поднялся бы и
+        // умер на require внутри Node, где Rust видит только «закрыл
+        // stdout». Называем настоящую причину и что с ней делать.
+        Some(p) => StoreError::Sidecar(format!(
+            "store-server.js найден ({}), но в его раскладе нет \
+             node_modules/better-sqlite3/build/Release/better_sqlite3.node: соберите \
+             vendor (tools/bundle-sidecar.ps1) или поставьте зависимости без --ignore-scripts",
+            p.display()
+        )),
+        None => StoreError::Sidecar(
+            "sidecar/store-server.js не найден (env SWAGCOD_STORE_SIDECAR, каталог exe, vendor или cwd)"
+                .into(),
+        ),
     })
 }
 
@@ -1134,11 +1243,27 @@ mod tests {
         );
     }
 
+    /// Исходник sidecar-скрипта в репозитории: источник правды для сверки
+    /// схемы. Читать для этого резолв рантайма нельзя — тот может вернуть
+    /// копию из `vendor/sidecar`, а она генерируется скриптом упаковки и в
+    /// рабочем дереве легко отстаёт от исходника на ревизию-другую.
+    fn repo_script(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sidecar")
+            .join(name)
+    }
+
     /// Схема не разъезжается с JS-sidecar: одинаковый набор таблиц.
     #[test]
     fn schema_matches_js_sidecar() {
-        let js = std::fs::read_to_string(sidecar_script().expect("скрипт sidecar найдён от cwd"))
-            .expect("скрипт читается");
+        let source = repo_script("store-server.js");
+        let raw = std::fs::read_to_string(&source)
+            .unwrap_or_else(|e| panic!("{} не читается: {e}", source.display()));
+        /* CRLF → LF: рабочая копия на Windows с core.autocrlf=true содержит
+        \r\n, а сверяем мы DDL, а не стиль переносов в файле. Без этого
+        многострочные утверждения (external-content FTS5) валятся локально и
+        проходят в CI — худший вид расхождения. */
+        let js = raw.replace("\r\n", "\n");
         for table in [
             "sessions",
             "turns",
@@ -1214,5 +1339,157 @@ mod tests {
             js.contains("(SELECT COUNT(*) FROM (SELECT rowid FROM messages_fts_docsize LIMIT 1)) = 0"),
             "в store-server.js другой критерий дозации FTS5 (нужна теневая таблица messages_fts_docsize)"
         );
+    }
+
+    /// Расклад пригоден, только если рядом со скриптом есть нативный
+    /// бинарник better-sqlite3, а копия скрипта не старше исходника в
+    /// `sidecar/`. Регрессия CI (ревизия 49): `pnpm install
+    /// --ignore-scripts` оставляет `sidecar/node_modules/better-sqlite3`
+    /// без бинарника, prebuilt качается только в `vendor/sidecar`, а поиск
+    /// брал первый найденный скрипт — репозиторный. `require` падал уже
+    /// внутри Node, prefs-мост JS-плагинов молча возвращал null, и весь
+    /// прогон красил ровно один тест без внятной причины.
+    #[test]
+    fn sidecar_layout_requires_sqlite_binding_and_freshness() {
+        /* Уникальность корня обязательна: два параллельных прогона на одной
+        машине не должны читать чужой расклад. */
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("swagcod-layout-{}-{}", std::process::id(), uniq));
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.join("sidecar");
+        let vendored = root.join("vendor").join("sidecar");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&vendored).unwrap();
+        let repo_script = repo.join("store-server.js");
+        let vendor_script = vendored.join("store-server.js");
+        std::fs::write(&repo_script, "// source").unwrap();
+        std::fs::write(&vendor_script, "// source").unwrap();
+
+        assert!(
+            !layout_has_sqlite(&repo_script),
+            "скрипт без node_modules/better-sqlite3 не поднимет стор"
+        );
+        assert_eq!(
+            pick_viable_layout(&[repo_script.clone(), vendor_script.clone()]),
+            None,
+            "нет бинарника ни в одном раскладе — честно None"
+        );
+
+        /* Бинарник только в vendor, а копия там собрана РАНЬШЕ исходника
+        (порядок записи задаёт время: vendor пишем вторым и тут же
+        пересохраняем исходник). Исполнять вчерашнюю схему стора нельзя. */
+        write_binding(&vendored);
+        std::fs::write(&repo_script, "// source, исправленный после сборки vendor").unwrap();
+        assert!(layout_has_sqlite(&vendor_script), "бинарник на месте");
+        assert!(
+            !layout_is_viable(&vendor_script),
+            "устаревшая копия не должна выигрывать у свежего исходника"
+        );
+        assert_eq!(
+            pick_viable_layout(&[repo_script.clone(), vendor_script.clone()]),
+            None,
+            "единственный расклад с бинарником устарел — пригодного нет"
+        );
+        assert_eq!(
+            repo_sidecar_source(&vendor_script),
+            Some(repo_script.clone()),
+            "исходник для копии в vendor/sidecar находится"
+        );
+
+        /* Vendor пересобран (bundle-sidecar.ps1 копирует скрипты и ставит
+        им свежее время записи) — расклад снова пригоден и выигрывает у
+        репозиторного, где бинарника нет. */
+        std::fs::write(
+            &vendor_script,
+            "// source, исправленный после сборки vendor",
+        )
+        .unwrap();
+        assert!(layout_is_viable(&vendor_script));
+        assert_eq!(
+            pick_viable_layout(&[repo_script.clone(), vendor_script.clone()]),
+            Some(vendor_script.clone()),
+            "vendor с бинарником выигрывает у репозиторного расклада без него"
+        );
+
+        // Бинарник появился и в репозиторном раскладе — побеждает он:
+        // это исходник, а не его копия.
+        write_binding(&repo);
+        assert_eq!(
+            pick_viable_layout(&[repo_script.clone(), vendor_script.clone()]),
+            Some(repo_script.clone()),
+            "порядок кандидатов: пригодный исходник раньше пригодной копии"
+        );
+        assert_eq!(
+            pick_viable_layout(&[vendor_script.clone(), repo_script.clone()]),
+            Some(vendor_script),
+            "порядок кандидатов не ломает выбор: пригоден любой из них"
+        );
+
+        /* Бандл рядом с exe: отдельное дерево, у которого в предках нет
+        `sidecar/` (у установленного приложения исходника нет вовсе),
+        поэтому решает один бинарник — сравнивать свежесть не с чем. */
+        let ship = std::env::temp_dir().join(format!("swagcod-ship-{uniq}"));
+        let bundled = ship.join("sidecar");
+        std::fs::create_dir_all(&bundled).unwrap();
+        let bundled_script = bundled.join("store-server.js");
+        std::fs::write(&bundled_script, "// shipped").unwrap();
+        write_binding(&bundled);
+        assert_eq!(
+            repo_sidecar_source(&bundled_script),
+            None,
+            "в установленном бандле нет исходника sidecar/ — сверять свежесть не с чем"
+        );
+        assert!(
+            layout_is_viable(&bundled_script),
+            "в бандле пригодность определяет бинарник"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ship);
+    }
+
+    /// Нативный бинарник в расклад `dir`. Содержимое не важно: резолв
+    /// смотрит на факт наличия, а грузит его Node.
+    fn write_binding(dir: &Path) {
+        let binding = sqlite_binding(dir);
+        std::fs::create_dir_all(binding.parent().unwrap()).unwrap();
+        std::fs::write(&binding, b"stub").unwrap();
+    }
+
+    /// В рабочем дереве репозитория живой расклад находится: иначе
+    /// `schema_matches_js_sidecar` читал бы не тот скрипт, а стор в auto
+    /// молча падал бы в rusqlite.
+    #[test]
+    fn sidecar_file_prefers_layout_that_can_load_sqlite() {
+        if std::env::var_os("SWAGCOD_STORE_SIDECAR").is_some() {
+            return; // явный путь владельца важнее резолва раскладов
+        }
+        let Some(p) = sidecar_file("store-server.js") else {
+            return; // расклада нет вовсе (свежая машина) — тест не о этом
+        };
+        let viable = sidecar_sqlite_file("store-server.js");
+        match viable {
+            Some(v) => assert_eq!(
+                v,
+                p,
+                "sidecar_file вернул {} , хотя есть живой расклад {}",
+                p.display(),
+                v.display()
+            ),
+            /* Живого нет нигде: sidecar_file обязан вернуть хоть что-то,
+            а стор — внятную ошибку с инструкцией (sidecar_script). */
+            None => {
+                let err = sidecar_script().expect_err("без бинарника stor не поднимается");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("better_sqlite3.node") && msg.contains("bundle-sidecar.ps1"),
+                    "ошибка не называет причину и лечение: {msg}"
+                );
+            }
+        }
     }
 }

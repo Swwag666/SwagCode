@@ -99,6 +99,37 @@ if ($okCount -lt 8) { throw "vendor sidecar did not answer all requests: $ping" 
 $ftsHit = @($ping | Where-Object { $_ -match '"rows":\[\[1\]\]' }).Count
 if ($ftsHit -lt 1) { throw "vendor sidecar FTS5 search did not find the probe row: $ping" }
 
+# 4b. Acceptance: the PLUGIN sidecar must reach prefs through the bundled
+# better-sqlite3. require() resolves from the script's own path, and CI
+# installs JS deps with --ignore-scripts, so only vendor/sidecar carries the
+# native binding: without this probe a stale or incomplete bundle passes the
+# store ping while api.prefs.get() silently returns null inside plugins
+# (the exact failure of revision 49).
+$probeDir = Join-Path $env:TEMP ("swagcod-plugin-probe-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+$probeDb = Join-Path $probeDir 'prefs.db'
+$probeJs = Join-Path $probeDir 'probe.js'
+Set-Content -Path $probeJs -Encoding ASCII -Value @'
+swagcod.define({
+  name: 'probe',
+  description: 'prefs bridge probe',
+  parameters: { type: 'object' },
+  handler: (args, api) => 'pref=' + api.prefs.get('vendor_probe'),
+});
+'@
+$ErrorActionPreference = 'Continue'
+$mkdb = '{"id":1,"method":"open","path":' + ($probeDb -replace '\\', '/' | ConvertTo-Json) + '}
+{"id":2,"method":"exec","sql":"INSERT INTO prefs(key, value) VALUES (?1, ?2)","params":["vendor_probe","7"]}
+{"id":3,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
+$plugin = '{"id":1,"method":"load","params":{"dir":' + ($probeDir -replace '\\', '/' | ConvertTo-Json) + ',"db":' + ($probeDb -replace '\\', '/' | ConvertTo-Json) + '}}
+{"id":2,"method":"call","params":{"name":"probe","arguments":{}}}
+{"id":3,"method":"shutdown"}' | & $node (Join-Path $vendor 'plugin-server.js') 2>$null
+$ErrorActionPreference = 'Stop'
+Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
+if (@($plugin | Where-Object { $_ -match '"output":"pref=7"' }).Count -lt 1) {
+  throw "vendor plugin-server.js did not read prefs through better-sqlite3: $plugin (seed: $mkdb)"
+}
+
 $size = (Get-ChildItem $vendor -Recurse | Measure-Object -Property Length -Sum).Sum
 $mb = [math]::Round($size / 1MB, 1)
 Write-Output "vendor/sidecar assembled and accepted by ping: $mb MB"
