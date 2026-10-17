@@ -4924,6 +4924,24 @@ cwd вверх на 6 уровней), а `sidecar_file()`/`sidecar_sqlite_file(
 раннер терял первую строку stdin) сеет ключ через `store-server.js` и требует от
 `plugin-server.js` ответа `pref=7`, иначе сборка падает с JSON-вердиктом.
 
+**D-214. cargo-deny уехал в отдельный job на ubuntu: container action на
+Windows-раннере не запускается вовсе.** Как только шаги `fmt`, `clippy`, `test` и
+`test release profile` позеленели, job `rust` всё равно остался красным — на
+последнем шаге: `##[error]Container action is only supported on Linux`.
+`EmbarkStudios/cargo-deny-action@v2` — docker-действие, а job объявлен
+`runs-on: windows-latest`. Проверка не «иногда падала», она не могла пройти
+никогда; видно это стало только теперь, потому что раньше job обрывался на
+предыдущих шагах и до cargo-deny дело не доходило. Отсюда общий вывод, который и
+есть причина записи: **пропущенный шаг не равен зелёному шагу**, и при починке
+красного пайплайна смотреть надо не только на то, что упало, но и на то, что
+перестало выполняться. Шаг вынесен в собственный job `deny` на `ubuntu-latest`:
+проверке нужны только `Cargo.toml`, `Cargo.lock` и `deny.toml`, ни Windows, ни
+node-вендор, ни компиляция ей не нужны, а граф зависимостей cargo-deny
+разбирает по локу для всех платформ сразу — то есть windows-sys и прочие
+таргет-специфичные крейты из проверки не выпадают. Побочный плюс: job `rust`
+больше не тратит время на шаг, который на нём не работоспособен, а deny
+выполняется параллельно.
+
 **Гейты rev50:** `cargo fmt --all -- --check` — чисто;
 `cargo clippy --workspace --all-targets -- -D warnings` — 0.
 `cargo test --workspace` — **420 passed / 0 failed / 1 ignored** (app lib 116 +
@@ -4942,3 +4960,10 @@ crate-type предупреждения исчезли, а не уменьшил
 переключается на `vendor/sidecar`), а без пригодного расклада скипаются, как и до
 правки. Приёмка бандла `tools/bundle-sidecar.ps1` — `vendor plugin prefs bridge
 accepted`, `vendor/sidecar assembled and accepted by ping: 11.8 MB`.
+
+**CI rev50:** прогон `39029501383` — `fmt` ✓, `clippy` ✓, `test (headless)` ✓
+(исходное падение `ПРИВЕТ:null` закрыто), `test release profile` ✓ (19 м 35 с на
+job, release собирается в своём `target-release`), `Frontend` ✓, `E2E smoke` ✓
+(10 м 00 с, шаг приёмки бандла зелёный с node-драйвером). Единственный красный
+шаг этого прогона — `cargo-deny` с `Container action is only supported on Linux`
+(D-214): до правки он не выполнялся никогда, потому что job обрывался раньше.
