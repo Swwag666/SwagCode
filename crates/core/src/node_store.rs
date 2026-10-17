@@ -1379,11 +1379,17 @@ mod tests {
             "нет бинарника ни в одном раскладе — честно None"
         );
 
-        /* Бинарник только в vendor, а копия там собрана РАНЬШЕ исходника
-        (порядок записи задаёт время: vendor пишем вторым и тут же
-        пересохраняем исходник). Исполнять вчерашнюю схему стора нельзя. */
+        /* Бинарник только в vendor, а копия там СТАРЕЕ исходника: время
+        записи ставим явно, потому что порядок `fs::write` на бегунке CI не
+        даёт гарантий — два write подряд попадают в один тик системных часов
+        (NTFS ленится обновлять mtime чаще ~15 мс), метки совпадают, а
+        «dst >= src» читает равные метки как свежие. Прогон 39031688630
+        красил на этом весь шаг `test (headless)`, тогда как локально тот же
+        код проходил. */
         write_binding(&vendored);
         std::fs::write(&repo_script, "// source, исправленный после сборки vendor").unwrap();
+        set_mtime(&vendor_script, 1_600_000_000);
+        set_mtime(&repo_script, 1_700_000_000);
         assert!(layout_has_sqlite(&vendor_script), "бинарник на месте");
         assert!(
             !layout_is_viable(&vendor_script),
@@ -1402,12 +1408,14 @@ mod tests {
 
         /* Vendor пересобран (bundle-sidecar.ps1 копирует скрипты и ставит
         им свежее время записи) — расклад снова пригоден и выигрывает у
-        репозиторного, где бинарника нет. */
+        репозиторного, где бинарника нет. Метку копии снова задаём явно:
+        «записали позже, значит время больше» на бегунке CI не гарантировано. */
         std::fs::write(
             &vendor_script,
             "// source, исправленный после сборки vendor",
         )
         .unwrap();
+        set_mtime(&vendor_script, 1_800_000_000);
         assert!(layout_is_viable(&vendor_script));
         assert_eq!(
             pick_viable_layout(&[repo_script.clone(), vendor_script.clone()]),
@@ -1458,6 +1466,20 @@ mod tests {
         let binding = sqlite_binding(dir);
         std::fs::create_dir_all(binding.parent().unwrap()).unwrap();
         std::fs::write(&binding, b"stub").unwrap();
+    }
+
+    /// Время записи файла в секундах от эпохи — задаём явно, а не полагаемся
+    /// на порядок `fs::write`: NTFS обновляет mtime лениво (раз в ~15 мс), и
+    /// два файла, записанных подряд, получают ОДНУ метку. Тогда «dst >= src»
+    /// читает равные метки как свежие, и тест свежести проходит или падает в
+    /// зависимости от нагрузки на бегунок.
+    fn set_mtime(path: &Path, secs: u64) {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(when))
+            .unwrap_or_else(|e| panic!("не выставить mtime {}: {e}", path.display()));
     }
 
     /// В рабочем дереве репозитория живой расклад находится: иначе

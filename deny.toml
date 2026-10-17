@@ -21,6 +21,29 @@ ignore = [
     # tauri на gtk-rs 0.20+ или при старте Linux-сборки.
     "RUSTSEC-2024-0370",
     "RUSTSEC-2025-0057",
+    # serde_yaml 0.9 помечен deprecated, а его unsafe-libyaml — не
+    # поддерживается (репозиторий dtolnay/unsafe-libyaml в архиве с 2024-03).
+    # Форки не лечат: serde_yaml_ng тянет тот же unsafe-libyaml, а saphyr —
+    # другой API и другая семантика чисел/якорей. YAML у нас — только ИМПОРТ
+    # экспортов DSH, которые пользователь сам выбирает файлом (dsh_import.rs,
+    # 21 обращение, всё чтение своего файла, не сеть). Апстрим-фикса нет и не
+    # будет; пересмотреть при переходе импорта на saphyr/serde-saphyr.
+    "RUSTSEC-2024-0449",
+    # zip 4.6.1 приходит транзитивом tauri-plugin-updater (optional, только
+    # cfg(target_os = "windows")) — распаковка артефакта обновления .nsis.zip.
+    # Лечение по advisories — zip >= 9, но даже свежий tauri-plugin-updater
+    # 2.14.0 требует `zip = "^4"`: безопасного апгрейда в цепочке НЕТ
+    # (проверено `cargo update -p zip --dry-run` — «0 packages», и манифестом
+    # 2.14.0 с crates.io). Все три advisory про распаковку ВРАЖЕСКОГО архива:
+    # SUID/SGID-биты и sticky на Unix, symlink-таргеты наружу каталога
+    # назначения, права через symlink. Наш архив (а) скачивается с releases
+    # своего же репозитория, (б) до распаковки проверяется подписью minisign
+    # (updater_builder + ключ в ~/.swagcod-updater, rev37), (в) Windows-сборка:
+    # SUID/SGID и Unix-режим прав на NTFS не применяются вовсе. Пересмотреть,
+    # когда tauri-plugin-updater перейдёт на zip 9+.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]

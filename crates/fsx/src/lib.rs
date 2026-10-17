@@ -464,6 +464,12 @@ mod tests {
 
     /// Бенч бюджета: 5000 строк < 50 мс в release (план B-4 ужесточил
     /// порог до реального бюджета; в debug LCS медленнее — 500 мс).
+    ///
+    /// Замер — минимум из трёх прогонов: воркспейс-тесты идут параллельно, и
+    /// один прогон на нагруженной машине упирается не в LCS, а в планировщик
+    /// (локально тот же код дал 0.23 с в одиночном запуске и >500 мс внутри
+    /// `cargo test --workspace`). Минимум отражает скорость алгоритма, которую
+    /// бюджет и ограничивает, а чужая нагрузка в него не попадает.
     #[test]
     fn diff_5000_line_patch_is_fast() {
         let old: String = (0..5000).map(|i| format!("line {i}\n")).collect();
@@ -476,15 +482,23 @@ mod tests {
                 }
             })
             .collect();
-        let start = std::time::Instant::now();
-        let d = diff_text(&old, &new);
-        let elapsed = start.elapsed();
-        assert!(d.added > 100, "diff должен найти изменения");
+        let mut best = std::time::Duration::MAX;
+        let mut added = 0u32;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let d = diff_text(&old, &new);
+            let elapsed = start.elapsed();
+            if elapsed < best {
+                best = elapsed;
+            }
+            added = d.added;
+        }
+        assert!(added > 100, "diff должен найти изменения");
         let budget_ms: u128 = if cfg!(debug_assertions) { 500 } else { 50 };
         assert!(
-            elapsed.as_millis() < budget_ms,
+            best.as_millis() < budget_ms,
             "слишком медленно: {} мс (бюджет < {budget_ms} мс)",
-            elapsed.as_millis()
+            best.as_millis()
         );
     }
 
