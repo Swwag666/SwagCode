@@ -102,13 +102,20 @@ if ($ftsHit -lt 1) { throw "vendor sidecar FTS5 search did not find the probe ro
 # 4b. Acceptance: the PLUGIN sidecar must reach prefs through the bundled
 # better-sqlite3. require() resolves from the script's own path, and CI
 # installs JS deps with --ignore-scripts, so only vendor/sidecar carries the
-# native binding: without this probe a stale or incomplete bundle passes the
-# store ping while api.prefs.get() silently returns null inside plugins
-# (the exact failure of revision 49).
+# native binding: without this probe an incomplete bundle passes the store
+# ping while api.prefs.get() silently returns null inside plugins (the exact
+# failure of revision 49).
+#
+# Transport: a temp driver.js spawned with the bundled node, talking to both
+# servers over child_process pipes. Piping JSON lines from PowerShell into a
+# native exe is fine on a dev box but lost the FIRST request line on the
+# Windows runner (the plugin server answered id 2 and 3 only), so the probe
+# does not depend on PowerShell stdin plumbing at all and prints one JSON
+# verdict with the load errors inside.
 $probeDir = Join-Path $env:TEMP ("swagcod-plugin-probe-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
-$probeDb = Join-Path $probeDir 'prefs.db'
-$probeJs = Join-Path $probeDir 'probe.js'
+$plugDir = Join-Path $probeDir 'plugins'
+New-Item -ItemType Directory -Force -Path $plugDir | Out-Null
+$probeJs = Join-Path $plugDir 'probe.js'
 Set-Content -Path $probeJs -Encoding ASCII -Value @'
 swagcod.define({
   name: 'probe',
@@ -117,18 +124,91 @@ swagcod.define({
   handler: (args, api) => 'pref=' + api.prefs.get('vendor_probe'),
 });
 '@
+$driverJs = Join-Path $probeDir 'driver.js'
+Set-Content -Path $driverJs -Encoding ASCII -Value @'
+'use strict';
+/* Acceptance driver: seeds prefs.db through the bundled store-server.js, then
+ * loads THIS directory as a plugin dir in the bundled plugin-server.js and
+ * calls the probe. Verdict is one JSON line; exit 0 only when prefs really
+ * came back through better-sqlite3. */
+const { spawn } = require('child_process');
+const path = require('path');
+
+const node = process.execPath;
+const here = __dirname;
+/* argv[2] = vendor/sidecar of the bundle under test: the driver lives in a
+ * temp dir, so it cannot derive the repo root itself. */
+const vendor = process.argv[2];
+const plug = path.join(here, 'plugins');
+const db = path.join(here, 'prefs.db');
+if (!vendor) throw new Error('usage: driver.js <vendor-sidecar-dir>');
+
+function rpc(script, requests) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(node, [script], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = [];
+    const err = [];
+    let buf = '';
+    child.stdout.on('data', (d) => {
+      buf += d.toString('utf8');
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try { out.push(JSON.parse(line)); } catch (_) { /* not protocol */ }
+      }
+    });
+    child.stderr.on('data', (d) => err.push(d.toString('utf8')));
+    child.on('error', reject);
+    child.on('exit', () => resolve({ out, err: err.join('') }));
+    for (const r of requests) child.stdin.write(JSON.stringify(r) + '\n');
+    child.stdin.end();
+  });
+}
+
+(async () => {
+  const seed = await rpc(path.join(vendor, 'store-server.js'), [
+    { id: 1, method: 'open', path: db },
+    { id: 2, method: 'exec', sql: 'INSERT INTO prefs(key, value) VALUES (?1, ?2)', params: ['vendor_probe', '7'] },
+    { id: 3, method: 'shutdown' },
+  ]);
+  const seedOk = seed.out.some((r) => r.id === 2 && r.ok === true && r.changes === 1);
+  const run = await rpc(path.join(vendor, 'plugin-server.js'), [
+    { id: 1, method: 'load', params: { dir: plug, db } },
+    { id: 2, method: 'call', params: { name: 'probe', arguments: {} } },
+    { id: 3, method: 'shutdown' },
+  ]);
+  const load = run.out.find((r) => r.id === 1) || null;
+  const call = run.out.find((r) => r.id === 2) || null;
+  const output = call && call.result ? String(call.result.output || '') : '';
+  const verdict = {
+    ok: Boolean(seedOk && output === 'pref=7'),
+    seedOk,
+    seedOut: seed.out.length,
+    output,
+    loadAnswered: load !== null,
+    loadPlugins: load && load.result && load.result.plugins ? load.result.plugins.map((p) => p.name) : null,
+    loadErrors: load && load.result ? load.result.errors : null,
+    stderr: String(run.err).slice(0, 400),
+    vendor,
+  };
+  process.stdout.write(JSON.stringify(verdict) + '\n');
+  process.exit(verdict.ok ? 0 : 1);
+})().catch((e) => {
+  process.stdout.write(JSON.stringify({ ok: false, fatal: String((e && e.message) || e) }) + '\n');
+  process.exit(1);
+});
+'@
 $ErrorActionPreference = 'Continue'
-$mkdb = '{"id":1,"method":"open","path":' + ($probeDb -replace '\\', '/' | ConvertTo-Json) + '}
-{"id":2,"method":"exec","sql":"INSERT INTO prefs(key, value) VALUES (?1, ?2)","params":["vendor_probe","7"]}
-{"id":3,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
-$plugin = '{"id":1,"method":"load","params":{"dir":' + ($probeDir -replace '\\', '/' | ConvertTo-Json) + ',"db":' + ($probeDb -replace '\\', '/' | ConvertTo-Json) + '}}
-{"id":2,"method":"call","params":{"name":"probe","arguments":{}}}
-{"id":3,"method":"shutdown"}' | & $node (Join-Path $vendor 'plugin-server.js') 2>$null
+$verdict = (& $node $driverJs $vendor 2>&1 | Out-String).Trim()
+$probeExit = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
-if (@($plugin | Where-Object { $_ -match '"output":"pref=7"' }).Count -lt 1) {
-  throw "vendor plugin-server.js did not read prefs through better-sqlite3: $plugin (seed: $mkdb)"
+if ($probeExit -ne 0 -or $verdict -notmatch '"ok":true') {
+  throw "vendor plugin-server.js did not read prefs through better-sqlite3: $verdict"
 }
+Write-Output "vendor plugin prefs bridge accepted: $verdict"
 
 $size = (Get-ChildItem $vendor -Recurse | Measure-Object -Property Length -Sum).Sum
 $mb = [math]::Round($size / 1MB, 1)
