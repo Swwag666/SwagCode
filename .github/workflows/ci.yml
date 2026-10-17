@@ -58,7 +58,19 @@ jobs:
 
       - name: test release profile
         # Бенчи и проверки производительности имеют смысл только в release.
-        run: cargo test --workspace --release
+        # Отдельный CARGO_TARGET_DIR (D-212): в общем target к этому шагу лежат
+        # debug-артефакты предыдущего шага и восстановленный кэш прошлых
+        # прогонов, а библиотека приложения собирается в нескольких crate-type
+        # и даёт совпадающие имена выходов (cargo#6313). На переиспользованном
+        # target это роняло компиляцию e2e_smoke с «multiple different versions
+        # of crate tokio» при единственной версии tokio в Cargo.lock, тогда как
+        # job e2e-smoke компилирует тот же таргет в release с нуля и проходит.
+        # Чистая директория делает шаг воспроизводимым; цена — полная сборка
+        # зависимостей в release.
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "target-release"
+          cargo test --workspace --release
 
       # B-7: лицензии и известные CVE зависимостей (deny.toml в корне).
       - name: cargo-deny (advisories, licenses, sources)

@@ -8,7 +8,14 @@ license.workspace = true
 
 [lib]
 name = "swagcod_app_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Только rlib (D-212). staticlib и cdylib здесь не нужны: exe линкуется из rlib,
+# мобильных таргетов в проекте нет (crates/app/gen/schemas — только desktop и
+# windows), а на MSVC несколько crate-type дают совпадающие имена выходов
+# (swagcod_app_lib.lib у staticlib и импорт-библиотека cdylib, общий .pdb —
+# cargo#6313). Коллизия имён в переиспользованном target ломала компиляцию
+# e2e_smoke в release: rustc линковал тест против двух наборов артефактов одного
+# пакета и рапортовал «multiple different versions of crate tokio».
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -4862,3 +4862,83 @@ rev48 означало бы подбирать результат, поэтом�
 
 **Стадия F-11 закрыта, план BACKEND_PHASE2 выполнен полностью: F-1…F-11,
 ревизии 38-49.**
+
+---
+
+## Ревизия 50 — ci / Rust: sidecar-расклад и release-профиль
+
+**D-212. Библиотека приложения собирается только в rlib, а release-шаг CI
+получил собственный target.** Job `rust` в CI падал на шаге `test release
+profile` с тремя `error[E0308]` в `crates/app/tests/e2e_smoke.rs`:
+«expected `tokio::net::tcp::listener::TcpListener`, found
+`tokio::net::TcpListener`», «expected trait `swagcod_core::store::Store`, found
+trait `Store`», то же для `swagcod_provider::AnyProvider` — и с примечанием
+«there are multiple different versions of crate tokio in the dependency graph»,
+где обе стороны указывали на ОДИН файл `tokio-1.53.2\src\net\tcp\listener.rs:57`
+и на `crates\core\src\store.rs:362`. Версий в графе не две: в `Cargo.lock` по
+одному экземпляру `tokio 1.53.2`, `swagcod-core`, `swagcod-provider`,
+`swagcod-app`. Тот же шаг в job `e2e-smoke` (`cargo test --release -p
+swagcod-app --test e2e_smoke`) проходил, и локально обе команды зелёные.
+Разница одна — состояние `target`: job `rust` восстанавливает кэш
+`Windows-cargo-${{ hashFiles('**/Cargo.lock') }}` и перед release-шагом
+прогоняет `cargo test --workspace` в debug, а `e2e-smoke` берёт отдельный ключ
+`-release-` и debug не собирает. Механизм виден в первых строках лога:
+`warning: output filename collision at target\release\deps\swagcod_app_lib.lib`,
+далее `.dll`, `.dll.lib`, `.dll.exp`, `.pdb`, `libswagcod_app_lib.rlib` —
+`crate-type = ["staticlib", "cdylib", "rlib"]` на MSVC даёт staticlib-`.lib` и
+импорт-библиотеку cdylib с одним именем плюс общий `.pdb` (cargo#6313).
+Совпадающие имена в переиспользованном `target` и дают два набора артефактов
+одного пакета, из-за чего линковка теста видит «разные» крейты. Решение в две
+части. Первая: `crate-type = ["rlib"]`. Промежуточный вариант `["cdylib",
+"rlib"]` collision не снял (`.dll`, `.dll.lib`, `.dll.exp`, `.pdb`, `.rlib`
+остались), а ни staticlib, ни cdylib здесь не нужны: exe линкуется из rlib,
+мобильных таргетов в проекте нет — в `crates/app/gen/schemas` лежат только
+desktop- и windows-схема, бандл собирается в NSIS. Один crate-type — один набор
+имён, предупреждения исчезают целиком, а не наполовину. Вторая: шаг `test
+release profile` получает `CARGO_TARGET_DIR = target-release`, то есть
+компилируется с нуля и не зависит ни от debug-артефактов предыдущего шага, ни от
+кэша прошлых прогонов. Цена — полная сборка зависимостей в release на каждом
+прогоне; за это куплена воспроизводимость: падение больше не может быть
+свойством чужого кэша. Записано потому, что сообщение компилятора («несколько
+версий tokio») уводило в поиск дублей в графе зависимостей, которых нет, а
+настоящая причина лежит в именах выходных файлов.
+
+**D-213. Расклад sidecar выбирается по способности поднять better-sqlite3, а не
+по порядку поиска.** Исходное падение CI (`js_host_loads_calls_prefs_and_enforces_deadline`,
+`left: "ПРИВЕТ:null"` против `right: "ПРИВЕТ:42"`): CI ставит node-зависимости с
+`--ignore-scripts`, поэтому в `sidecar/node_modules/better-sqlite3` нет
+`build/Release/better_sqlite3.node`; `sidecar_file()` возвращала ПЕРВЫЙ
+найденный скрипт и выбирала репозиторный `sidecar/plugin-server.js` вместо
+собранного `vendor/sidecar`, `require('better-sqlite3')` падал, `openPrefs()`
+глотал исключение, и `api.prefs.get()` отдавал `null`. Три изменения.
+`sidecar_candidates()` возвращает все существующие расклады (каталог exe, затем
+cwd вверх на 6 уровней), а `sidecar_file()`/`sidecar_sqlite_file()` выбирают из
+них жизнеспособный: бинарник на месте И копия не старше исходника
+`sidecar/<name>` (проверка по mtime; для установленного бандла предка-исходника
+нет, и правило свежести не применяется). `plugin-server.js` больше не молчит:
+`openPrefs()` запоминает первую строку ошибки, и `doLoad()` кладёт в
+`lastErrors` запись `prefs-мост не поднят (better-sqlite3 недоступен из …)` —
+поэтому `host.errors.len() == 1` в тесте остался assertion'ом, а не ослаблен.
+Приёмка бандла в `tools/bundle-sidecar.ps1` проверяет не «скрипт запустился», а
+сквозное чтение prefs: node-драйвер (`driver.js`, а не пайп из PowerShell —
+раннер терял первую строку stdin) сеет ключ через `store-server.js` и требует от
+`plugin-server.js` ответа `pref=7`, иначе сборка падает с JSON-вердиктом.
+
+**Гейты rev50:** `cargo fmt --all -- --check` — чисто;
+`cargo clippy --workspace --all-targets -- -D warnings` — 0.
+`cargo test --workspace` — **420 passed / 0 failed / 1 ignored** (app lib 116 +
+e2e_smoke 4 + core 151 + fsx 77 + provider 52 + pty 20+1); в rev49 было 418,
+прирост +2 — два теста расклада в `core::node_store`
+(`sidecar_layout_requires_sqlite_binding_and_freshness`,
+`sidecar_file_prefers_layout_that_can_load_sqlite`), число тестов app-lib не
+изменилось: `js_host_loads_calls_prefs_and_enforces_deadline` остался тем же
+assertion'ом. `cargo test --workspace --release` — те же 420/0/1.
+`cargo build --release -p swagcod-app --bin swagcod-app` — 13 м 31 с, exe
+**12.81 МБ**, и ни одного `output filename collision` в выводе: с одним
+crate-type предупреждения исчезли, а не уменьшились (промежуточный вариант
+`["cdylib", "rlib"]` оставлял `.dll`, `.dll.lib`, `.dll.exp`, `.pdb`, `.rlib`).
+Воспроизведение исходного сбоя: при убранном
+`sidecar/node_modules/better-sqlite3/build` тесты `jsplugins` проходят (расклад
+переключается на `vendor/sidecar`), а без пригодного расклада скипаются, как и до
+правки. Приёмка бандла `tools/bundle-sidecar.ps1` — `vendor plugin prefs bridge
+accepted`, `vendor/sidecar assembled and accepted by ping: 11.8 MB`.

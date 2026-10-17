@@ -9,6 +9,9 @@ SwagCod.exe
 
 # Rust
 target/
+# D-212: release-шаг CI компилирует в отдельный каталог, чтобы debug-артефакты
+# и кэш прошлых прогонов не участвовали в сборке (collision имён выходов).
+target-release/
 **/*.rs.bk
 
 # Node / фронтенд
