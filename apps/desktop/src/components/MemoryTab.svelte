@@ -15,7 +15,12 @@
     text: string
     created_ms: number
     session_id?: string | null
+    /** rev56: рабочая папка-владелец (заполнен у строк области folder). */
+    dir?: string | null
   }
+
+  /** Область памяти. Совпадает с `core::store::MEMORY_SCOPE_*`. */
+  export type MemoryScope = 'global' | 'session' | 'folder'
 
   interface Props {
     title: string
@@ -29,7 +34,7 @@
     forgetLabel: string
     emptyLabel: string
     items: MemoryItem[]
-    scope: 'global' | 'session'
+    scope: MemoryScope
     busy?: boolean
     status?: string | null
     /** Сессии для селектора заметок. Заметки видны одной сессии, но править
@@ -40,13 +45,32 @@
     onPickSession?: (id: string) => void
     pickSessionLabel?: string
     pickSessionHint?: string
+    /** rev56: подписи третьей области — фактов рабочей папки. */
+    folderLabel?: string
+    folderHint?: string
+    /** Папка, чьи факты показаны (уже разрешённая родителем: выбрана вручную
+        или взята из cwd активной сессии). */
+    folderDir?: string | null
+    /** Диалог выбора папки открывает родитель: компонент не знает про Tauri. */
+    onPickFolder?: () => Promise<void>
+    pickFolderLabel?: string
+    folderNoneLabel?: string
+    browseLabel?: string
     /** Импорт промпта из txt/md: возвращает текст файла или null при отмене
         диалога. Родитель сам читает файл и сам показывает ошибку. */
     onImportFile?: () => Promise<string | null>
     importLabel?: string
     importingLabel?: string
     importBusy?: boolean
-    onScope: (scope: 'global' | 'session') => void
+    /** rev56: экспорт строки памяти в txt/md. Родитель сам открывает диалог
+        сохранения, сам пишет файл и сам показывает результат в статусе;
+        возврат (текст статуса или null при отмене) компонент не использует —
+        он нужен правилам папки, где статус свой. */
+    onExportItem?: (text: string) => Promise<string | null>
+    exportLabel?: string
+    exportingLabel?: string
+    exportBusy?: boolean
+    onScope: (scope: MemoryScope) => void
     onAdd: (text: string) => void
     onForget: (id: number) => void
   }
@@ -71,10 +95,21 @@
     onPickSession,
     pickSessionLabel = '',
     pickSessionHint = '',
+    folderLabel = '',
+    folderHint = '',
+    folderDir = null,
+    onPickFolder,
+    pickFolderLabel = '',
+    folderNoneLabel = '',
+    browseLabel = '',
     onImportFile,
     importLabel = '',
     importingLabel = '',
     importBusy = false,
+    onExportItem,
+    exportLabel = '',
+    exportingLabel = '',
+    exportBusy = false,
     onScope,
     onAdd,
     onForget,
@@ -92,6 +127,18 @@
     scope === 'session' && sessions.length > 0 && onPickSession !== undefined
   )
 
+  /** rev56: строка папки показывается в области folder всегда — путь сам по
+   * себе полезная информация («чьи это факты»). А вот кнопка выбора нужна
+   * только с колбэком: без него она была бы мёртвой, диалог открывает
+   * родитель, компонент про Tauri не знает. */
+  const showFolderRow = $derived(scope === 'folder')
+
+  /** Подсказка под чипами — по текущей области: текст про глобальные факты
+   * рядом со списком заметок сессии врал бы человеку. */
+  const hint = $derived(
+    scope === 'global' ? globalHint : scope === 'session' ? sessionHint : folderHint
+  )
+
   function submit(): void {
     const text = draft.trim()
     if (!text || busy) return
@@ -106,6 +153,14 @@
     if (!onImportFile || busy || importBusy) return
     const text = await onImportFile()
     if (text !== null && text.length > 0) draft = text
+  }
+
+  /** rev56: экспорт строки в файл. Отдельная кнопка на каждом факте, а не
+   * «выгрузить всё»: длинный промпт владелец забирает один, а общий дамп всей
+   * памяти в txt не читается и не правится. */
+  async function exportItem(text: string): Promise<void> {
+    if (!onExportItem || busy || exportBusy) return
+    await onExportItem(text)
   }
 
   /** Короткая метка времени: список читается как лента, а не как журнал. */
@@ -134,8 +189,17 @@
       data-testid="scope-session"
       onclick={() => onScope('session')}>{sessionLabel}</button
     >
+    {#if folderLabel}
+      <button
+        type="button"
+        class="mem-scope"
+        class:active={scope === 'folder'}
+        data-testid="scope-folder"
+        onclick={() => onScope('folder')}>{folderLabel}</button
+      >
+    {/if}
   </div>
-  <p class="mem-hint">{scope === 'global' ? globalHint : sessionHint}</p>
+  <p class="mem-hint">{hint}</p>
 
   {#if showSessionPicker}
     <label class="mem-session">
@@ -153,6 +217,31 @@
         {/each}
       </select>
     </label>
+  {/if}
+
+  {#if showFolderRow}
+    <!-- rev56: папка показывается текстом, а не списком — рабочих папок у
+         владельца единицы, а путь из диалога длиннее любого заголовка. Пустой
+         путь означал бы, что сохранять некуда, поэтому вместо него честная
+         подпись: ядро такой факт отвергнет. -->
+    <div class="mem-session">
+      <span class="mem-session-label">{pickFolderLabel}</span>
+      <span
+        class="mem-dir"
+        class:mem-dir-empty={!folderDir}
+        data-testid="memory-folder-dir"
+        title={folderDir ?? folderNoneLabel}
+      >{folderDir || folderNoneLabel}</span>
+      {#if onPickFolder}
+        <button
+          type="button"
+          class="mem-browse"
+          data-testid="memory-folder-browse"
+          disabled={busy}
+          onclick={() => void onPickFolder()}>{browseLabel}</button
+        >
+      {/if}
+    </div>
   {/if}
 
   <div class="mem-add">
@@ -205,6 +294,17 @@
           <div class="mem-meta">
             <span class="mem-id">#{it.id}</span>
             {#if when(it.created_ms)}<span class="mem-when">{when(it.created_ms)}</span>{/if}
+            {#if onExportItem}
+              <button
+                type="button"
+                class="mem-export"
+                data-testid="memory-export"
+                disabled={busy || exportBusy}
+                title={exportLabel}
+                onclick={() => void exportItem(it.text)}
+                >{exportBusy ? exportingLabel : exportLabel}</button
+              >
+            {/if}
             <button
               type="button"
               class="mem-forget"
@@ -297,6 +397,43 @@
   }
   .mem-select:disabled {
     opacity: 0.5;
+  }
+  /* rev56: путь рабочей папки. Длинный путь обрезаем многоточием, полный
+     остаётся в title: обрезанный хвост важнее начала — по нему узнают папку. */
+  .mem-dir {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12px;
+  }
+  /* Пунктир и приглушённый цвет — папка не выбрана, это состояние, а не
+     значение: с пустым путём ядро факт не примет. */
+  .mem-dir-empty {
+    color: var(--text-faint);
+    border-style: dashed;
+  }
+  .mem-browse,
+  .mem-export {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .mem-browse:disabled,
+  .mem-export:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .mem-input {
     flex: 1;

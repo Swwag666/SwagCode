@@ -669,23 +669,23 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
            строки должны быть короткими. */
         ToolSpec {
             name: "memory_add".into(),
-            description: "Save a durable fact to the application memory (database, survives sessions and working-directory changes). scope=\"global\" = a fact about the user or the workflow, injected into the system prompt of every turn (keep it short); scope=\"session\" = a note for this session only. Returns the new memory id. Prefer this over memory_append for facts that are not tied to one repository.".into(),
+            description: "Save a durable fact to the application memory (database, survives sessions and working-directory changes). scope=\"global\" = a fact about the user or the workflow, injected into the system prompt of every turn (keep it short); scope=\"session\" = a note for this session only; scope=\"folder\" = a fact about the current working directory, injected into every turn run in that folder (the folder is taken from the session, you cannot pick another one). Returns the new memory id. Prefer this over memory_append for facts that are not tied to one repository.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "One short fact, up to 2000 chars" },
-                    "scope": { "type": "string", "enum": ["global", "session"], "description": "global (default) or session" }
+                    "text": { "type": "string", "description": "One fact, up to 4000 chars; newlines are kept" },
+                    "scope": { "type": "string", "enum": ["global", "session", "folder"], "description": "global (default), session or folder" }
                 },
                 "required": ["text"]
             }),
         },
         ToolSpec {
             name: "memory_list".into(),
-            description: "List saved memory entries, newest first, with their ids (the id is what memory_forget needs). scope=\"global\" = application facts, scope=\"session\" = notes of the current session.".into(),
+            description: "List saved memory entries, newest first, with their ids (the id is what memory_forget needs). scope=\"global\" = application facts, scope=\"session\" = notes of the current session, scope=\"folder\" = facts of the current working directory.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["global", "session"], "description": "global (default) or session" },
+                    "scope": { "type": "string", "enum": ["global", "session", "folder"], "description": "global (default), session or folder" },
                     "limit": { "type": "integer", "description": "Max entries, 1..200, default 50" }
                 }
             }),
@@ -1260,7 +1260,26 @@ mod tests {
         assert!(required.iter().any(|v| v == "text"), "{required:?}");
         // Область — enum, а не свободная строка: «private» молча не сохранится.
         let scope = &add.parameters["properties"]["scope"]["enum"];
-        assert_eq!(scope.as_array().unwrap().len(), 2, "{scope}");
+        let scopes: Vec<&str> = scope
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        /* rev56: набор областей сверяем целиком, а не по длине. Длина совпала
+        бы и при замене folder на что угодно, а расхождение между этим enum и
+        `memory_check_scope` в ядре означало бы, что модель видит область,
+        которую хранилище отвергает. */
+        assert_eq!(scopes, vec!["global", "session", "folder"], "{scopes:?}");
+        assert_eq!(
+            scopes,
+            vec![
+                crate::store::MEMORY_SCOPE_GLOBAL,
+                crate::store::MEMORY_SCOPE_SESSION,
+                crate::store::MEMORY_SCOPE_FOLDER
+            ],
+            "enum инструмента разошёлся с константами хранилища"
+        );
         let forget = builtin_tool_specs()
             .into_iter()
             .find(|s| s.name == "memory_forget")

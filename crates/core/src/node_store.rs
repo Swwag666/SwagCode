@@ -27,9 +27,10 @@ use serde_json::{json, Value};
 
 use crate::session::{Session, SessionId, SessionStatus, TurnRecord};
 use crate::store::{
-    fts_match_expr, memory_check_scope, memory_check_text, policy_from_str_opt, policy_to_str,
-    role_from_str, role_to_str, search_limit, ApprovalEntry, MemoryEntry, MessageHit, SessionStub,
-    Store, StoreError, StoreResult, FTS_NEEDS_BACKFILL_SQL, FTS_REBUILD_SQL, SEARCH_MESSAGES_SQL,
+    fts_match_expr, memory_check_owner, memory_check_scope, memory_check_text, policy_from_str_opt,
+    policy_to_str, role_from_str, role_to_str, search_limit, ApprovalEntry, MemoryEntry,
+    MessageHit, SessionStub, Store, StoreError, StoreResult, FTS_NEEDS_BACKFILL_SQL,
+    FTS_REBUILD_SQL, SEARCH_MESSAGES_SQL,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall};
 
@@ -618,19 +619,28 @@ impl Store for NodeStore {
             .collect())
     }
 
-    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64> {
+    fn memory_add(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        dir: Option<&str>,
+        text: &str,
+    ) -> StoreResult<i64> {
         let scope = memory_check_scope(scope)?;
+        let (sid, d) = memory_check_owner(&scope, session_id, dir)?;
         let text = memory_check_text(text)?;
         let now = crate::bus::now_ms() as i64;
         /* insertId отдаёт sidecar (better-sqlite3 lastInsertRowid): id нужен
         инструментам и UI, чтобы забыть конкретную строку. */
         let resp = self.exec(
-            "INSERT INTO memory(scope, text, created_ms, session_id) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO memory(scope, text, created_ms, session_id, dir) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![
                 json!(scope),
                 json!(text),
                 json!(now),
-                session_id.map(|s| json!(s)).unwrap_or(Value::Null),
+                sid.map(|s| json!(s)).unwrap_or(Value::Null),
+                d.map(|s| json!(s)).unwrap_or(Value::Null),
             ],
         )?;
         Ok(resp["insertId"].as_i64().unwrap_or(0))
@@ -640,17 +650,27 @@ impl Store for NodeStore {
         &self,
         scope: &str,
         session_id: Option<&str>,
+        dir: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<MemoryEntry>> {
         let scope = memory_check_scope(scope)?;
+        let (sid, d) = memory_check_owner(&scope, session_id, dir)?;
         let limit = limit.clamp(1, 1000) as i64;
-        let select = "SELECT id, scope, text, created_ms, session_id FROM memory WHERE scope = ?1";
-        let rows = match session_id {
-            Some(sid) => self.query(
+        let select =
+            "SELECT id, scope, text, created_ms, session_id, dir FROM memory WHERE scope = ?1";
+        /* Тот же SQL и тот же порядок колонок, что в SqliteStore: выборки не
+        должны разъезжаться между бэкендами (паритет ловит
+        `node_memory_*` в тестах ниже). */
+        let rows = match (sid.as_deref(), d.as_deref()) {
+            (Some(sid), _) => self.query(
                 &format!("{select} AND session_id = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3"),
                 vec![json!(scope), json!(sid), json!(limit)],
             )?,
-            None => self.query(
+            (None, Some(d)) => self.query(
+                &format!("{select} AND dir = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3"),
+                vec![json!(scope), json!(d), json!(limit)],
+            )?,
+            (None, None) => self.query(
                 &format!("{select} ORDER BY created_ms DESC, id DESC LIMIT ?2"),
                 vec![json!(scope), json!(limit)],
             )?,
@@ -663,6 +683,7 @@ impl Store for NodeStore {
                 text: v_text(col(r, 2)),
                 created_ms: v_int(col(r, 3)) as u64,
                 session_id: v_opt_text(col(r, 4)),
+                dir: v_opt_text(col(r, 5)),
             })
             .collect())
     }
@@ -1205,42 +1226,82 @@ mod tests {
 
     /// F-7: память через sidecar ведёт себя как через rusqlite — области,
     /// порядок, forget, insertId и общая валидация.
+    ///
+    /// rev56: сюда же добавлена область folder. Паритет проверяется именно
+    /// здесь, потому что `dir` — новая колонка, и sidecar со старой схемой
+    /// ответил бы на INSERT ошибкой, которую SqliteStore-тесты не видят.
     #[test]
     fn node_memory_roundtrip_matches_sqlite() {
-        use crate::store::{MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
+        use crate::store::{MEMORY_SCOPE_FOLDER, MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
         let Some(store) = try_memory() else { return };
         let id = store
-            .memory_add(MEMORY_SCOPE_GLOBAL, None, "  факт 1  ")
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, None, "  факт 1  ")
             .unwrap();
         assert!(id > 0, "sidecar обязан вернуть insertId");
         let id2 = store
-            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка")
+            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), None, "заметка")
             .unwrap();
         assert_ne!(id, id2);
+        let id3 = store
+            .memory_add(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-a"), "факт папки a")
+            .unwrap();
+        store
+            .memory_add(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-b"), "факт папки b")
+            .unwrap();
 
-        let globals = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 50).unwrap();
+        let globals = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 50)
+            .unwrap();
         assert_eq!(globals.len(), 1, "сессионная строка не в глобальных");
         assert_eq!(globals[0].text, "факт 1", "текст пишется trimmed");
         assert_eq!(globals[0].id, id);
         assert!(globals[0].created_ms > 0);
         assert_eq!(globals[0].session_id, None);
+        assert_eq!(globals[0].dir, None);
 
         let sess = store
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), None, 50)
             .unwrap();
         assert_eq!(sess.len(), 1);
         assert_eq!(sess[0].session_id.as_deref(), Some("s-1"));
         assert!(store
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), 50)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), None, 50)
+            .unwrap()
+            .is_empty());
+
+        // Факт папки виден своей папке и не виден соседней.
+        let a = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-a"), 50)
+            .unwrap();
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(a[0].id, id3);
+        assert_eq!(a[0].dir.as_deref(), Some("D:/proj-a"));
+        assert_eq!(a[0].session_id, None);
+        let b = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-b"), 50)
+            .unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].text, "факт папки b");
+        assert!(store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-c"), 50)
             .unwrap()
             .is_empty());
 
         assert!(store.memory_forget(id2).unwrap());
         assert!(!store.memory_forget(id2).unwrap(), "повтор — false");
         // Валидация общая для обеих реализаций (memory_check_* в store.rs).
-        assert!(store.memory_add(MEMORY_SCOPE_GLOBAL, None, "   ").is_err());
-        assert!(store.memory_add("private", None, "x").is_err());
-        assert!(store.memory_list("private", None, 10).is_err());
+        assert!(store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, None, "   ")
+            .is_err());
+        assert!(store.memory_add("private", None, None, "x").is_err());
+        assert!(store.memory_list("private", None, None, 10).is_err());
+        // Владелец обязан соответствовать области — и в sidecar тоже.
+        assert!(store
+            .memory_add(MEMORY_SCOPE_FOLDER, None, None, "без папки")
+            .is_err());
+        assert!(store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, Some("D:/x"), "с папкой")
+            .is_err());
     }
 
     /* ── F-10: полнотекстовый поиск — тот же контракт, что в SqliteStore. ── */
@@ -1354,6 +1415,13 @@ mod tests {
                 "в store-server.js нет миграции колонки turns.{col}"
             );
         }
+        /* rev56: колонка dir — владелец факта области folder. Без неё sidecar
+        открыл бы базу, созданную прежней версией, и падал на каждом INSERT в
+        memory: Rust-сторона пишет пять колонок, таблица знает четыре. */
+        assert!(
+            js.contains("ALTER TABLE memory ADD COLUMN dir"),
+            "в store-server.js нет миграции колонки memory.dir"
+        );
         /* F-10: FTS5-индекс — тоже часть схемы, и его DDL обязан совпадать.
         Расхождение молчаливо: один бэкенд ищет по истории, второй возвращает
         пусто, а падает только поиск, который никто не запускает в тестах

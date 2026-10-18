@@ -58,25 +58,40 @@ pub struct ApprovalEntry {
 pub struct MemoryEntry {
     pub id: i64,
     /// "global" — факты приложения (вшиваются в системный промпт каждого
-    /// хода), "session" — заметка одной сессии.
+    /// хода), "session" — заметка одной сессии, "folder" — факты рабочей
+    /// папки (видны сессиям с этим cwd).
     pub scope: String,
     pub text: String,
     pub created_ms: u64,
     /// Заполнен у строк с scope="session".
     pub session_id: Option<String>,
+    /// Заполнен у строк с scope="folder": рабочая папка, которой принадлежит
+    /// факт. Хранится дословно как пришёл (путь из диалога или cwd сессии),
+    /// сравнение при выборке — побайтовое.
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 /// Область памяти: факты приложения.
 pub const MEMORY_SCOPE_GLOBAL: &str = "global";
 /// Область памяти: заметки одной сессии.
 pub const MEMORY_SCOPE_SESSION: &str = "session";
+/// Область памяти: факты рабочей папки — видны любой сессии с этим cwd и не
+/// уезжают в остальные папки.
+pub const MEMORY_SCOPE_FOLDER: &str = "folder";
 /// Потолок одной строки памяти в символах.
 ///
-/// Глобальная память вшивается в КАЖДЫЙ запрос хода (кап секции —
+/// Память вшивается в КАЖДЫЙ запрос хода (кап секции —
 /// `context::FACTS_MAX_CHARS`), поэтому длинная «заметка» стоит токенов на
 /// всех последующих ходах. Превышение — ошибка, а не тихая обрезка:
 /// молча отрезанный факт выглядит сохранённым.
-pub const MEMORY_TEXT_MAX_CHARS: usize = 2000;
+///
+/// Потолок равен `FACTS_MAX_CHARS` (4000): ровно столько вмещает секция
+/// фактов, значит один импортированный из файла промпт в неё помещается
+/// целиком. Длиннее — не сюда: для большого промпта есть `.swagcod/rules.md`
+/// (кап 8000, `folder_rules::FOLDER_RULES_MAX_CHARS`), он и создан для текста
+/// на всю папку.
+pub const MEMORY_TEXT_MAX_CHARS: usize = 4000;
 
 /// Проверка текста памяти — одна на обе реализации Store, чтобы правило не
 /// разъехалось между rusqlite и sidecar.
@@ -87,10 +102,16 @@ pub(crate) fn memory_check_text(text: &str) -> StoreResult<String> {
     }
     if t.chars().count() > MEMORY_TEXT_MAX_CHARS {
         return Err(StoreError::Invalid(format!(
-            "строка памяти длиннее {} символов: разбейте на несколько",
-            MEMORY_TEXT_MAX_CHARS
+            "строка памяти длиннее {} символов: разбейте на несколько, а для большого промпта \
+             возьмите .swagcod/rules.md (там кап {})",
+            MEMORY_TEXT_MAX_CHARS,
+            crate::folder_rules::FOLDER_RULES_MAX_CHARS
         )));
     }
+    /* Внутренние переводы строк сохраняются дословно: владелец импортирует в
+    память целые промпты из txt/md, и нумерованные шаги или markdown-заголовки
+    в таком тексте — структура, а не мусор. В системный промпт факт уходит
+    одним буллетом с отступом продолжения (см. `memory_facts_for_prompt`). */
     Ok(t.to_string())
 }
 
@@ -99,9 +120,67 @@ pub(crate) fn memory_check_text(text: &str) -> StoreResult<String> {
 /// всех остальных сессиях.
 pub(crate) fn memory_check_scope(scope: &str) -> StoreResult<String> {
     match scope.trim() {
-        MEMORY_SCOPE_GLOBAL | MEMORY_SCOPE_SESSION => Ok(scope.trim().to_string()),
+        MEMORY_SCOPE_GLOBAL | MEMORY_SCOPE_SESSION | MEMORY_SCOPE_FOLDER => {
+            Ok(scope.trim().to_string())
+        }
         other => Err(StoreError::Invalid(format!(
-            "неизвестная область памяти {other:?} (global | session)"
+            "неизвестная область памяти {other:?} (global | session | folder)"
+        ))),
+    }
+}
+
+/// Владелец строки памяти обязан соответствовать области: у global его нет, у
+/// session это id сессии, у folder — путь рабочей папки.
+///
+/// Проверка одна на обе реализации Store (как [`memory_check_text`]), поэтому
+/// rusqlite и sidecar не могут разойтись в том, что считается валидной строкой.
+/// Несовпадение — ошибка, а не «запишем что дали»: `session_id` и `dir` лежат в
+/// разных колонках, и факт с проставленным не тем владельцем либо не выбрался бы
+/// никогда (потеря молча), либо попал бы в чужую сессию или чужую папку.
+pub(crate) fn memory_check_owner(
+    scope: &str,
+    session_id: Option<&str>,
+    dir: Option<&str>,
+) -> StoreResult<(Option<String>, Option<String>)> {
+    let sid = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let d = dir.map(str::trim).filter(|s| !s.is_empty());
+    match scope {
+        MEMORY_SCOPE_GLOBAL => {
+            if sid.is_some() || d.is_some() {
+                return Err(StoreError::Invalid(
+                    "глобальный факт не принадлежит ни сессии, ни папке".into(),
+                ));
+            }
+            Ok((None, None))
+        }
+        MEMORY_SCOPE_SESSION => {
+            let Some(sid) = sid else {
+                return Err(StoreError::Invalid(
+                    "заметка сессии без session_id: область session требует владельца".into(),
+                ));
+            };
+            if d.is_some() {
+                return Err(StoreError::Invalid(
+                    "заметка сессии не может одновременно принадлежать папке".into(),
+                ));
+            }
+            Ok((Some(sid.to_string()), None))
+        }
+        MEMORY_SCOPE_FOLDER => {
+            let Some(d) = d else {
+                return Err(StoreError::Invalid(
+                    "факт папки без пути: область folder требует рабочую папку".into(),
+                ));
+            };
+            if sid.is_some() {
+                return Err(StoreError::Invalid(
+                    "факт папки не может одновременно принадлежать сессии".into(),
+                ));
+            }
+            Ok((None, Some(d.to_string())))
+        }
+        other => Err(StoreError::Invalid(format!(
+            "неизвестная область памяти {other:?} (global | session | folder)"
         ))),
     }
 }
@@ -305,15 +384,21 @@ CREATE TABLE IF NOT EXISTS metrics(
   value REAL NOT NULL
 );
 /* F-7: персистентная память. scope='global' — факты приложения (вшиваются
-   в системный промпт каждого хода), scope='session' — заметки одной сессии.
+   в системный промпт каждого хода), scope='session' — заметки одной сессии,
+   scope='folder' — факты рабочей папки (владелец в колонке dir).
    Автономная таблица без FK на sessions: память обязана пережить удаление
-   сессии, иначе «забыть сессию» молча стирало бы факты владельца. */
+   сессии, иначе «забыть сессию» молча стирало бы факты владельца.
+   Отдельного индекса на (scope, dir) нет сознательно: префикс scope в
+   idx_memory_scope уже сужает выборку до одной области, а dir — остаточный
+   фильтр по десяткам строк. Индекс стоил бы записи на каждый memory_add и
+   зеркального DDL в sidecar ради ненаблюдаемого выигрыша. */
 CREATE TABLE IF NOT EXISTS memory(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'global',
   text TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
-  session_id TEXT
+  session_id TEXT,
+  dir TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
@@ -411,13 +496,28 @@ pub trait Store: Send {
     /// Текст и область проверяются до записи ([`memory_check_text`],
     /// [`memory_check_scope`]): пустая строка или «память» неизвестной
     /// области — ошибка, а не молчаливое сохранение мусора.
-    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64>;
+    ///
+    /// rev56: `dir` — владелец строки области folder (рабочая папка). Владелец
+    /// обязан соответствовать области ([`memory_check_owner`]): global — оба
+    /// None, session — только `session_id`, folder — только `dir`. Два соседних
+    /// `Option<&str>` перепутать местами легко, но перестановка не проходит
+    /// молча — проверка возвращает «не может одновременно принадлежать», то
+    /// есть ошибка видна в первом же тесте, а не в чужой сессии через месяц.
+    fn memory_add(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        dir: Option<&str>,
+        text: &str,
+    ) -> StoreResult<i64>;
     /// F-7: строки области (новые первыми). `session_id` фильтрует заметки
-    /// конкретной сессии; для глобальных строк передают None.
+    /// конкретной сессии, `dir` — факты конкретной рабочей папки; для
+    /// глобальных строк передают None в обоих.
     fn memory_list(
         &self,
         scope: &str,
         session_id: Option<&str>,
+        dir: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<MemoryEntry>>;
     /// F-7: забыть строку; true, если она существовала.
@@ -502,6 +602,13 @@ impl SqliteStore {
         let _ = conn.execute("ALTER TABLE turns ADD COLUMN parent_turn_id TEXT", []);
         // Миграция F-5: git-чекпоинт хода (снимок worktree до хода).
         let _ = conn.execute("ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT", []);
+        /* Миграция rev56: область folder — владелец строки в колонке dir. Для
+        баз, созданных до неё, колонку добавляет этот ALTER; для новых она уже в
+        CREATE TABLE, и тогда ALTER отвечает «duplicate column» — тот же
+        нормальный повторный запуск, что у B-3 выше. Колонка nullable без
+        DEFAULT: у global и session владельца-папки нет, и NOT NULL потребовал бы
+        значения-заглушки, которое пришлось бы отличать от настоящего пути. */
+        let _ = conn.execute("ALTER TABLE memory ADD COLUMN dir TEXT", []);
         // F-10: индекс FTS5 создан вместе со схемой, но история в этой базе
         // могла появиться раньше него.
         Self::fts_backfill(&conn)?;
@@ -877,13 +984,21 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn memory_add(&self, scope: &str, session_id: Option<&str>, text: &str) -> StoreResult<i64> {
+    fn memory_add(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        dir: Option<&str>,
+        text: &str,
+    ) -> StoreResult<i64> {
         let scope = memory_check_scope(scope)?;
+        let (sid, d) = memory_check_owner(&scope, session_id, dir)?;
         let text = memory_check_text(text)?;
         let now = crate::bus::now_ms() as i64;
         self.conn.execute(
-            "INSERT INTO memory(scope, text, created_ms, session_id) VALUES (?1, ?2, ?3, ?4)",
-            params![scope, text, now, session_id],
+            "INSERT INTO memory(scope, text, created_ms, session_id, dir) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![scope, text, now, sid, d],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -892,9 +1007,11 @@ impl Store for SqliteStore {
         &self,
         scope: &str,
         session_id: Option<&str>,
+        dir: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<MemoryEntry>> {
         let scope = memory_check_scope(scope)?;
+        let (sid, d) = memory_check_owner(&scope, session_id, dir)?;
         let limit = limit.clamp(1, 1000) as i64;
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<MemoryEntry> {
             Ok(MemoryEntry {
@@ -903,19 +1020,28 @@ impl Store for SqliteStore {
                 text: r.get(2)?,
                 created_ms: r.get::<_, i64>(3)? as u64,
                 session_id: r.get(4)?,
+                dir: r.get(5)?,
             })
         };
         /* Новые первыми: память читается как лента, и свежие факты важнее —
         при переполнении потолка контекста обрезается хвост, то есть
         старьё. */
-        let select = "SELECT id, scope, text, created_ms, session_id FROM memory WHERE scope = ?1";
-        let rows = match session_id {
-            Some(sid) => {
-                let sql = format!(
-                    "{select} AND session_id = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3"
-                );
+        let select =
+            "SELECT id, scope, text, created_ms, session_id, dir FROM memory WHERE scope = ?1";
+        /* `memory_check_owner` гарантирует, что владелец ровно один или его
+        нет, поэтому фильтр — одна колонка. Имя колонки — литерал из этого
+        match, а не входные данные, так что склеивать SQL здесь безопасно. */
+        let owner = match (sid.as_deref(), d.as_deref()) {
+            (Some(sid), _) => Some(("session_id", sid)),
+            (None, Some(d)) => Some(("dir", d)),
+            (None, None) => None,
+        };
+        let rows = match owner {
+            Some((col, val)) => {
+                let sql =
+                    format!("{select} AND {col} = ?2 ORDER BY created_ms DESC, id DESC LIMIT ?3");
                 let mut stmt = self.conn.prepare(&sql)?;
-                let mapped = stmt.query_map(params![scope, sid, limit], map_row)?;
+                let mapped = stmt.query_map(params![scope, val, limit], map_row)?;
                 mapped.collect::<Result<Vec<_>, _>>()?
             }
             None => {
@@ -1638,6 +1764,7 @@ mod tests {
             .memory_add(
                 MEMORY_SCOPE_GLOBAL,
                 None,
+                None,
                 "  сборка: cargo test --workspace  ",
             )
             .unwrap();
@@ -1645,15 +1772,18 @@ mod tests {
             .memory_add(
                 MEMORY_SCOPE_GLOBAL,
                 None,
+                None,
                 "деплой: tools\\build-release.ps1",
             )
             .unwrap();
         let s1 = store
-            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка сессии 1")
+            .memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), None, "заметка сессии 1")
             .unwrap();
         assert_ne!(g1, g2);
 
-        let globals = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 50).unwrap();
+        let globals = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 50)
+            .unwrap();
         assert_eq!(globals.len(), 2, "сессионная строка не попала в глобальные");
         // Текст пишется trimmed: пробелы вокруг факта — мусор в промпте.
         assert!(
@@ -1664,18 +1794,25 @@ mod tests {
         );
         assert!(globals.iter().all(|m| m.scope == MEMORY_SCOPE_GLOBAL));
         assert!(globals.iter().all(|m| m.created_ms > 0));
+        // У глобального факта владельца нет: обе колонки пусты.
+        assert!(
+            globals
+                .iter()
+                .all(|m| m.session_id.is_none() && m.dir.is_none()),
+            "{globals:?}"
+        );
         // Новые первыми: при переполнении потолка обрезается старьё.
         assert_eq!(globals[0].id, g2, "свежий факт в начале: {globals:?}");
 
         let sess = store
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), None, 50)
             .unwrap();
         assert_eq!(sess.len(), 1);
         assert_eq!(sess[0].id, s1);
         assert_eq!(sess[0].session_id.as_deref(), Some("s-1"));
         // Чужая сессия не видит заметку.
         assert!(store
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), 50)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-2"), None, 50)
             .unwrap()
             .is_empty());
 
@@ -1685,39 +1822,172 @@ mod tests {
             "повторное удаление — false"
         );
         assert!(store
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 50)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), None, 50)
             .unwrap()
             .is_empty());
         // Предел выборки соблюдается и не ломает порядок.
-        let one = store.memory_list(MEMORY_SCOPE_GLOBAL, None, 1).unwrap();
+        let one = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 1)
+            .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].id, g2);
+    }
+
+    /// rev56: область folder — факт принадлежит рабочей папке и виден только
+    /// ей. Проверка на трёх папках: без фильтра по `dir` факты соседей уехали
+    /// бы в системный промпт чужого проекта, и владелец увидел бы их запреты и
+    /// соглашения там, где они не действуют.
+    #[test]
+    fn memory_folder_scope_is_bound_to_dir() {
+        let store = SqliteStore::in_memory().unwrap();
+        let f1 = store
+            .memory_add(
+                MEMORY_SCOPE_FOLDER,
+                None,
+                Some("D:/proj-a"),
+                "здесь pnpm, не npm",
+            )
+            .unwrap();
+        store
+            .memory_add(
+                MEMORY_SCOPE_FOLDER,
+                None,
+                Some("D:/proj-b"),
+                "здесь cargo, тесты обязательны",
+            )
+            .unwrap();
+        store
+            .memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                None,
+                "владелец любит краткие ответы",
+            )
+            .unwrap();
+
+        let a = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-a"), 50)
+            .unwrap();
+        assert_eq!(a.len(), 1, "факт соседней папки не виден: {a:?}");
+        assert_eq!(a[0].id, f1);
+        assert_eq!(a[0].dir.as_deref(), Some("D:/proj-a"));
+        assert_eq!(a[0].text, "здесь pnpm, не npm");
+        assert_eq!(a[0].session_id, None, "у факта папки нет сессии-владельца");
+
+        let b = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-b"), 50)
+            .unwrap();
+        assert_eq!(b.len(), 1);
+        assert!(b[0].text.contains("cargo"), "{b:?}");
+
+        // Неизвестная папка — пусто, а не «все факты папок подряд».
+        assert!(store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-c"), 50)
+            .unwrap()
+            .is_empty());
+        // Глобальная выборка не подмешивает папочные строки.
+        let g = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 50)
+            .unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+        // И наоборот: папочная выборка не подмешивает глобальные.
+        assert!(!a.iter().any(|m| m.text.contains("краткие")), "{a:?}");
+    }
+
+    /// rev56: владелец обязан соответствовать области. Проверка живёт в ядре
+    /// (`memory_check_owner`), поэтому обе реализации Store отвечают одинаково;
+    /// тест держит и текст ошибки — его видит человек в UI и модель в
+    /// результате инструмента.
+    #[test]
+    fn memory_owner_must_match_scope() {
+        let store = SqliteStore::in_memory().unwrap();
+        // folder без пути: строка не нашлась бы ни одной выборкой.
+        let e = store
+            .memory_add(MEMORY_SCOPE_FOLDER, None, None, "факт")
+            .unwrap_err();
+        assert!(e.to_string().contains("требует рабочую папку"), "{e}");
+        // session без id — то же самое.
+        let e = store
+            .memory_add(MEMORY_SCOPE_SESSION, None, None, "заметка")
+            .unwrap_err();
+        assert!(e.to_string().contains("требует владельца"), "{e}");
+        // global с владельцем: молча сохранить значило бы потерять строку.
+        let e = store
+            .memory_add(MEMORY_SCOPE_GLOBAL, Some("s-1"), None, "факт")
+            .unwrap_err();
+        assert!(e.to_string().contains("не принадлежит"), "{e}");
+        let e = store
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, Some("D:/x"), "факт")
+            .unwrap_err();
+        assert!(e.to_string().contains("не принадлежит"), "{e}");
+        // Перестановка двух соседних Option местами не проходит молча.
+        let e = store
+            .memory_add(MEMORY_SCOPE_SESSION, Some("D:/x"), Some("s-1"), "заметка")
+            .unwrap_err();
+        assert!(e.to_string().contains("одновременно"), "{e}");
+        let e = store
+            .memory_add(MEMORY_SCOPE_FOLDER, Some("s-1"), Some("D:/x"), "факт")
+            .unwrap_err();
+        assert!(e.to_string().contains("одновременно"), "{e}");
+        // Выборка подчиняется тем же правилам.
+        let e = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, None, 10)
+            .unwrap_err();
+        assert!(e.to_string().contains("требует рабочую папку"), "{e}");
+        // Пустая строка вместо владельца — не владелец.
+        let e = store
+            .memory_add(MEMORY_SCOPE_FOLDER, None, Some("   "), "факт")
+            .unwrap_err();
+        assert!(e.to_string().contains("требует рабочую папку"), "{e}");
     }
 
     #[test]
     fn memory_rejects_empty_overlong_and_unknown_scope() {
         let store = SqliteStore::in_memory().unwrap();
         let e = store
-            .memory_add(MEMORY_SCOPE_GLOBAL, None, "   ")
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, None, "   ")
             .unwrap_err();
         assert!(e.to_string().contains("пустая"), "{e}");
         let e = store
             .memory_add(
                 MEMORY_SCOPE_GLOBAL,
                 None,
+                None,
                 &"ф".repeat(MEMORY_TEXT_MAX_CHARS + 1),
             )
             .unwrap_err();
         assert!(e.to_string().contains("длиннее"), "{e}");
+        /* rev56: многострочный текст — не повод для отказа. Владелец
+        импортирует в память целые промпты из txt/md, а тримятся только края. */
+        let multi = store
+            .memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                None,
+                "  # Роль\nТы ревьюер.\n\nПроверяй тесты.  ",
+            )
+            .unwrap();
+        let rows = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 10)
+            .unwrap();
+        let saved = rows.iter().find(|m| m.id == multi).unwrap();
+        assert_eq!(
+            saved.text, "# Роль\nТы ревьюер.\n\nПроверяй тесты.",
+            "переводы строк обязаны доехать дословно: {:?}",
+            saved.text
+        );
         // Молча превратить заметку сессии в глобальный факт нельзя.
-        let e = store.memory_add("private", None, "факт").unwrap_err();
+        let e = store.memory_add("private", None, None, "факт").unwrap_err();
         assert!(e.to_string().contains("неизвестная область"), "{e}");
-        let e = store.memory_list("private", None, 10).unwrap_err();
+        let e = store.memory_list("private", None, None, 10).unwrap_err();
         assert!(e.to_string().contains("неизвестная область"), "{e}");
-        assert!(store
-            .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 10)
+                .unwrap()
+                .len()
+                == 1
+        );
     }
 
     /// База, созданная до F-7 (таблицы `memory` нет), открывается прежним
@@ -1737,16 +2007,70 @@ mod tests {
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(store.integrity_check().unwrap(), "ok");
         let id = store
-            .memory_add(MEMORY_SCOPE_GLOBAL, None, "факт после миграции")
+            .memory_add(MEMORY_SCOPE_GLOBAL, None, None, "факт после миграции")
             .unwrap();
         assert!(id > 0);
         assert_eq!(
             store
-                .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
+                .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 10)
                 .unwrap()
                 .len(),
             1
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rev56: база, созданная ДО области folder (таблица `memory` есть, но
+    /// колонки `dir` нет), открывается и доезжает до новой схемы через ALTER.
+    ///
+    /// Это сценарий обновления на машине владельца: без миграции каждый INSERT
+    /// в память падал бы на неизвестной колонке, то есть память молча
+    /// превратилась бы в «не работает» ровно после обновления приложения.
+    /// Старые строки обязаны выжить с пустым `dir`.
+    #[test]
+    fn memory_dir_column_appears_on_pre_rev56_database() {
+        let dir = std::env::temp_dir().join(format!("swagcod-mem-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pre56.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            /* Схема ровно та, что была до rev56: четыре колонки, без dir. */
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memory(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   scope TEXT NOT NULL DEFAULT 'global',
+                   text TEXT NOT NULL,
+                   created_ms INTEGER NOT NULL,
+                   session_id TEXT
+                 );
+                 INSERT INTO memory(scope, text, created_ms, session_id)
+                   VALUES ('global', 'старый факт', 1, NULL);",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.integrity_check().unwrap(), "ok");
+        let old = store
+            .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 10)
+            .unwrap();
+        assert_eq!(old.len(), 1, "старая строка переживает миграцию");
+        assert_eq!(old[0].text, "старый факт");
+        assert_eq!(old[0].dir, None, "у прежних фактов владельца-папки нет");
+        // После миграции область folder работает в той же базе.
+        store
+            .memory_add(
+                MEMORY_SCOPE_FOLDER,
+                None,
+                Some("D:/proj"),
+                "новый факт папки",
+            )
+            .unwrap();
+        let f = store
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj"), 10)
+            .unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].text, "новый факт папки");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -967,7 +967,7 @@
      и модель видят один список. Глобальные факты вшиваются в системный промпт
      каждого хода, заметки сессии — только свои. */
   let memoryItems = $state<MemoryItem[]>([])
-  let memoryScope = $state<'global' | 'session'>('global')
+  let memoryScope = $state<'global' | 'session' | 'folder'>('global')
   let memoryBusy = $state(false)
   let memoryStatus = $state<string | null>(null)
   /* Заметки сессии читаются для ВЫБРАННОЙ сессии, а не только для активной:
@@ -977,16 +977,41 @@
   let memorySessions = $state<{ id: string; title: string }[]>([])
   let memorySessionId = $state<string | null>(null)
   let memoryImporting = $state(false)
+  let memoryExporting = $state(false)
+  /* rev56: третья область — факты рабочей папки. Папка по умолчанию та же, что
+     у правил папки на вкладке Security (cwd активной сессии), но выбрать можно
+     любую: владелец правит факты проекта, который сейчас не открыт. Выражение
+     повторяет `filesRoot`, а не ссылается на него — тот объявлен ниже по файлу. */
+  let memoryDirId = $state<string | null>(null)
+  const memoryCwd = $derived(currentSession ? (sessionCwds[currentSession] ?? '') : '')
+  const memoryDir = $derived(memoryDirId ?? (memoryCwd || null))
 
   const memorySession = $derived(memorySessionId ?? currentSession)
 
+  /* Владелец строки обязан соответствовать области, и проверяет это ядро
+     (`memory_check_owner`), а не фронтенд: global с подставленным sessionId
+     теперь ошибка, а не «сохраним как глобальный». Поэтому аргументы
+     передаются только для своей области. */
+  const memoryOwnerArgs = $derived({
+    sessionId: memoryScope === 'session' ? memorySession : null,
+    dir: memoryScope === 'folder' ? memoryDir : null,
+  })
+
   async function refreshMemory(): Promise<void> {
     if (!tauriAvailable) return
+    /* Факты папки без папки не выбираются. Ядро ответило бы «область folder
+       требует рабочую папку», и показывать это как «Не получилось» значило бы
+       пугать человека тем, что он просто ещё не выбрал папку. */
+    if (memoryScope === 'folder' && !memoryDir) {
+      memoryItems = []
+      return
+    }
     memoryBusy = true
     try {
       memoryItems = await invoke<MemoryItem[]>('memory_list', {
         scope: memoryScope,
-        sessionId: memorySession,
+        sessionId: memoryOwnerArgs.sessionId,
+        dir: memoryOwnerArgs.dir,
         limit: 200,
       })
     } catch (e) {
@@ -1054,7 +1079,8 @@
     try {
       await invoke<number>('memory_add', {
         scope: memoryScope,
-        sessionId: memorySession,
+        sessionId: memoryOwnerArgs.sessionId,
+        dir: memoryOwnerArgs.dir,
         text,
       })
       memoryStatus = t('memoryAdded')
@@ -1064,6 +1090,57 @@
       memoryStatus = t('memoryFailed').replace('{msg}', String(e))
     } finally {
       memoryBusy = false
+    }
+  }
+
+  /** rev56: выбрать рабочую папку для фактов области folder. Нативный диалог,
+      тот же `openDialog({ directory: true })`, что у правил папки и рабочих
+      областей. Отмена (null) текущий выбор не трогает. */
+  async function pickMemoryDir(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      const sel = await openDialog({
+        multiple: false,
+        directory: true,
+        title: t('memoryPickFolderHint'),
+      })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return
+      memoryDirId = path
+      memoryStatus = null
+      await refreshMemory()
+    } catch (e) {
+      memoryStatus = t('memoryFailed').replace('{msg}', String(e))
+    }
+  }
+
+  /** rev56: экспорт факта в txt/md. Путь выбирает нативный диалог сохранения,
+      пишет ядро командой `write_prompt_file`. `overwrite: true` передаём
+      осознанно: диалог уже спросил человека про замену, а флаг в команде
+      существует, чтобы никакой ДРУГОЙ вызывающий не затёр файл молча.
+      Возвращает текст статуса (или null при отмене диалога): правилам папки
+      тот же экспорт нужен со своим статусом, и читать чужой `memoryStatus`
+      они не должны — там могло остаться вчерашнее «Сохранено». */
+  async function exportMemoryFile(text: string): Promise<string | null> {
+    if (!tauriAvailable || memoryExporting) return null
+    memoryExporting = true
+    try {
+      const path = await saveDialog({
+        title: t('memoryExportTitle'),
+        defaultPath: 'prompt.md',
+        filters: [{ name: 'Text / Markdown', extensions: ['md', 'txt', 'markdown', 'text'] }],
+      })
+      if (!path) return null
+      const n = await invoke<number>('write_prompt_file', { path, text, overwrite: true })
+      const msg = t('memoryExportDone').replace('{path}', path).replace('{n}', String(n))
+      memoryStatus = msg
+      return msg
+    } catch (e) {
+      const msg = t('memoryExportFailed').replace('{msg}', String(e))
+      memoryStatus = msg
+      return msg
+    } finally {
+      memoryExporting = false
     }
   }
 
@@ -1083,7 +1160,7 @@
 
   /* Смена области перечитывает список: показывать глобальные факты под
      подписью «заметки сессии» значило бы врать человеку. */
-  function setMemoryScope(scope: 'global' | 'session'): void {
+  function setMemoryScope(scope: 'global' | 'session' | 'folder'): void {
     if (memoryScope === scope) return
     memoryScope = scope
     memoryStatus = null
@@ -1092,19 +1169,29 @@
 
   $effect(() => {
     if (showSettings && settingsTab === 'memory') {
-      /* Чтение выбранной сессии регистрируется как зависимость: смена выбора
-         в селекторе перечитывает список, а не оставляет заметки прежней. */
+      /* Чтение выбранного владельца регистрируется как зависимость: смена
+         сессии в селекторе или папки в диалоге перечитывает список, а не
+         оставляет строки прежней области. `memoryCwd` читаем отдельно — иначе
+         смена активной сессии при невыбранной папке не обновила бы факты. */
       const sid = memorySession
+      const dir = memoryDir
+      const cwd = memoryCwd
       void sid
+      void dir
+      void cwd
       void refreshMemory()
       void refreshMemorySessions()
     }
   })
 
   $effect(() => {
-    /* Диалог настроек закрыли — выбор сессии сбрасывается: в следующий раз
-       память открывается на активной сессии, а не на вчерашнем выборе. */
-    if (!showSettings && memorySessionId !== null) memorySessionId = null
+    /* Диалог настроек закрыли — выбор сбрасывается: в следующий раз память
+       открывается на активной сессии и её рабочей папке, а не на вчерашнем
+       выборе, который молча показывал бы чужие строки. */
+    if (!showSettings) {
+      if (memorySessionId !== null) memorySessionId = null
+      if (memoryDirId !== null) memoryDirId = null
+    }
   })
 
   /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
@@ -2425,6 +2512,11 @@
   {memoryImporting}
   {pickMemorySession}
   {importPromptFile}
+  /* rev56: факты рабочей папки и экспорт промпта в txt/md */
+  {memoryDir}
+  {pickMemoryDir}
+  {exportMemoryFile}
+  {memoryExporting}
 
   /* js-плагины */
   {jsPlugTools}

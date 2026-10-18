@@ -98,14 +98,16 @@ CREATE TABLE IF NOT EXISTS metrics(
   value REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts_ms);
-/* F-7: персистентная память (scope global|session). Без FK на sessions:
-   память переживает удаление сессии. */
+/* F-7: персистентная память (scope global|session|folder). Без FK на sessions:
+   память переживает удаление сессии. rev56: колонка dir — владелец строки
+   области folder (рабочая папка). */
 CREATE TABLE IF NOT EXISTS memory(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'global',
   text TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
-  session_id TEXT
+  session_id TEXT,
+  dir TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, started_ms);
@@ -189,6 +191,11 @@ function openDb(path) {
   try { db.exec('ALTER TABLE turns ADD COLUMN parent_turn_id TEXT'); } catch { /* уже есть */ }
   /* F-5: git-чекпоинт хода (снимок worktree до хода). */
   try { db.exec('ALTER TABLE turns ADD COLUMN checkpoint_sha TEXT'); } catch { /* уже есть */ }
+  /* rev56: область folder — владелец строки в колонке dir. Текст миграции
+     обязан совпадать с SqliteStore::open (сверяет schema_matches_js_sidecar):
+     расхождение означало бы, что один бэкенд умеет факты папки, а второй
+     падает на неизвестной колонке. */
+  try { db.exec('ALTER TABLE memory ADD COLUMN dir TEXT'); } catch { /* уже есть */ }
   /* F-10: индекс FTS5 создаёт SCHEMA, но история могла появиться раньше него
      (база старше FTS5 или оборвавшийся rebuild) — тогда дозируем один раз.
      Критерий и текст запроса совпадают с SqliteStore::fts_backfill. */

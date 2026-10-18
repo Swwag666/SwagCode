@@ -211,4 +211,102 @@ describe('MemoryTab: smoke', () => {
     await fireEvent.click(btn)
     expect(onImportFile).not.toHaveBeenCalled()
   })
+
+  /* ── rev56: третья область — факты рабочей папки ── */
+
+  const folderProps = {
+    folderLabel: STR.ru.memoryFolder,
+    folderHint: STR.ru.memoryFolderHint,
+    folderDir: 'D:/proj-a',
+    pickFolderLabel: STR.ru.memoryPickFolder,
+    folderNoneLabel: STR.ru.memoryFolderNone,
+    browseLabel: STR.ru.memoryBrowse,
+  }
+
+  it('чип папки появляется с подписью и переключает область', async () => {
+    const onScope = vi.fn()
+    /* Без folderLabel чипа нет: пустая подпись оставила бы в ряду дырку,
+       а область folder тогда всё равно недоступна. */
+    render(MemoryTab, { ...props, onScope })
+    expect(screen.queryByTestId('scope-folder')).toBeNull()
+    cleanup()
+    render(MemoryTab, { ...props, onScope, ...folderProps })
+    expect(screen.getByTestId('scope-folder').textContent).toBe(STR.ru.memoryFolder)
+    await fireEvent.click(screen.getByTestId('scope-folder'))
+    expect(onScope).toHaveBeenCalledWith('folder')
+  })
+
+  it('в области folder показаны путь папки и её подсказка', () => {
+    render(MemoryTab, { ...props, scope: 'folder', ...folderProps })
+    expect(screen.getByTestId('memory-folder-dir').textContent).toBe('D:/proj-a')
+    expect(screen.getByText(STR.ru.memoryFolderHint)).toBeTruthy()
+    // Селектор сессий в этой области не нужен: факт принадлежит папке.
+    expect(screen.queryByTestId('memory-session-select')).toBeNull()
+  })
+
+  it('без папки показана честная подпись, а не пустое место', () => {
+    render(MemoryTab, { ...props, scope: 'folder', ...folderProps, folderDir: null })
+    expect(screen.getByTestId('memory-folder-dir').textContent).toBe(STR.ru.memoryFolderNone)
+  })
+
+  it('кнопка выбора папки зовёт колбэк родителя', async () => {
+    const onPickFolder = vi.fn().mockResolvedValue(undefined)
+    render(MemoryTab, { ...props, scope: 'folder', ...folderProps, onPickFolder })
+    await fireEvent.click(screen.getByTestId('memory-folder-browse'))
+    expect(onPickFolder).toHaveBeenCalled()
+  })
+
+  it('строки выбора папки нет вне области folder и без колбэка', () => {
+    render(MemoryTab, { ...props, scope: 'global', ...folderProps, onPickFolder: vi.fn() })
+    expect(screen.queryByTestId('memory-folder-browse')).toBeNull()
+    cleanup()
+    /* Без колбэка кнопка была бы мёртвой: диалог открывает родитель, компонент
+       про Tauri не знает. */
+    render(MemoryTab, { ...props, scope: 'folder', ...folderProps })
+    expect(screen.queryByTestId('memory-folder-browse')).toBeNull()
+  })
+
+  /* ── rev56: экспорт факта в txt/md ── */
+
+  it('экспорт отправляет текст конкретной строки, а не весь список', async () => {
+    const onExportItem = vi.fn().mockResolvedValue(null)
+    render(MemoryTab, { ...props, onExportItem, exportLabel: STR.ru.memoryToFile })
+    const buttons = screen.getAllByTestId('memory-export')
+    expect(buttons.length).toBe(items.length)
+    await fireEvent.click(buttons[0])
+    /* Первая строка списка — id 2: порядок в ленте «свежие сверху». */
+    expect(onExportItem).toHaveBeenCalledWith('деплой: tools\\build-release.ps1')
+  })
+
+  it('без колбэка экспорта кнопки нет, в busy и при занятом экспорте она не работает', async () => {
+    render(MemoryTab, { ...props })
+    expect(screen.queryByTestId('memory-export')).toBeNull()
+    const onExportItem = vi.fn()
+    const { getAllByTestId } = render(MemoryTab, {
+      ...props,
+      exportBusy: true,
+      onExportItem,
+      exportLabel: STR.ru.memoryToFile,
+      exportingLabel: STR.ru.memoryExporting,
+    })
+    /* Кнопка своя у каждой строки, поэтому берём первую из списка. */
+    const btn = getAllByTestId('memory-export')[0] as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    expect(btn.textContent).toBe(STR.ru.memoryExporting)
+    await fireEvent.click(btn)
+    expect(onExportItem).not.toHaveBeenCalled()
+  })
+
+  it('многострочный факт доезжает до экспорта дословно', async () => {
+    const text = '# Роль\nТы ревьюер.\n\n1. Проверяй тесты.\n2. Не молчи.'
+    const onExportItem = vi.fn().mockResolvedValue(null)
+    render(MemoryTab, {
+      ...props,
+      items: [{ id: 7, scope: 'folder', text, created_ms: 1_760_000_000_000, dir: 'D:/proj-a' }],
+      onExportItem,
+      exportLabel: STR.ru.memoryToFile,
+    })
+    await fireEvent.click(screen.getByTestId('memory-export'))
+    expect(onExportItem).toHaveBeenCalledWith(text)
+  })
 })

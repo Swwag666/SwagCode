@@ -208,6 +208,24 @@ export const STR = {
       memoryImporting: 'Читаю файл…',
       memoryImportFailed: 'Импорт не удался: {msg}',
       memoryImportTitle: 'Промпт или заметка (txt, md)',
+      /* rev56: третья область — факты рабочей папки. Видны любому ходу в этой
+         папке и не уезжают в другие проекты. Наследования в подпапки нет (в
+         отличие от правил папки из rev54), и подсказка говорит об этом прямо:
+         иначе владелец ждал бы, что факт корня подействует в подкаталоге. */
+      memoryFolder: 'Факты папки',
+      memoryFolderHint:
+        'Видны любому ходу в выбранной папке и не попадают в другие проекты. В подпапки не наследуются: факт принадлежит той папке, где сохранён.',
+      memoryPickFolder: 'Папка',
+      memoryPickFolderHint: 'Факты какой рабочей папки показаны',
+      memoryFolderNone: 'не выбрана — откройте сессию или укажите папку',
+      memoryBrowse: 'Обзор…',
+      /* Экспорт наружу: длинный промпт удобнее править в обычном редакторе и
+         держать в репозитории, чем в строке базы. */
+      memoryToFile: 'В файл…',
+      memoryExporting: 'Сохраняю…',
+      memoryExportTitle: 'Куда сохранить промпт (txt, md)',
+      memoryExportDone: 'Сохранено: {path} ({n} Б)',
+      memoryExportFailed: 'Экспорт не удался: {msg}',
       memoryCmdDesc: 'Открыть память приложения',
       approvalLogTitle: 'Журнал подтверждений',
       approvalLogBtn: 'Обновить',
@@ -532,6 +550,18 @@ export const STR = {
       memoryImporting: 'Reading file…',
       memoryImportFailed: 'Import failed: {msg}',
       memoryImportTitle: 'Prompt or note (txt, md)',
+      memoryFolder: 'Folder facts',
+      memoryFolderHint:
+        'Visible to every turn run in the selected folder; they never reach other projects. Subfolders do not inherit them: a fact belongs to the folder it was saved in.',
+      memoryPickFolder: 'Folder',
+      memoryPickFolderHint: 'Which working folder these facts belong to',
+      memoryFolderNone: 'not set — open a session or pick a folder',
+      memoryBrowse: 'Browse…',
+      memoryToFile: 'To file…',
+      memoryExporting: 'Saving…',
+      memoryExportTitle: 'Save the prompt to (txt, md)',
+      memoryExportDone: 'Saved: {path} ({n} B)',
+      memoryExportFailed: 'Export failed: {msg}',
       memoryCmdDesc: 'Open application memory',
       approvalLogTitle: 'Approval journal',
       approvalLogBtn: 'Refresh',

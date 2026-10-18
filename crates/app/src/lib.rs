@@ -2002,29 +2002,93 @@ pub(crate) fn is_memory_tool(name: &str) -> bool {
 /// обрезана `context::FACTS_MAX_CHARS`; предел здесь держит выборку дешёвой.
 const MEMORY_PROMPT_LIMIT: usize = 200;
 
-/// Глобальные факты для системного промпта: `- текст` по строке, свежие
-/// первыми. Пустая строка, если памяти нет или база недоступна — отсутствие
-/// памяти не должно ронять ход.
-pub(crate) fn memory_facts_for_prompt(state: &AppState) -> String {
+/// Глобальные и папочные факты для системного промпта: `- текст` по факту,
+/// свежие первыми. Пустая строка, если памяти нет или база недоступна —
+/// отсутствие памяти не должно ронять ход.
+///
+/// rev56: `cwd` — рабочая папка хода; её факты (область folder) добавляются
+/// после глобальных. Порядок именно такой: глобальные — это постоянные
+/// предпочтения владельца, их мало и они коротки, а папочные — контекст
+/// конкретной работы. При переполнении `context::FACTS_MAX_CHARS` обрезается
+/// хвост, то есть контекст папки: потерять контекст восстановимо, потерять
+/// постоянные предпочтения — нет.
+///
+/// Совпадение папки — побайтовое по cwd, без наследования в подпапки. Это
+/// сознательное расхождение с правилами папки (rev54), которые резолвятся
+/// от листа к корню: запрет, унаследованный сверху, защищает, а чужой факт,
+/// приехавший из родительского каталога, — молча меняет поведение. Факт
+/// принадлежит той папке, в которой его сохранили.
+pub(crate) fn memory_facts_for_prompt(state: &AppState, cwd: &std::path::Path) -> String {
     let Ok(store) = state.store.lock() else {
         return String::new();
     };
-    let rows = store
+    let dir = cwd.to_string_lossy();
+    let globals = store
         .memory_list(
             swagcod_core::store::MEMORY_SCOPE_GLOBAL,
+            None,
             None,
             MEMORY_PROMPT_LIMIT,
         )
         .unwrap_or_default();
-    if rows.is_empty() {
+    let folder = store
+        .memory_list(
+            swagcod_core::store::MEMORY_SCOPE_FOLDER,
+            None,
+            Some(dir.as_ref()),
+            MEMORY_PROMPT_LIMIT,
+        )
+        .unwrap_or_default();
+    if globals.is_empty() && folder.is_empty() {
         return String::new();
     }
     /* Список свежих первым читается моделью как «актуальнее — выше», а обрезка
     по потолку откусывает старьё, а не последние решения владельца. */
-    rows.iter()
-        .map(|m| format!("- {}", m.text.replace('\n', " ")))
+    globals
+        .iter()
+        .chain(folder.iter())
+        .map(|m| fact_bullet(&m.text))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Один факт — один буллет: маркер у первой строки, продолжение с отступом в
+/// два пробела.
+///
+/// Переводы строк сохраняются дословно. До rev56 текст схлопывался в одну
+/// строку (`replace('\n', " ")`), и для короткой заметки это было правильно:
+/// иначе одна заметка выглядела бы как несколько фактов. Но владелец
+/// импортирует в память целые промпты из txt/md, а схлопывание уничтожает их
+/// структуру — нумерованные шаги склеиваются в кашу, markdown-заголовки
+/// теряют смысл. Отступ решает обе задачи сразу: маркер `-` по-прежнему ровно
+/// один на факт, поэтому факты не сливаются, а структура текста доезжает до
+/// модели как есть. Внутренние отступы источника не трогаем: у кода и
+/// вложенных списков они значимы.
+fn fact_bullet(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').trim_end())
+        .collect();
+    /* Хвостовые пустые строки отбрасываем: в секции фактов они дали бы
+    висячий перенос и читались бы как пустой факт. Внутренние сохраняем — у
+    промпта из файла пустая строка разделяет абзацы, это структура, а не
+    мусор. `memory_check_text` тримит текст до записи, так что на практике
+    хвост сюда и не приезжает; защита — от прямого вызова. */
+    let last = lines.iter().rposition(|l| !l.is_empty()).unwrap_or(0);
+    let mut out = String::with_capacity(text.len() + 4);
+    for (i, line) in lines.iter().take(last + 1).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if i == 0 {
+            out.push_str("- ");
+            out.push_str(line);
+        } else if !line.is_empty() {
+            out.push_str("  ");
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Аргумент `scope`: по умолчанию global (как в описании инструмента).
@@ -2045,27 +2109,46 @@ pub(crate) async fn run_memory_tool(
     call: &ToolCall,
 ) -> ToolOutcome {
     let fail = |output: String| ToolOutcome { ok: false, output };
+    /* rev56: владельцем факта области folder служит cwd самой сессии. Берём его
+    ДО лока хранилища: `sessions` — async-мьютекс, и ждать его, уже держа
+    std-MutexGuard от store, значило бы держать блокировку через await. */
+    let session_dir = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .map(|s| s.cwd.clone())
+    };
+    let scope = memory_scope_arg(call);
+    if scope == swagcod_core::store::MEMORY_SCOPE_FOLDER && session_dir.is_none() {
+        return fail(format!(
+            "memory: рабочая папка сессии {session_id} неизвестна, факт папки сохранить некуда"
+        ));
+    }
     let Ok(store) = state.store.lock() else {
         return fail("память недоступна: хранилище заблокировано".into());
     };
-    let scope = memory_scope_arg(call);
+    /* Владелец строки определяется областью и подставляется НАМИ, а не моделью:
+    иначе вызов записал бы заметку чужой сессии или факт чужой папки. */
+    let (sid, dir): (Option<&str>, Option<&str>) = match scope.as_str() {
+        s if s == swagcod_core::store::MEMORY_SCOPE_SESSION => (Some(session_id), None),
+        s if s == swagcod_core::store::MEMORY_SCOPE_FOLDER => (None, session_dir.as_deref()),
+        _ => (None, None),
+    };
     match call.name.as_str() {
-        "memory_add" => {
-            /* Заметка сессии принадлежит сессии: id подставляем сами, иначе
-            модель могла бы записать «сессионный» факт чужой сессии. */
-            let sid = if scope == swagcod_core::store::MEMORY_SCOPE_SESSION {
-                Some(session_id)
-            } else {
-                None
-            };
-            match store.memory_add(&scope, sid, &arg_str(call, "text")) {
-                Ok(id) => ToolOutcome {
+        "memory_add" => match store.memory_add(&scope, sid, dir, &arg_str(call, "text")) {
+            Ok(id) => {
+                let where_ = match dir {
+                    Some(d) => format!("{scope}: {d}"),
+                    None => scope.clone(),
+                };
+                ToolOutcome {
                     ok: true,
-                    output: format!("сохранено в память (id {id}, область {scope})"),
-                },
-                Err(e) => fail(format!("memory_add: {e}")),
+                    output: format!("сохранено в память (id {id}, область {where_})"),
+                }
             }
-        }
+            Err(e) => fail(format!("memory_add: {e}")),
+        },
         "memory_list" => {
             let limit = call
                 .arguments
@@ -2073,12 +2156,7 @@ pub(crate) async fn run_memory_tool(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
-            let sid = if scope == swagcod_core::store::MEMORY_SCOPE_SESSION {
-                Some(session_id)
-            } else {
-                None
-            };
-            match store.memory_list(&scope, sid, limit) {
+            match store.memory_list(&scope, sid, dir, limit) {
                 Ok(rows) if rows.is_empty() => ToolOutcome {
                     ok: true,
                     output: format!("память пуста (область {scope})"),
@@ -2621,32 +2699,39 @@ fn memory_list(
     state: State<'_, Arc<AppState>>,
     scope: Option<String>,
     session_id: Option<String>,
+    dir: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<swagcod_core::store::MemoryEntry>, String> {
     let scope = scope.unwrap_or_else(|| swagcod_core::store::MEMORY_SCOPE_GLOBAL.to_string());
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store
-        .memory_list(&scope, session_id.as_deref(), limit.unwrap_or(200))
+        .memory_list(
+            &scope,
+            session_id.as_deref(),
+            dir.as_deref(),
+            limit.unwrap_or(200),
+        )
         .map_err(|e| e.to_string())
 }
 
 /// Добавить строку памяти из UI. Возвращает id новой строки.
+///
+/// rev56: `dir` — владелец строки области folder. Соответствие владельца
+/// области проверяет ядро (`memory_check_owner`, одно на обе реализации Store);
+/// дублировать проверку здесь значило бы завести второй источник правды,
+/// который разъезжается с первым молча.
 #[tauri::command]
 fn memory_add(
     state: State<'_, Arc<AppState>>,
     scope: Option<String>,
     session_id: Option<String>,
+    dir: Option<String>,
     text: String,
 ) -> Result<i64, String> {
     let scope = scope.unwrap_or_else(|| swagcod_core::store::MEMORY_SCOPE_GLOBAL.to_string());
-    /* Заметка сессии без сессии — бессмыслица: она не найдётся ни одним
-    списком. Отказ понятнее, чем строка с NULL, висящая в базе. */
-    if scope == swagcod_core::store::MEMORY_SCOPE_SESSION && session_id.is_none() {
-        return Err("заметка сессии требует session_id".into());
-    }
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store
-        .memory_add(&scope, session_id.as_deref(), &text)
+        .memory_add(&scope, session_id.as_deref(), dir.as_deref(), &text)
         .map_err(|e| e.to_string())
 }
 
@@ -3250,6 +3335,47 @@ fn read_prompt_file(path: String) -> Result<String, String> {
     // lossy: файл из блокнота с кривой кодировкой не должен ронять импорт.
     let bytes = std::fs::read(p).map_err(|e| format!("read: {e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Записать текст в txt/md-файл — экспорт промпта из редактора памяти наружу,
+/// чтобы длинный текст можно было править в обычном редакторе и держать в
+/// репозитории.
+///
+/// Ограничения те же, что у [`read_prompt_file`]: расширение txt/md/markdown/
+/// text и потолок 64 КБ. Отдельно — отказ перезаписывать существующий файл без
+/// явного `overwrite: true`. Разделение ответственности такое: нативный диалог
+/// сохранения спрашивает человека про замену, а команда не даёт молча затереть
+/// файл любому другому вызывающему (баг во фронте, чужой код, опечатка в пути).
+/// Возвращает число записанных байт — UI показывает его в статусе.
+#[tauri::command]
+fn write_prompt_file(path: String, text: String, overwrite: Option<bool>) -> Result<u64, String> {
+    let p = std::path::Path::new(&path);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if !is_prompt_file_ext(ext) {
+        return Err(format!("промпт сохраняется в txt/md, а не .{ext}"));
+    }
+    let len = text.len() as u64;
+    if len > PROMPT_FILE_MAX_BYTES {
+        return Err(format!(
+            "текст больше {} КБ: для длинного промпта есть .swagcod/rules.md",
+            PROMPT_FILE_MAX_BYTES / 1024
+        ));
+    }
+    if p.exists() && !overwrite.unwrap_or(false) {
+        return Err(format!(
+            "файл уже существует, перезапись не разрешена: {path}"
+        ));
+    }
+    /* Родительский каталог создаём: в диалоге сохранения человек может ввести
+    путь с новой папкой, и отказ из-за её отсутствия выглядел бы как «экспорт
+    сломан». */
+    if let Some(dir) = p.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create_dir: {e}"))?;
+        }
+    }
+    std::fs::write(p, text.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    Ok(len)
 }
 
 /// Список моделей АКТИВНОГО провайдера (вкладка провайдеров).
@@ -4481,6 +4607,7 @@ pub fn run() {
             list_dir,
             read_file,
             read_prompt_file,
+            write_prompt_file,
             list_models,
             providers::list_provider_presets,
             providers::providers_state,
@@ -6617,7 +6744,7 @@ rl.on('line', (l) => {
                 .store
                 .lock()
                 .unwrap()
-                .memory_list(MEMORY_SCOPE_GLOBAL, None, 10)
+                .memory_list(MEMORY_SCOPE_GLOBAL, None, None, 10)
                 .unwrap()
                 .len(),
             1
@@ -6626,7 +6753,7 @@ rl.on('line', (l) => {
             .store
             .lock()
             .unwrap()
-            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), 10)
+            .memory_list(MEMORY_SCOPE_SESSION, Some("s-1"), None, 10)
             .unwrap()
             .is_empty());
     }
@@ -6684,23 +6811,48 @@ rl.on('line', (l) => {
 
     #[tokio::test]
     async fn global_facts_are_injected_into_system_prompt() {
-        use swagcod_core::store::{MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
+        use swagcod_core::store::{MEMORY_SCOPE_FOLDER, MEMORY_SCOPE_GLOBAL, MEMORY_SCOPE_SESSION};
         let state = mem_state();
+        let cwd = std::path::Path::new("D:/proj-a");
         assert_eq!(
-            memory_facts_for_prompt(&state),
+            memory_facts_for_prompt(&state, cwd),
             "",
             "пустая память не добавляет секцию"
         );
         {
             let g = state.store.lock().unwrap();
-            g.memory_add(MEMORY_SCOPE_GLOBAL, None, "сборка: cargo test --workspace")
+            g.memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                None,
+                "сборка: cargo test --workspace",
+            )
+            .unwrap();
+            g.memory_add(
+                MEMORY_SCOPE_GLOBAL,
+                None,
+                None,
+                "# Роль\nТы ревьюер.\nПроверяй тесты.",
+            )
+            .unwrap();
+            g.memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), None, "заметка сессии")
                 .unwrap();
-            g.memory_add(MEMORY_SCOPE_GLOBAL, None, "первая\nвторая строка")
-                .unwrap();
-            g.memory_add(MEMORY_SCOPE_SESSION, Some("s-1"), "заметка сессии")
-                .unwrap();
+            g.memory_add(
+                MEMORY_SCOPE_FOLDER,
+                None,
+                Some("D:/proj-a"),
+                "здесь pnpm, не npm",
+            )
+            .unwrap();
+            g.memory_add(
+                MEMORY_SCOPE_FOLDER,
+                None,
+                Some("D:/proj-b"),
+                "соглашения чужой папки",
+            )
+            .unwrap();
         }
-        let facts = memory_facts_for_prompt(&state);
+        let facts = memory_facts_for_prompt(&state, cwd);
         assert!(
             facts.contains("- сборка: cargo test --workspace"),
             "{facts}"
@@ -6709,16 +6861,39 @@ rl.on('line', (l) => {
             !facts.contains("заметка сессии"),
             "сессионное не уезжает в глобальный промпт: {facts}"
         );
-        /* Многострочный факт схлопывается в одну строку списка: иначе одна
-        «заметка» выглядела бы как несколько фактов. */
-        assert!(facts.contains("- первая вторая строка"), "{facts}");
-        assert_eq!(facts.lines().count(), 2, "{facts}");
+        assert!(
+            !facts.contains("чужой папки"),
+            "факт соседней папки не виден ходу в proj-a: {facts}"
+        );
+        assert!(facts.contains("- здесь pnpm, не npm"), "{facts}");
+        /* rev56: многострочный факт остаётся ОДНИМ буллетом — маркер у первой
+        строки, продолжение с отступом в два пробела. Прежде текст
+        схлопывался в одну строку, и для импортированного из txt/md промпта
+        это значило потерю структуры: нумерованные шаги склеивались в кашу. */
+        assert!(
+            facts.contains("- # Роль\n  Ты ревьюер.\n  Проверяй тесты."),
+            "{facts}"
+        );
+        // Маркеров ровно столько, сколько фактов: 2 глобальных + 1 папочный.
+        assert_eq!(facts.matches("\n- ").count() + 1, 3, "{facts}");
+        assert_eq!(facts.lines().count(), 5, "{facts}");
+        /* Порядок: глобальные первыми, папочные после. При обрезке по
+        `context::FACTS_MAX_CHARS` теряется хвост, то есть контекст папки, а не
+        постоянные предпочтения владельца. */
+        let gi = facts.find("сборка:").unwrap();
+        let fi = facts.find("pnpm").unwrap();
+        assert!(gi < fi, "глобальные факты идут раньше папочных: {facts}");
 
         let msg = swagcod_core::context::system_prompt("", "", &facts);
         assert!(msg.content.contains("Сохранённые факты"), "{}", msg.content);
         assert!(
             msg.content.contains("cargo test --workspace"),
             "{}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Ты ревьюер."),
+            "структура многострочного факта доехала до промпта: {}",
             msg.content
         );
     }
@@ -6845,7 +7020,7 @@ rl.on('line', (l) => {
         {
             let g = state.store.lock().unwrap();
             let rows = g
-                .memory_list(swagcod_core::store::MEMORY_SCOPE_GLOBAL, None, 10)
+                .memory_list(swagcod_core::store::MEMORY_SCOPE_GLOBAL, None, None, 10)
                 .unwrap();
             assert_eq!(rows.len(), 1, "{rows:?}");
             assert_eq!(rows[0].text, "владелец любит краткие ответы");
@@ -7232,6 +7407,173 @@ rl.on('line', (l) => {
         let text = crate::read_prompt_file(f.to_string_lossy().into_owned()).unwrap();
         assert!(text.starts_with("ok"));
         assert!(text.ends_with(" tail"));
+    }
+
+    /// rev56: экспорт промпта наружу — те же границы, что у импорта.
+    #[test]
+    fn write_prompt_file_saves_txt_and_md_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub").join("prompt.md");
+        let text = "# Роль\nТы ревьюер.\n\n1. Проверяй тесты.\n2. Не молчи.";
+        let n = crate::write_prompt_file(out.to_string_lossy().into_owned(), text.into(), None)
+            .expect("новый файл в новой папке пишется");
+        assert_eq!(n as usize, text.len(), "возвращаем число записанных байт");
+        // Круг замкнулся: экспорт читается тем же импортом дословно.
+        assert_eq!(
+            crate::read_prompt_file(out.to_string_lossy().into_owned()).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn write_prompt_file_guards_ext_size_and_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        // Расширение: промпт не сохраняется в .exe и не затирает его.
+        let exe = dir.path().join("tool.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let err = crate::write_prompt_file(exe.to_string_lossy().into_owned(), "x".into(), None)
+            .unwrap_err();
+        assert!(err.contains("txt/md"), "ошибка называет причину: {err}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"MZ", "файл не тронут");
+        // Потолок размера.
+        let big = dir.path().join("big.txt");
+        let err = crate::write_prompt_file(
+            big.to_string_lossy().into_owned(),
+            "a".repeat(crate::PROMPT_FILE_MAX_BYTES as usize + 1),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("КБ"), "{err}");
+        assert!(!big.exists(), "отказ до записи, а не обрезанный файл");
+        // Перезапись существующего файла — только с явного разрешения:
+        // молча затереть промпт владельца нельзя.
+        let md = dir.path().join("keep.md");
+        std::fs::write(&md, "старое").unwrap();
+        let err = crate::write_prompt_file(md.to_string_lossy().into_owned(), "новое".into(), None)
+            .unwrap_err();
+        assert!(err.contains("уже существует"), "{err}");
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "старое");
+        // Диалог сохранения спросил человека — фронтенд передаёт true.
+        crate::write_prompt_file(
+            md.to_string_lossy().into_owned(),
+            "новое".into(),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "новое");
+    }
+
+    /// rev56: один факт — один буллет, но структура исходного текста доезжает
+    /// до промпта целиком.
+    ///
+    /// Прежнее `replace('\n', " ")` делало из импортированного промпта кашу:
+    /// нумерованные шаги склеивались, markdown-заголовки теряли смысл. Отступ
+    /// продолжения сохраняет и то и другое: маркер `-` по-прежнему один на
+    /// факт, поэтому соседние факты не сливаются в один.
+    #[test]
+    fn fact_bullet_keeps_one_marker_and_source_structure() {
+        assert_eq!(fact_bullet("простой факт"), "- простой факт");
+        assert_eq!(
+            fact_bullet("# Роль\nТы ревьюер.\nПроверяй тесты."),
+            "- # Роль\n  Ты ревьюер.\n  Проверяй тесты."
+        );
+        // Внутренние отступы источника не трогаем: у кода они значимы.
+        assert_eq!(
+            fact_bullet("fn main() {\n    println!();\n}"),
+            "- fn main() {\n      println!();\n  }"
+        );
+        // Пустые строки внутри факта остаются пустыми, без висячих пробелов.
+        assert_eq!(fact_bullet("a\n\nb"), "- a\n\n  b");
+        // Хвостовые пробелы и CRLF из файла Windows не доезжают до промпта.
+        assert_eq!(fact_bullet("a  \r\nb\t\r\n"), "- a\n  b");
+        // Хвостовые пустые строки отбрасываются: висячий перенос в секции
+        // фактов читался бы как пустой факт.
+        assert_eq!(fact_bullet("a\n\n\n"), "- a");
+        // Пустой текст не роняет разметку: маркер есть, продолжения нет.
+        assert_eq!(fact_bullet(""), "- ");
+    }
+
+    /// Инструмент памяти с областью folder: папку подставляем мы из cwd
+    /// сессии, модель её не выбирает — иначе вызов записал бы факт чужого
+    /// проекта, и он всплыл бы в системном промпте там, где не действует.
+    #[tokio::test]
+    async fn memory_tool_folder_scope_uses_session_cwd() {
+        use swagcod_core::store::MEMORY_SCOPE_FOLDER;
+        let state = mem_state();
+        let sid = "folder-sess";
+        let s = Session::new(
+            SessionId::new(sid),
+            "D:/proj-a".to_string(),
+            "test-model".to_string(),
+        );
+        state.sessions.lock().await.push(s);
+        let out = run_memory_tool(
+            &state,
+            sid,
+            &call(
+                "memory_add",
+                serde_json::json!({"scope": "folder", "text": "здесь pnpm"}),
+            ),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("D:/proj-a"), "{}", out.output);
+
+        let rows = state
+            .store
+            .lock()
+            .unwrap()
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-a"), 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].text, "здесь pnpm");
+        assert_eq!(rows[0].dir.as_deref(), Some("D:/proj-a"));
+        // Соседняя папка факт не видит.
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-b"), 10)
+            .unwrap()
+            .is_empty());
+
+        // Выборка тем же инструментом — по cwd сессии, без аргумента пути.
+        let out = run_memory_tool(
+            &state,
+            sid,
+            &call("memory_list", serde_json::json!({"scope": "folder"})),
+        )
+        .await;
+        assert!(
+            out.ok && out.output.contains("здесь pnpm"),
+            "{}",
+            out.output
+        );
+
+        /* Сессия не найдена — честный отказ, а не факт с пустой папкой:
+        строка без владельца не нашлась бы ни одной выборкой. */
+        let out = run_memory_tool(
+            &state,
+            "no-such-session",
+            &call(
+                "memory_add",
+                serde_json::json!({"scope": "folder", "text": "сирота"}),
+            ),
+        )
+        .await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("неизвестна"), "{}", out.output);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .memory_list(MEMORY_SCOPE_FOLDER, None, Some("D:/proj-a"), 10)
+                .unwrap()
+                .len(),
+            1,
+            "отказ ничего не записал"
+        );
     }
 
     #[test]

@@ -87,10 +87,12 @@ $ping = '{"id":1,"method":"ping"}
 {"id":5,"method":"exec","sql":"INSERT INTO sessions(id, cwd, model, title, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)","params":["s-vendor","D:/probe","m","vendor",1]}
 {"id":6,"method":"exec","sql":"INSERT INTO messages(session_id, ord, role, content) VALUES (?1, ?2, ?3, ?4)","params":["s-vendor",0,"user","vendorprobe token"]}
 {"id":7,"method":"query","sql":"SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?1","params":["\"vendorprobe\"*"]}
-{"id":8,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
+{"id":8,"method":"exec","sql":"INSERT INTO memory(scope, text, created_ms, session_id, dir) VALUES (?1, ?2, ?3, ?4, ?5)","params":["folder","vendorprobe fact",1,null,"D:/probe"]}
+{"id":9,"method":"query","sql":"SELECT text, dir FROM memory WHERE scope = ?1 AND dir = ?2","params":["folder","D:/probe"]}
+{"id":10,"method":"shutdown"}' | & $node (Join-Path $vendor 'store-server.js') 2>$null
 $ErrorActionPreference = 'Stop'
 $okCount = @($ping | Where-Object { $_ -match '"ok":true' }).Count
-if ($okCount -lt 8) { throw "vendor sidecar did not answer all requests: $ping" }
+if ($okCount -lt 10) { throw "vendor sidecar did not answer all requests: $ping" }
 # F-10: the FTS5 index has to work in the BUNDLED node, not only in the dev
 # one. Request 7 must come back with a count of 1: a vendor assembled against
 # a different better-sqlite3 ABI (or a stale store-server.js without the FTS5
@@ -98,6 +100,13 @@ if ($okCount -lt 8) { throw "vendor sidecar did not answer all requests: $ping" 
 # search silently returns nothing on the primary backend.
 $ftsHit = @($ping | Where-Object { $_ -match '"rows":\[\[1\]\]' }).Count
 if ($ftsHit -lt 1) { throw "vendor sidecar FTS5 search did not find the probe row: $ping" }
+# rev56: the folder-scope owner column has to survive the bundle too. Request 9
+# reads back the row inserted by request 8, so a stale store-server.js (schema
+# without memory.dir) fails HERE instead of on the first folder fact written by
+# the shipped app. Same reasoning as the FTS probe above: opening the database
+# and answering the prefs roundtrip proves nothing about a column added later.
+$dirHit = @($ping | Where-Object { $_ -match 'vendorprobe fact' -and $_ -match 'D:/probe' }).Count
+if ($dirHit -lt 1) { throw "vendor sidecar memory.dir roundtrip failed: $ping" }
 
 # 4b. Acceptance: the PLUGIN sidecar must reach prefs through the bundled
 # better-sqlite3. require() resolves from the script's own path, and CI

@@ -484,6 +484,21 @@
     }
   }
 
+  /** rev56: экспорт `system_prompt_append` в txt/md — обратная сторона
+      импорта. Промпт папки удобнее держать файлом в репозитории, чем строкой в
+      базе: его видно в диффах, и его можно отдать коллеге. Статус берём из
+      возврата, а не из `memoryStatus`: там могло остаться вчерашнее сообщение. */
+  async function exportDirAppend() {
+    if (!dirAppend.trim()) return
+    dirBusy = true
+    try {
+      const msg = await exportMemoryFile(dirAppend)
+      dirStatus = msg
+    } finally {
+      dirBusy = false
+    }
+  }
+
   function resolvedEmpty(v: FolderRulesView): boolean {
     const r = v.resolved
     return (
@@ -704,13 +719,13 @@
 
     /* ── память ── */
     memoryItems: MemoryItem[]
-    memoryScope: 'global' | 'session'
+    memoryScope: 'global' | 'session' | 'folder'
     memoryBusy: boolean
     memoryStatus: string | null
     refreshMemory: () => Promise<void>
     addMemory: (text: string) => Promise<void>
     forgetMemory: (id: number) => Promise<void>
-    setMemoryScope: (scope: 'global' | 'session') => void
+    setMemoryScope: (scope: 'global' | 'session' | 'folder') => void
     /* Выбор сессии для заметок и импорт промпта из txt/md. `memorySession` —
        уже разрешённый id (выбранный вручную или активная сессия), поэтому
        компонент не знает про currentSession. */
@@ -719,6 +734,14 @@
     memoryImporting: boolean
     pickMemorySession: (id: string) => void
     importPromptFile: () => Promise<string | null>
+    /* rev56: факты рабочей папки (область folder) и экспорт промпта наружу.
+       `memoryDir` — уже разрешённый путь (выбран вручную или cwd активной
+       сессии), `exportMemoryFile` сам открывает диалог сохранения и сам пишет
+       статус, поэтому здесь только проброс. */
+    memoryDir: string | null
+    pickMemoryDir: () => Promise<void>
+    exportMemoryFile: (text: string) => Promise<string | null>
+    memoryExporting: boolean
 
     /* ── js-плагины ── */
     jsPlugTools: { name: string; description: string; file: string }[]
@@ -862,6 +885,10 @@
     memoryImporting,
     pickMemorySession,
     importPromptFile,
+    memoryDir,
+    pickMemoryDir,
+    exportMemoryFile,
+    memoryExporting,
 
     /* js-плагины */
     jsPlugTools,
@@ -1525,12 +1552,23 @@
                     <span class="label-title">System prompt append</span>
                     <span class="label-desc">Added to the system prompt of sessions started in this folder; empty clears it</span>
                     <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirAppend} aria-label="System prompt append"></textarea>
-                    <button
-                      class="text-btn step-btn"
-                      data-testid="dir-append-import"
-                      disabled={dirBusy}
-                      onclick={() => void importDirAppend()}
-                    >Load from txt/md…</button>
+                    <div class="rules-btns">
+                      <button
+                        class="text-btn step-btn"
+                        data-testid="dir-append-import"
+                        disabled={dirBusy}
+                        onclick={() => void importDirAppend()}
+                      >Load from txt/md…</button>
+                      <!-- rev56: экспорт обратно в файл. Мёртв при пустом поле:
+                           сохранять нечего, а диалог с пустым результатом только
+                           путал бы. -->
+                      <button
+                        class="text-btn step-btn"
+                        data-testid="dir-append-export"
+                        disabled={dirBusy || !dirAppend.trim()}
+                        onclick={() => void exportDirAppend()}
+                      >Save to txt/md…</button>
+                    </div>
                   </div>
                   <div class="settings-row">
                     <div class="settings-label">
@@ -1817,6 +1855,13 @@
                 sessionLabel={t('memorySession')}
                 globalHint={t('memoryGlobalHint')}
                 sessionHint={t('memorySessionHint')}
+                folderLabel={t('memoryFolder')}
+                folderHint={t('memoryFolderHint')}
+                folderDir={memoryDir}
+                onPickFolder={pickMemoryDir}
+                pickFolderLabel={t('memoryPickFolder')}
+                folderNoneLabel={t('memoryFolderNone')}
+                browseLabel={t('memoryBrowse')}
                 placeholder={t('memoryPlaceholder')}
                 addLabel={t('memoryAdd')}
                 forgetLabel={t('memoryForget')}
@@ -1834,6 +1879,10 @@
                 importLabel={t('memoryFromFile')}
                 importingLabel={t('memoryImporting')}
                 importBusy={memoryImporting}
+                onExportItem={exportMemoryFile}
+                exportLabel={t('memoryToFile')}
+                exportingLabel={t('memoryExporting')}
+                exportBusy={memoryExporting}
                 onScope={setMemoryScope}
                 onAdd={(text) => void addMemory(text)}
                 onForget={(id) => void forgetMemory(id)}
@@ -3006,6 +3055,14 @@
 .rules-input {
     width: 100%;
     text-align: left;
+  }
+
+/* rev56: импорт и экспорт промпта папки — одна группа действий над полем,
+   поэтому в ряд, а не стопкой. */
+.rules-btns {
+    display: flex;
+    gap: 8px;
+    align-items: center;
   }
 
 </style>
