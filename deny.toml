@@ -29,6 +29,15 @@ ignore = [
     # 21 обращение, всё чтение своего файла, не сеть). Апстрим-фикса нет и не
     # будет; пересмотреть при переходе импорта на saphyr/serde-saphyr.
     "RUSTSEC-2024-0449",
+    # zvariant 5.15.0 и zbus_names 4.3.4 помечены unmaintained
+    # (RUSTSEC-2026-0370, RUSTSEC-2026-0371): оба влиты в zbus 6+ как модули.
+    # Транзитивы tauri-plugin-single-instance 2.5.2 → zbus 5.19.0; безопасного
+    # апгрейда нет (zbus 6 ломает API, плагин требует zbus ^5), та же семья,
+    # что уже разрешённый RUSTSEC-2026-0372. D-Bus нужен плагину только на
+    # Linux: наш Windows-бинарник эти пути не исполняет. Пересмотреть при
+    # выходе tauri-plugin-single-instance на zbus 6+.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
     # zip 4.6.1 приходит транзитивом tauri-plugin-updater (optional, только
     # cfg(target_os = "windows")) — распаковка артефакта обновления .nsis.zip.
     # Лечение по advisories — zip >= 9, но даже свежий tauri-plugin-updater

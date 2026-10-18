@@ -26,6 +26,9 @@ export interface TranscriptItem {
   kind: ItemKind
   /** Основной текст. Для стримящихся элементов растёт на месте. */
   text: string
+  /** Версия текста: инкрементится при каждой мутации, чтобы Svelte видел
+      изменение даже когда key элемента не меняется (live-reasoning). */
+  ver?: number
   /** Идентификатор хода. */
   turn?: string
   /** Для tool_result: успешность и длительность. */
@@ -54,6 +57,9 @@ export class Transcript {
 
   private push(item: TranscriptItem): number {
     const idx = this.items.length
+    // ver по умолчанию 0: Svelte использует ${key}-${ver} как key в each,
+    // чтобы видеть мутацию текста даже когда элемент тот же.
+    if (item.ver === undefined) item.ver = 0
     this.items.push(item)
     if (item.turn) {
       const arr = this.byTurn.get(item.turn)
@@ -123,6 +129,7 @@ export class Transcript {
         const ex = this.findStreaming(k.data.turn, 'reasoning')
         if (ex) {
           ex.text += k.data.text
+          ex.ver = (ex.ver ?? 0) + 1
           return true
         }
         this.push({
@@ -140,6 +147,7 @@ export class Transcript {
         const ex = this.findStreaming(k.data.turn, 'assistant')
         if (ex) {
           ex.text += k.data.text
+          ex.ver = (ex.ver ?? 0) + 1
           return true
         }
         /* Продолжение ответа после преждевременно закрытого куска льём в
@@ -148,6 +156,7 @@ export class Transcript {
         const last = this.lastAssistant(k.data.turn)
         if (last) {
           last.text += k.data.text
+          last.ver = (last.ver ?? 0) + 1
           return true
         }
         this.push({
@@ -315,6 +324,16 @@ export class Transcript {
   /** Закрыть все незакрытые элементы (например, при остановке хода). */
   closeAll(): void {
     for (const it of this.items) it.done = true
+  }
+
+  /** Ключи стримящихся (незавершённых) reasoning-элементов: пока модель
+      рассуждает, мысли видны целиком; на финише хода сворачиваются сами. */
+  liveReasoningKeys(): string[] {
+    const out: string[] = []
+    for (const it of this.items) {
+      if (it.kind === 'reasoning' && !it.done) out.push(it.key)
+    }
+    return out
   }
 
   get length(): number {

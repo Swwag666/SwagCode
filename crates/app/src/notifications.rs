@@ -127,22 +127,23 @@ struct AudioOutput {
 unsafe impl Send for AudioOutput {}
 unsafe impl Sync for AudioOutput {}
 
-/// Глобальный audio output: инициализируется один раз.
-static AUDIO_OUTPUT: std::sync::OnceLock<AudioOutput> = std::sync::OnceLock::new();
+/// Глобальный audio output: инициализируется один раз. None = аудиоустройства
+/// нет вовсе (headless CI, RDP-сессия без звука): звук молча пропускается,
+/// toast и остальная логика уведомлений работают как обычно.
+static AUDIO_OUTPUT: std::sync::OnceLock<Option<AudioOutput>> = std::sync::OnceLock::new();
 
 fn get_audio_handle() -> Option<&'static rodio::OutputStreamHandle> {
-    Some(
-        &AUDIO_OUTPUT
-            .get_or_init(|| {
-                let (stream, handle) = rodio::OutputStream::try_default()
-                    .expect("rodio: no audio output device available");
-                AudioOutput {
+    AUDIO_OUTPUT
+        .get_or_init(|| {
+            rodio::OutputStream::try_default()
+                .ok()
+                .map(|(stream, handle)| AudioOutput {
                     _stream: stream,
                     handle,
-                }
-            })
-            .handle,
-    )
+                })
+        })
+        .as_ref()
+        .map(|output| &output.handle)
 }
 
 /// Менеджер уведомлений: держит конфиг, воспроизводит звуки, показывает toast.

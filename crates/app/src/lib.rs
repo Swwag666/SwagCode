@@ -1826,6 +1826,7 @@ pub(crate) async fn run_subagent(
             stream: true,
             temperature,
             max_tokens: None,
+            reasoning_effort: Some("high".to_string()),
             tools: tool_wire.clone(),
         };
         let (mut rx, handle) = match provider.stream(request) {

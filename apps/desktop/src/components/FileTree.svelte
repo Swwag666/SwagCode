@@ -41,6 +41,28 @@
     contextMenu = null
   }
 
+  /* Тот же дефект, что у меню сессий: кастомное меню без внешнего
+     «клик мимо» висит вечно. Любой клик/колесо/Escape вне меню закрывают. */
+  $effect(() => {
+    if (!contextMenu) return
+    const onDown = (e: Event): void => {
+      const t = e.target as HTMLElement | null
+      if (t && t.closest('.context-menu')) return
+      contextMenu = null
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') contextMenu = null
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('wheel', onDown, true)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('wheel', onDown, true)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  })
+
   function copyPath(): void {
     if (contextMenu) {
       navigator.clipboard.writeText(contextMenu.entry.path)
