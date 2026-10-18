@@ -82,10 +82,26 @@ pub const ATTEMPTS_PER_ENDPOINT: usize = 3;
 fn retryable(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     [
-        "503", "502", "504", "500", "429", "service unavailable", "bad gateway",
-        "gateway timeout", "overloaded", "capacity", "rate limit", "too many requests",
-        "нет первого события", "стрим закрылся", "connection", "timeout", "timed out",
-        "reset by peer", "broken pipe", "eos",
+        "503",
+        "502",
+        "504",
+        "500",
+        "429",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "overloaded",
+        "capacity",
+        "rate limit",
+        "too many requests",
+        "нет первого события",
+        "стрим закрылся",
+        "connection",
+        "timeout",
+        "timed out",
+        "reset by peer",
+        "broken pipe",
+        "eos",
     ]
     .iter()
     .any(|k| m.contains(k))

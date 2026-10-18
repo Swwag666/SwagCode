@@ -862,10 +862,7 @@ pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Resu
     });
     {
         let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions
-            .iter_mut()
-            .find(|s| s.id.to_string() == session_id)
-        {
+        if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == session_id) {
             session.status = swagcod_core::session::SessionStatus::Cancelled;
             session.current_turn = None;
         }

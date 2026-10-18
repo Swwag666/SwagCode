@@ -117,6 +117,10 @@
   let perSessionModels = $state<boolean>(
     localStorage.getItem('swagcod-per-session-models') !== 'false'
   )
+  /* Per-session модель: каждая сессия помнит свою модель, не переключаешься
+     глобально. Пустая строка = использовать глобальный дефолт из prefs.
+     Объявлена до effectiveModel: derived читает её при первом же кадре. */
+  let sessionModels = $state<Record<string, string>>({})
   let showModelPicker = $state(false)
   let showPermPicker = $state(false)
   let modelQuery = $state('')
@@ -384,9 +388,6 @@
   /* id сессии → её cwd: «+» открывает новую сессию в той же папке, где
      сидит пользователь, а не каждый раз в домашней. */
   let sessionCwds = $state<Record<string, string>>({})
-  /* Per-session модель: каждая сессия помнит свою модель, не переключаешься
-     глобально. Пустая строка = использовать глобальный дефолт из prefs. */
-  let sessionModels = $state<Record<string, string>>({})
 
   async function loadWorkspaces(): Promise<void> {
     try {

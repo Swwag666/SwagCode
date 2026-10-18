@@ -86,7 +86,11 @@ pub struct ChatRequest {
     /// Усилие рассуждения для reasoning-моделей (rustvy/openai-совместимые):
     /// включает поток мыслей (`reasoning_content`). Без него часть маршрутов
     /// (например `abyss/ahmia-v6-lite`) думает молча — «мыслей не видно».
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoning_effort")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "reasoning_effort"
+    )]
     pub reasoning_effort: Option<String>,
     /// Всегда `true` для интерактивного агента: стрим — основа плавности.
     #[serde(default = "default_true")]
