@@ -13,6 +13,7 @@ pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
 pub mod hooks;
+pub mod hot_reload;
 pub mod httpapi;
 pub mod jsplugins;
 pub mod mcp;
@@ -109,6 +110,9 @@ pub struct AppState {
     pub notifications: Arc<Mutex<notifications::NotificationManager>>,
     /// Флаг фокуса окна для suppress_when_focused.
     pub window_focused: Arc<std::sync::atomic::AtomicBool>,
+    /// Скиллы: markdown-шаблоны с YAML-frontmatter, hot-reload из
+    /// ~/.swagcod/skills/. std-мьютекс: операции чтения/записи миллисекундные.
+    pub skills: std::sync::Mutex<swagcod_core::skills::SkillRegistry>,
 }
 
 /// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
@@ -225,6 +229,17 @@ impl Default for AppState {
                 notifications::NotificationConfig::default(),
             ))),
             window_focused: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            skills: std::sync::Mutex::new(
+                swagcod_core::skills::SkillRegistry::load(
+                    &swagcod_core::skills::default_skills_dir(),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("skills: не загрузил: {e}");
+                    swagcod_core::skills::SkillRegistry::new(
+                        swagcod_core::skills::default_skills_dir(),
+                    )
+                }),
+            ),
         }
     }
 }
@@ -3695,6 +3710,29 @@ async fn js_plugins_reload(state: State<'_, Arc<AppState>>) -> Result<serde_json
     js_plugins_list(state).await
 }
 
+/* ===================== Hot-reload: скиллы ===================== */
+
+/// Список скиллов для UI.
+#[tauri::command]
+fn get_skills_list(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<swagcod_core::skills::SkillSummary>, String> {
+    let reg = state.skills.lock().map_err(|e| e.to_string())?;
+    Ok(reg.list())
+}
+
+/// Перезагрузить один скилл по имени (ищет файл по source_path).
+#[tauri::command]
+fn reload_skill(state: State<'_, Arc<AppState>>, name: String) -> Result<(), String> {
+    let mut reg = state.skills.lock().map_err(|e| e.to_string())?;
+    let path = reg
+        .skills
+        .get(&name)
+        .map(|s| s.source_path.clone())
+        .ok_or_else(|| format!("скилл не найден: {name}"))?;
+    reg.reload_file(&path)
+}
+
 /* ===================== E-5: tasks + воркер ===================== */
 
 /// Период опроса воркера (override SWAGCOD_TASKS_POLL_MS, 1..3600 с).
@@ -4235,6 +4273,20 @@ pub fn run() {
             // B-8: watchdog живых ходов.
             spawn_watchdog(state.clone());
 
+            // Hot-reload: watcher за MCP-конфигами, JS-плагинами и скиллами.
+            {
+                let st = state.clone();
+                let skills_dir = swagcod_core::skills::default_skills_dir();
+                let plugins_dir = jsplugins::plugins_dir();
+                tauri::async_runtime::spawn(async move {
+                    let watch_dirs = vec![skills_dir, plugins_dir];
+                    match hot_reload::HotReloadCoordinator::new(watch_dirs) {
+                        Ok(coord) => coord.run(st).await,
+                        Err(e) => eprintln!("hot-reload: не запустился: {e}"),
+                    }
+                });
+            }
+
             // Уведомления: фоновый listener шины.
             let notif_bus = state.bus.clone();
             let notif_mgr = state.notifications.clone();
@@ -4314,6 +4366,8 @@ pub fn run() {
             providers::save_provider,
             providers::delete_provider,
             providers::set_active_provider,
+            get_skills_list,
+            reload_skill,
             open_in_explorer,
             update_check,
             update_install,

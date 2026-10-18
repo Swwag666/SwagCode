@@ -18,6 +18,7 @@ pub mod node_store;
 pub mod rules;
 pub mod semantic;
 pub mod session;
+pub mod skills;
 pub mod store;
 pub mod tasks;
 pub mod turn;

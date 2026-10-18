@@ -38,6 +38,8 @@ swagcod-provider.workspace = true
 swagcod-pty.workspace = true
 swagcod-fsx.workspace = true
 dotenvy = "0.15"
+# Hot-reload: файловый watcher для MCP-конфигурации, JS-плагинов и скиллов.
+notify = "8"
 tauri-plugin-dialog = "2.0.0-rc.8"
 # E-9: сессии DSH лежат в многокадровом zstd (session.v3.jsonl.zstd).
 # Статическая libzstd из zstd-sys — внешних зависимостей не добавляет.

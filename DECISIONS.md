@@ -5103,3 +5103,35 @@ handles turn_ended, suppresses when focused, disabled skips all).
 `cargo clippy --all-targets -D warnings` — 0. `cargo fmt --check` — чисто.
 `svelte-check` — 0/0. `vitest` — 18 файлов / 180 тестов. Бандл
 391858 / 400000 (без изменений: бэкенд не влияет на JS).
+
+---
+
+## Ревизия 53 — hot-reload MCP, JS-плагинов, скиллов
+
+**D-221. HotReloadCoordinator с notify + дебаунс 300мс.** Новый модуль
+`hot_reload.rs` в `crates/app`: файловый вотчер через `notify::RecommendedWatcher`
+отслеживает изменения в директориях скиллов (`~/.swagcod/skills/`) и плагинов.
+События дебаунсятся (HashMap<PathBuf, Instant>, порог 300мс) и маршрутизируются
+по расширению файла: `.md` → reload skill, `.js` → reload JS plugin,
+`mcp_servers.json` → diff MCP конфигов. Reload не рвёт активные ходы: старые
+`Arc<Conn>` живут до завершения хода, новые подключения создаются параллельно.
+
+**D-222. SkillRegistry в core с YAML-frontmatter парсингом.** Новый модуль
+`skills.rs` в `crates/core`: `SkillRegistry` загружает `.md` файлы из
+директории скиллов, парсит YAML frontmatter (`---\n...\n---`) для метаданных
+(name, description, defaults), поддерживает шаблонные переменные `{{var}}`.
+API: `load(dir)`, `reload_file(path)`, `render(name, vars)`, `list()`.
+Директория по умолчанию `~/.swagcod/skills/`, override через
+`SWAGCOD_SKILLS_DIR`. Tauri commands: `get_skills_list`, `reload_skill`.
+
+**D-223. MCP reload через diff конфигураций.** При изменении
+`mcp_servers.json` coordinator читает новый конфиг, сравнивает с текущим
+состоянием `McpRegistry`, connect'ит новые серверы и disconnect'ит удалённые.
+Изменённые серверы переподключаются. Старые `Arc<Conn>` не инвалидируются —
+активные ходы завершаются на старом соединении.
+
+**Гейты rev53:** `cargo test --workspace` — **437 passed / 0 failed / 1 ignored**
+(было 428, прирост +9: 7 тестов skills + 2 теста hot_reload).
+`cargo clippy --all-targets -D warnings` — 0. `cargo fmt --check` — чисто.
+`svelte-check` — 0/0. `vitest` — 18 файлов / 180 тестов. Бандл
+397156 / 400000 (без изменений: бэкенд не влияет на JS).
