@@ -35,15 +35,33 @@ tokio.workspace = true
 thiserror.workspace = true
 swagcod-core.workspace = true
 swagcod-provider.workspace = true
+glob.workspace = true
+# Фича 2: allow/deny из .swagcod/rules.json — те же regex, что core::rules
+# собирает для хода. Валидируем синтаксис до записи файла на диск.
+regex.workspace = true
 swagcod-pty.workspace = true
 swagcod-fsx.workspace = true
 dotenvy = "0.15"
+# Hot-reload: файловый watcher для MCP-конфигурации, JS-плагинов и скиллов.
+notify = "8"
 tauri-plugin-dialog = "2.0.0-rc.8"
 # E-9: сессии DSH лежат в многокадровом zstd (session.v3.jsonl.zstd).
 # Статическая libzstd из zstd-sys — внешних зависимостей не добавляет.
 zstd = "0.13"
 
+# Звуковые уведомления: rodio декодирует WAV/MP3/OGG и играет через WASAPI.
+rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
+
 # B-7: DPAPI (CryptProtectData) — ключ провайдера опционально хранится
 # зашифрованным под учётной записью Windows. Только на Windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+] }
+
+[dev-dependencies]
+tempfile = "3"

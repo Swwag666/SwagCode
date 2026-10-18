@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use crate::session::{Session, SessionId, SessionStatus, TurnRecord};
 use crate::store::{
     fts_match_expr, memory_check_scope, memory_check_text, policy_from_str_opt, policy_to_str,
-    role_from_str, role_to_str, search_limit, ApprovalEntry, MemoryEntry, MessageHit, Store,
-    StoreError, StoreResult, FTS_NEEDS_BACKFILL_SQL, FTS_REBUILD_SQL, SEARCH_MESSAGES_SQL,
+    role_from_str, role_to_str, search_limit, ApprovalEntry, MemoryEntry, MessageHit, SessionStub,
+    Store, StoreError, StoreResult, FTS_NEEDS_BACKFILL_SQL, FTS_REBUILD_SQL, SEARCH_MESSAGES_SQL,
 };
 use swagcod_provider::types::{ChatMessage, ToolCall};
 
@@ -452,6 +452,23 @@ impl Store for NodeStore {
             out.push(ses);
         }
         Ok(out)
+    }
+
+    fn session_stubs(&self) -> StoreResult<Vec<SessionStub>> {
+        // Один SELECT через тот же rpc-мост: sidecar исполняет произвольный
+        // SQL, поэтому метод не требует ни правки JS, ни пересборки vendor.
+        let rows = self.query(
+            "SELECT id, cwd, created_ms FROM sessions ORDER BY created_ms, id",
+            vec![],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| SessionStub {
+                id: v_text(col(row, 0)),
+                cwd: v_text(col(row, 1)),
+                created_ms: v_int(col(row, 2)) as u64,
+            })
+            .collect())
     }
 
     fn load_session(&self, id: &str) -> StoreResult<Option<Session>> {
@@ -1127,6 +1144,46 @@ mod tests {
         let all = store.load_all().unwrap();
         let ids: Vec<_> = all.iter().map(|s| s.id.as_str().to_string()).collect();
         assert_eq!(ids, vec!["s-a", "s-b"]);
+    }
+
+    /// Паритет лёгкого снимка: `session_stubs` обязан дать те же id/cwd/
+    /// created_ms в том же порядке, что `load_all`, иначе автоочистка на
+    /// ОСНОВНОМ бэкенде (better-sqlite3 у владельца) резала бы не те сессии,
+    /// а на аварийном rusqlite — те. Расхождение здесь молчаливое, поэтому
+    /// сверяются значения, а не факт «метод существует».
+    #[test]
+    fn node_session_stubs_parity_with_load_all() {
+        let Some(store) = try_memory() else { return };
+        let mut a = Session::new(SessionId::new("s-b"), "D:/b", "m");
+        a.created_ms = 200;
+        let mut b = Session::new(SessionId::new("s-a"), "D:/a", "m");
+        b.created_ms = 100;
+        let mut c = Session::new(SessionId::new("s-c"), "D:/c", "m");
+        c.created_ms = 150;
+        store.create_session(&a).unwrap();
+        store.create_session(&b).unwrap();
+        store.create_session(&c).unwrap();
+
+        let stubs = store.session_stubs().unwrap();
+        let all = store.load_all().unwrap();
+        assert_eq!(stubs.len(), 3);
+        assert_eq!(all.len(), 3);
+        for (stub, full) in stubs.iter().zip(all.iter()) {
+            assert_eq!(stub.id, full.id.as_str());
+            assert_eq!(stub.cwd, full.cwd);
+            assert_eq!(stub.created_ms, full.created_ms);
+        }
+        assert_eq!(
+            stubs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-a", "s-c", "s-b"]
+        );
+
+        store.delete_session("s-c").unwrap();
+        let stubs = store.session_stubs().unwrap();
+        assert_eq!(
+            stubs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-a", "s-b"]
+        );
     }
 
     #[test]

@@ -23,10 +23,10 @@ use swagcod_provider::{ChatRequest, StreamEvent};
 use tokio::sync::oneshot;
 
 use crate::{
-    arg_str, execute_tool, hooks, is_memory_tool, jsplugins, load_command_rules, mcp,
-    memory_facts_for_prompt, meta_of, providers, rehydrate_session, run_compaction, run_js_call,
-    run_mcp_call, run_memory_tool, run_semantic_search, run_subagent, sandbox_path, short_id,
-    spawn_semantic_index, touch_turn, AppState, PluginTool, TurnActivity, TurnHandle,
+    arg_str, execute_tool, hooks, is_memory_tool, jsplugins, mcp, memory_facts_for_prompt, meta_of,
+    providers, rehydrate_session, run_compaction, run_js_call, run_mcp_call, run_memory_tool,
+    run_semantic_search, run_subagent, sandbox_path, short_id, spawn_semantic_index, touch_turn,
+    AppState, PluginTool, TurnActivity, TurnHandle,
 };
 
 /// Вложения пользователя (скрепка в UI): текстовые файлы подшиваются к
@@ -166,6 +166,45 @@ pub(crate) fn approval_preview(call: &ToolCall, cwd: &std::path::Path) -> Option
     Some(text)
 }
 
+/* ── Фича 2: folder-scoped rules ─────────────────────────────────────────────
+ * Резолв правил рабочей папки и фильтрация инструментов. Вынесено из тела
+ * хода, чтобы логику можно было проверить на in-memory AppState без провайдера.
+ */
+
+/// Резолвить правила для рабочей папки: глобальные glob-правила плюс дерево
+/// `.swagcod/rules.json` вверх до корня ФС.
+///
+/// Отравленный мьютекс кэша не роняет ход: возвращаем пустые правила, и сессия
+/// идёт как до появления Фичи 2. Молча терять запреты хуже, чем молча терять
+/// удобства, поэтому факт потери пишется в лог.
+pub(crate) fn resolve_folder_rules(
+    state: &AppState,
+    cwd: &std::path::Path,
+) -> swagcod_core::folder_rules::ResolvedFolderRules {
+    match state.folder_rules.lock() {
+        Ok(mut cache) => cache.resolve(cwd),
+        Err(e) => {
+            eprintln!("folder-rules: кэш заблокирован ({e}), ход без правил папки");
+            swagcod_core::folder_rules::ResolvedFolderRules::default()
+        }
+    }
+}
+
+/// Плагин отключён правилом папки. Сравниваем по имени без префикса `js:` и
+/// без учёта регистра: владелец пишет `Shout`, а реестр хранит `shout`.
+///
+/// Пустые и пробельные строки правил игнорируются: иначе одна опечатка в
+/// `rules.json` (`"disabled_plugins": [""]`) совпала бы с любым именем и
+/// молча выключила все плагины сессии.
+pub(crate) fn plugin_disabled(disabled: &[String], name: &str) -> bool {
+    let bare = name
+        .strip_prefix(crate::jsplugins::JS_PREFIX)
+        .unwrap_or(name);
+    disabled.iter().any(|d| {
+        !d.trim().is_empty() && (d.eq_ignore_ascii_case(bare) || d.eq_ignore_ascii_case(name))
+    })
+}
+
 /* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
 loopback REST API. Поведение идентично: та же машина хода, та же шина. */
 pub(crate) async fn start_turn_core(
@@ -191,16 +230,7 @@ pub(crate) async fn start_turn_core(
     // Активный провайдер из настроек (default = .env/DPAPI как раньше).
     let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
 
-    /* F-3: allow/deny-списки команд читаются из prefs на каждый ход —
-    правка списка в настройках действует сразу, без перезапуска. */
-    let cmd_rules = state
-        .store
-        .lock()
-        .map(|s| load_command_rules(s.as_ref()))
-        // Отравленный мьютекс не должен снимать запреты: дефолты F-3.
-        .unwrap_or_else(|_| swagcod_core::rules::CommandRules::defaults());
-
-    let (turn_id, history, session_summary, session_model, cwd, cfg) = {
+    let (turn_id, history, session_summary, session_model, cwd, mut cfg) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .iter_mut()
@@ -229,8 +259,9 @@ pub(crate) async fn start_turn_core(
         if let Some(p) = session.approval_policy {
             cfg.approval_policy = p;
         }
-        // F-3: списки команд — свои на каждый ход (свежие из prefs).
-        cfg.rules = cmd_rules;
+        /* F-3 + Фича 2: списки команд собираются ПОСЛЕ выхода из-под лока
+        сессий. Folder-rules рабочей папки дополняют prefs, а читать файлы
+        правил, держа мьютекс сессий, — значит сериализовать ходы на диске. */
         (
             turn_id.to_string(),
             session.history.clone(),
@@ -243,33 +274,87 @@ pub(crate) async fn start_turn_core(
 
     // W-6 фикс: используем переданную модель если есть, иначе из сессии.
     let effective_model = model.unwrap_or(session_model);
+
+    /* Фича 2: folder-scoped rules. Резолвятся один раз на ход от рабочей
+    папки сессии: дерево `.swagcod/rules.json` вверх до корня ФС плюс
+    глобальные glob-правила. Кэш сверяет mtime, поэтому правка файла
+    подхватывается со следующего хода без перезапуска приложения. */
+    let folder = resolve_folder_rules(&state, std::path::Path::new(&cwd));
+
+    /* F-3: allow/deny из prefs читаются на каждый ход (правка в настройках
+    действует сразу), и folder-rules папки их дополняют. Deny остаётся
+    сильнее allow — порядок проверки внутри CommandRules, а не здесь. */
+    let (mut allow_lines, mut deny_lines) = state
+        .store
+        .lock()
+        .map(|s| crate::command_rule_lines(s.as_ref()))
+        // Отравленный мьютекс не должен снимать запреты: дефолты F-3.
+        .unwrap_or_else(|_| crate::default_rule_lines());
+    allow_lines.extend(folder.allow.iter().cloned());
+    deny_lines.extend(folder.deny.iter().cloned());
+    cfg.rules = swagcod_core::rules::CommandRules::from_lines(allow_lines, deny_lines);
+    if !folder.is_noop() {
+        eprintln!(
+            "folder-rules для {cwd}: allow+{} deny+{} mcp-{} plugins-{} skills-{} источников {}",
+            folder.allow.len(),
+            folder.deny.len(),
+            folder.disabled_mcp.len(),
+            folder.disabled_plugins.len(),
+            folder.disabled_skills.len(),
+            folder.sources.len()
+        );
+    }
+
     // Тулзы уходят в каждом запросе: без определений модель не может их вызвать.
     // B-5: встроенные плюс зарегистрированные плагины — модель видит один список.
     let plugins: Vec<PluginTool> = state.plugins.lock().map(|p| p.clone()).unwrap_or_default();
     let mut specs = builtin_tool_specs();
-    specs.extend(plugins.iter().map(|p| ToolSpec {
-        name: p.name.clone(),
-        description: p.description.clone(),
-        parameters: p.parameters.clone(),
-    }));
+    specs.extend(
+        plugins
+            .iter()
+            // Фича 2: disabled_plugins глушит и Rust-плагины — для модели
+            // это один класс «плагин», различать их в правилах смысла нет.
+            .filter(|p| !plugin_disabled(&folder.disabled_plugins, &p.name))
+            .map(|p| ToolSpec {
+                name: p.name.clone(),
+                description: p.description.clone(),
+                parameters: p.parameters.clone(),
+            }),
+    );
     /* E-3: инструменты MCP-серверов видны модели одним списком с
-    встроенными и плагинами B-5. */
+    встроенными и плагинами B-5. Фича 2: disabled_mcp глушит сервер целиком —
+    все его инструменты, а не по одному имени. */
     {
         let reg = state.mcp.lock().await;
-        specs.extend(reg.tools.iter().map(|t| ToolSpec {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            parameters: t.parameters.clone(),
-        }));
+        specs.extend(
+            reg.tools
+                .iter()
+                .filter(|t| !folder.disabled_mcp.iter().any(|s| s == &t.server))
+                .map(|t| ToolSpec {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                }),
+        );
     }
-    /* E-4: JS-плагины sidecar — тот же единый список (имена js:*). */
+    /* E-4: JS-плагины sidecar — тот же единый список (имена js:*).
+    Фича 2: disabled_plugins матчится по short-имени, без префикса. */
     if let Ok(tools) = state.js_tools.lock() {
-        specs.extend(tools.iter().map(|t| ToolSpec {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            parameters: t.parameters.clone(),
-        }));
+        specs.extend(
+            tools
+                .iter()
+                .filter(|t| !plugin_disabled(&folder.disabled_plugins, &t.short))
+                .map(|t| ToolSpec {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                }),
+        );
     }
+    /* Текст правил папки уходит в задачу хода отдельной строкой: сам
+    ResolvedFolderRules нужен здесь (фильтрация tools, allow/deny), а в задаче
+    из него используется только промпт-секция. */
+    let folder_prompt = folder.prompt_text();
     let tool_wire: Vec<serde_json::Value> = ChatRequest::new(&effective_model, Vec::new())
         .with_tools(&specs)
         .tools;
@@ -381,7 +466,11 @@ pub(crate) async fn start_turn_core(
         модели со следующего хода (сам вызов memory_add уже вернул
         подтверждение в истории, так что модель о нём знает). */
         let memory_facts = memory_facts_for_prompt(&app_state);
-        let system_msg = context::system_prompt(&summary, &memory_md, &memory_facts);
+        /* Фича 2: правила рабочей папки — третья секция инструкций после
+        памяти проекта и фактов. Пустая строка даёт промпт, байт-в-байт равный
+        прежнему: правил нет — ход идёт как до Фичи 2. */
+        let system_msg =
+            context::system_prompt_with(&summary, &memory_md, &memory_facts, &folder_prompt);
 
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
         let mut fail_reason: Option<String> = None;
