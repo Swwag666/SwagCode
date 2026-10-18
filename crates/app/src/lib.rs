@@ -16,6 +16,7 @@ pub mod hooks;
 pub mod httpapi;
 pub mod jsplugins;
 pub mod mcp;
+pub mod notifications;
 pub mod providers;
 pub mod stdio_rpc;
 pub mod turn_driver;
@@ -104,6 +105,10 @@ pub struct AppState {
     pub js_host: std::sync::Mutex<Option<Arc<jsplugins::JsHost>>>,
     pub js_tools: std::sync::Mutex<Vec<jsplugins::JsPluginTool>>,
     pub js_errors: std::sync::Mutex<Vec<String>>,
+    /// Уведомления: звуки и toast. Arc<Mutex>: listener + commands делят доступ.
+    pub notifications: Arc<Mutex<notifications::NotificationManager>>,
+    /// Флаг фокуса окна для suppress_when_focused.
+    pub window_focused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
@@ -216,6 +221,10 @@ impl Default for AppState {
             js_host: std::sync::Mutex::new(None),
             js_tools: std::sync::Mutex::new(Vec::new()),
             js_errors: std::sync::Mutex::new(Vec::new()),
+            notifications: Arc::new(Mutex::new(notifications::NotificationManager::new(
+                notifications::NotificationConfig::default(),
+            ))),
+            window_focused: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 }
@@ -4226,6 +4235,15 @@ pub fn run() {
             // B-8: watchdog живых ходов.
             spawn_watchdog(state.clone());
 
+            // Уведомления: фоновый listener шины.
+            let notif_bus = state.bus.clone();
+            let notif_mgr = state.notifications.clone();
+            let notif_focused = state.window_focused.clone();
+            tauri::async_runtime::spawn(async move {
+                notifications::spawn_notification_listener(notif_bus, notif_mgr, notif_focused)
+                    .await;
+            });
+
             state.bus.publish(swagcod_core::bus::EventKind::Status {
                 message: format!("SwagCod {} запущен", env!("CARGO_PKG_VERSION")),
             });
@@ -4299,10 +4317,54 @@ pub fn run() {
             open_in_explorer,
             update_check,
             update_install,
-            restart_app
+            restart_app,
+            get_notification_config,
+            set_notification_config,
+            test_notification,
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить SwagCod");
+}
+
+// ---------------------------------------------------------------------------
+// Уведомления: Tauri commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn get_notification_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<notifications::NotificationConfig, String> {
+    let mgr = state.notifications.lock().await;
+    Ok(mgr.config().clone())
+}
+
+#[tauri::command]
+async fn set_notification_config(
+    state: tauri::State<'_, AppState>,
+    config: notifications::NotificationConfig,
+) -> Result<(), String> {
+    // Сохраняем в prefs.
+    {
+        let store = state.store.lock().unwrap();
+        let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+        store
+            .set_pref("notification_config", &json)
+            .map_err(|e| e.to_string())?;
+    }
+    // Обновляем in-memory.
+    let mut mgr = state.notifications.lock().await;
+    mgr.update_config(config);
+    Ok(())
+}
+
+#[tauri::command]
+async fn test_notification(
+    state: tauri::State<'_, AppState>,
+    trigger: notifications::NotifyTrigger,
+) -> Result<(), String> {
+    let mut mgr = state.notifications.lock().await;
+    mgr.test_trigger(trigger).await;
+    Ok(())
 }
 
 #[cfg(test)]
