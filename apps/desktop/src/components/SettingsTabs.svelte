@@ -16,6 +16,109 @@
   import Icon, { type IconName } from './Icon.svelte'
   import { type StrKey } from '../lib/strings'
   import { polylinePoints, barHeights } from '../lib/charts'
+  import { invoke } from '@tauri-apps/api/core'
+
+  /* ── Уведомления: типы совпадают с бэкендом (serde snake_case). ── */
+  type NotifyTrigger = 'turn_complete' | 'turn_error' | 'approval_required'
+  type SoundSource = { type: 'builtin'; name: string } | { type: 'custom'; path: string }
+  type NotifyAction =
+    | { action: 'sound'; source: SoundSource; volume: number }
+    | { action: 'toast'; title: string; body: string }
+    | { action: 'both'; source: SoundSource; volume: number; title: string; body: string }
+  interface NotificationConfig {
+    triggers: Record<string, NotifyAction>
+    master_volume: number
+    enabled: boolean
+    suppress_when_focused: boolean
+  }
+
+  const BUILTIN_SOUNDS = ['done', 'error', 'chime'] as const
+  const TRIGGER_KEYS: NotifyTrigger[] = ['turn_complete', 'turn_error', 'approval_required']
+  const TRIGGER_LABELS: Record<NotifyTrigger, string> = {
+    turn_complete: 'Turn complete',
+    turn_error: 'Turn error',
+    approval_required: 'Approval required',
+  }
+
+  function defaultAction(): NotifyAction {
+    return { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 80, title: '', body: '' }
+  }
+
+  let notifyCfg = $state<NotificationConfig>({
+    triggers: {},
+    master_volume: 80,
+    enabled: true,
+    suppress_when_focused: false,
+  })
+  let notifyLoaded = $state(false)
+  let notifyStatus = $state<string | null>(null)
+  let saveTimer: ReturnType<typeof setTimeout> | null = null
+
+  async function loadNotifyConfig() {
+    try {
+      notifyCfg = await invoke<NotificationConfig>('get_notification_config')
+      notifyLoaded = true
+    } catch (e) {
+      notifyStatus = `Load failed: ${e}`
+    }
+  }
+
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = setTimeout(() => {
+      void saveNotifyConfig()
+    }, 500)
+  }
+
+  async function saveNotifyConfig() {
+    notifyStatus = null
+    try {
+      await invoke('set_notification_config', { config: notifyCfg })
+      notifyStatus = 'Saved'
+      setTimeout(() => { if (notifyStatus === 'Saved') notifyStatus = null }, 1500)
+    } catch (e) {
+      notifyStatus = `Save failed: ${e}`
+    }
+  }
+
+  // Type-safe accessors for NotifyAction union (svelte2tsx can't narrow discriminated unions in templates).
+  function actVolume(act: NotifyAction): number { return 'volume' in act ? (act as any).volume : 80 }
+  function actSource(act: NotifyAction): SoundSource { return 'source' in act ? (act as any).source : { type: 'builtin', name: 'done' } }
+  function actTitle(act: NotifyAction): string { return 'title' in act ? (act as any).title : 'Notification' }
+  function actBody(act: NotifyAction): string { return 'body' in act ? (act as any).body : '' }
+
+  async function testTrigger(trigger: NotifyTrigger) {
+    try {
+      await invoke('test_notification', { trigger })
+    } catch (e) {
+      notifyStatus = `Test failed: ${e}`
+    }
+  }
+
+  function getTriggerAction(key: string): NotifyAction {
+    return notifyCfg.triggers[key] ?? defaultAction()
+  }
+
+  function setTriggerAction(key: string, a: NotifyAction) {
+    notifyCfg.triggers[key] = a
+    scheduleSave()
+  }
+
+  function onNotifyToggle(field: 'enabled' | 'suppress_when_focused', val: boolean) {
+    notifyCfg[field] = val
+    scheduleSave()
+  }
+
+  function onMasterVolume(val: number) {
+    notifyCfg.master_volume = val
+    scheduleSave()
+  }
+
+  $effect(() => {
+    if (showSettings && !notifyLoaded) {
+      void loadNotifyConfig()
+    }
+  })
 
   /* ── Типы, которые нужны и окну, и App: объявлены здесь и экспортируются
      (приём MemoryTab/Icon), чтобы не дублировать объявление в двух файлах. ── */
@@ -592,6 +695,103 @@
                   {/if}
                 </div>
               </div>
+
+              <!-- ── Notifications subsection ── -->
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Notifications</span>
+                  <span class="label-desc">{notifyStatus ?? (notifyLoaded ? 'Configure alerts for turn events' : 'Loading...')}</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" checked={notifyCfg.enabled} onchange={(e) => onNotifyToggle('enabled', e.currentTarget.checked)} />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Suppress when focused</span>
+                  <span class="label-desc">Don't notify while the window is active</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" checked={notifyCfg.suppress_when_focused} onchange={(e) => onNotifyToggle('suppress_when_focused', e.currentTarget.checked)} />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Master volume</span>
+                  <span class="label-desc">{Math.round(notifyCfg.master_volume)}%</span>
+                </div>
+                <div class="font-size-control">
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={notifyCfg.master_volume}
+                    oninput={(e) => onMasterVolume(Number((e.target as HTMLInputElement).value))}
+                    class="settings-range"
+                  />
+                  <span>{Math.round(notifyCfg.master_volume)}%</span>
+                </div>
+              </div>
+              {#each TRIGGER_KEYS as key (key)}
+                {@const act = getTriggerAction(key)}
+                {@const actionType = (act.action as string) || 'off'}
+                <div class="settings-row notify-trigger-row">
+                  <div class="settings-label">
+                    <span class="label-title">{TRIGGER_LABELS[key]}</span>
+                  </div>
+                  <div class="notify-controls">
+                    <select
+                      class="settings-select"
+                      value={actionType}
+                      onchange={(e) => {
+                        const v = e.currentTarget.value
+                        if (v === 'off') setTriggerAction(key, { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 80, title: '', body: '' })
+                        else if (v === 'sound') setTriggerAction(key, { action: 'sound', source: { type: 'builtin', name: 'done' }, volume: actVolume(act) })
+                        else if (v === 'toast') setTriggerAction(key, { action: 'toast', title: actTitle(act), body: actBody(act) })
+                        else if (v === 'both') setTriggerAction(key, { action: 'both', source: actSource(act), volume: actVolume(act), title: actTitle(act), body: actBody(act) })
+                      }}
+                    >
+                      <option value="off">Off</option>
+                      <option value="sound">Sound</option>
+                      <option value="toast">Toast</option>
+                      <option value="both">Sound + Toast</option>
+                    </select>
+                    {#if actionType === 'sound' || actionType === 'both'}
+                      <select
+                        class="settings-select"
+                        value={(actSource(act).type === 'builtin' ? (actSource(act) as any).name : 'done')}
+                        onchange={(e) => {
+                          const name = e.currentTarget.value
+                          const cur = getTriggerAction(key)
+                          setTriggerAction(key, { ...cur, source: { type: 'builtin', name } } as NotifyAction)
+                        }}
+                      >
+                        {#each BUILTIN_SOUNDS as s (s)}
+                          <option value={s}>{s}</option>
+                        {/each}
+                      </select>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={actVolume(act)}
+                        oninput={(e) => {
+                          const vol = Number((e.target as HTMLInputElement).value)
+                          const cur = getTriggerAction(key)
+                          setTriggerAction(key, { ...cur, volume: vol } as NotifyAction)
+                        }}
+                        class="settings-range notify-vol-range"
+                        title={`Volume: ${actVolume(act)}%`}
+                      />
+                    {/if}
+                    <button class="step-btn text-btn" onclick={() => void testTrigger(key)}>Test</button>
+                  </div>
+                </div>
+              {/each}
             </div>
           {:else if settingsTab === 'security'}
             <div class="settings-section">
@@ -2090,6 +2290,22 @@
 
 .label-err {
     color: var(--err);
+  }
+
+/* ── Notifications subsection ── */
+.notify-trigger-row {
+    flex-wrap: wrap;
+  }
+
+.notify-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+.notify-vol-range {
+    width: 100px;
   }
 
 </style>

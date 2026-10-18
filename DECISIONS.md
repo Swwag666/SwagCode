@@ -5063,3 +5063,43 @@ debug-, и release-зависимости собирались с нуля. Кэ
 переиспользованных артефактов, из которой вырос D-212. Локальные гейты этого
 состояния: fmt чисто, clippy `-D warnings` 0, `cargo test --workspace`
 420 passed / 0 failed / 1 ignored.
+
+---
+
+## Ревизия 51 — уведомления: звуки, toast, Tauri commands
+
+**D-218. Звуковые уведомления через rodio с глобальным аудио-выходом.** Новый
+модуль `notifications.rs` в `crates/app`: `NotificationManager` подписывается
+на Bus через `spawn_notification_listener`, маппит события на триггеры
+(`TurnComplete`, `TurnError`, `ApprovalRequired`) и выполняет действия (звук,
+toast, оба). Звуки воспроизводятся через rodio (WASAPI на Windows): глобальный
+`OnceLock<AudioOutput>` инициализируется один раз, `OutputStream` хранится в
+статике (не перемещается между потоками), playback идёт через `&'static
+OutputStreamHandle`. Три встроенных звука (`done`, `error`, `chime`)
+генерируются программно (синусоидальные тоны с envelope) — нет внешних файлов,
+нет лицензионных вопросов. Пользовательские звуки декодируются из WAV/OGG и
+кэшируются в памяти. Громкость = `source.volume × master_volume`.
+
+**D-219. Toast-уведомления через MessageBoxW, а не WinRT.** WinRT Toast API
+(`Windows.UI.Notifications`) требует UWP-контекст и AppUserModelID в реестре,
+что не работает reliably в desktop Tauri-приложении без дополнительной
+регистрации. Fallback: `MessageBoxW` в отдельном `std::thread::spawn` (не
+блокирует async runtime). Это гарантирует работу на любой Windows-машине без
+дополнительной настройки. В будущем можно добавить libnotify для Linux и
+native macOS notifications.
+
+**D-220. Конфигурация уведомлений в prefs, не в новой таблице.**
+`NotificationConfig` сериализуется в JSON и хранится в prefs под ключом
+`notification_config`. Причины: (1) prefs уже существуют для всех настроек UI,
+(2) конфигурация уведомлений — это пользовательские предпочтения, а не доменные
+данные, (3) не нужна миграция БД. Tauri commands: `get_notification_config`,
+`set_notification_config` (сохраняет в prefs + обновляет in-memory),
+`test_notification` (воспроизводит действие для заданного триггера).
+
+**Гейты rev51:** `cargo test --workspace` — **428 passed / 0 failed / 1 ignored**
+(было 420, прирост +8 тестов уведомлений: default config, roundtrip JSON,
+builtin sounds generate, unknown builtin returns none, escape XML, manager
+handles turn_ended, suppresses when focused, disabled skips all).
+`cargo clippy --all-targets -D warnings` — 0. `cargo fmt --check` — чисто.
+`svelte-check` — 0/0. `vitest` — 18 файлов / 180 тестов. Бандл
+391858 / 400000 (без изменений: бэкенд не влияет на JS).
