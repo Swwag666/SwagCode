@@ -98,8 +98,17 @@ struct Choice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek / совместимые шлюзы: мысли в отдельном поле.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Альтернативные имена того же поля у разных провайдеров/шлюзов
+    /// (ahmia, kimi, некоторые OpenAI-совместимые обёртки): мысли приходят
+    /// в `reasoning` или `thinking`, а не в `reasoning_content`. Без этого
+    /// рассуждение модели вообще не попадает в поток — «мыслей не видно».
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolDelta>>,
     /// Присутствует в первом чанке. Намеренно не используется: роль сообщения
@@ -309,10 +318,15 @@ impl SseParser {
                 out.push(StreamEvent::Content(c));
             }
         }
-        if let Some(r) = d.reasoning_content {
-            if !r.is_empty() {
-                out.push(StreamEvent::Reasoning(r));
-            }
+        // Мысли: провайдеры кладут их в разные поля (reasoning_content у
+        // DeepSeek, reasoning/thinking у ahmia и kimi-совместимых шлюзов).
+        // Берём первое непустое — иначе рассуждение теряется и «мыслей не видно».
+        let reasoning_text = [d.reasoning_content, d.reasoning, d.thinking]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.is_empty());
+        if let Some(r) = reasoning_text {
+            out.push(StreamEvent::Reasoning(r));
         }
 
         if let Some(calls) = d.tool_calls {

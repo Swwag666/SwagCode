@@ -96,6 +96,10 @@
     appearance: Appearance
     fontSize: number
     glowLevel: 'soft' | 'normal' | 'strong'
+    /** Показ мыслей: 'live' - только живое рассуждение, 'always' - все строки. */
+    showThoughts: 'live' | 'always'
+    /** Per-session модель: каждая сессия помнит свою модель. */
+    perSessionModels: boolean
     uiZoom: number
     uiLang: UiLang
     effectsEnabled: boolean
@@ -233,6 +237,8 @@
     appearance = $bindable(),
     fontSize = $bindable(),
     glowLevel = $bindable(),
+    showThoughts = $bindable(),
+    perSessionModels = $bindable(),
     uiZoom,
     uiLang = $bindable(),
     effectsEnabled = $bindable(),
@@ -427,6 +433,16 @@
                   <button class="appearance-btn" class:active={glowLevel === 'soft'} onclick={() => (glowLevel = 'soft')}>{t('glowSoft')}</button>
                   <button class="appearance-btn" class:active={glowLevel === 'normal'} onclick={() => (glowLevel = 'normal')}>{t('glowNormal')}</button>
                   <button class="appearance-btn" class:active={glowLevel === 'strong'} onclick={() => (glowLevel = 'strong')}>{t('glowStrong')}</button>
+                </div>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('thoughtsTitle')}</span>
+                  <span class="label-desc">{t('thoughtsDesc')}</span>
+                </div>
+                <div class="appearance-options">
+                  <button class="appearance-btn" class:active={showThoughts === 'live'} onclick={() => (showThoughts = 'live')}>{t('thoughtsLive')}</button>
+                  <button class="appearance-btn" class:active={showThoughts === 'always'} onclick={() => (showThoughts = 'always')}>{t('thoughtsAlways')}</button>
                 </div>
               </div>
               <div class="settings-row">
@@ -763,6 +779,16 @@
                   <span class="label-desc">{t('tempAutoDesc')}</span>
                 </div>
                 <span class="auto-badge">{t('auto')}</span>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('perSessionModel')}</span>
+                  <span class="label-desc">{t('perSessionModelDesc')}</span>
+                </div>
+                <label class="toggle">
+                  <input type="checkbox" bind:checked={perSessionModels} />
+                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                </label>
               </div>
               <div class="model-cards">
                 {#each modelSpecs as m (m.id)}

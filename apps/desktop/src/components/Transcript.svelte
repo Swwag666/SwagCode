@@ -11,12 +11,8 @@
   import Icon from './Icon.svelte'
   import { renderMarkdown } from '../lib/markdown'
   import {
-    clampWindow,
-    computeWindow,
     ESTIMATED_ITEM_HEIGHT,
-    recordHeight,
-    type HeightCache,
-    type VirtualWindow,
+    OVERSCAN,
   } from '../lib/virtual'
   import type { TranscriptItem } from '../lib/transcript'
 
@@ -28,19 +24,43 @@
     maxRendered?: number
     bookmarks?: Set<string>
     onToggleBookmark?: (key: string) => void
+    /** Показ мыслей: 'live' — раскрыты, пока размышление стримится,
+        'always' — завершённые строки мыслей тоже раскрыты по умолчанию. */
+    showThoughts?: 'live' | 'always'
+    /** Монотонный счётчик «чат открылся заново» (смена сессии, загрузка
+        истории). По нему список принудительно уезжает к низу: scrollTop
+        иначе переживает смену сессии и новый чат открывается с дырой. */
+    scrollNonce?: number
   }
 
-  let { items, revision, maxRendered = 200, bookmarks = new Set(), onToggleBookmark }: Props = $props()
+  let {
+    items,
+    revision,
+    maxRendered = 200,
+    bookmarks = new Set(),
+    onToggleBookmark,
+    showThoughts = 'live',
+    scrollNonce = 0,
+  }: Props = $props()
 
   let scroller: HTMLDivElement | undefined = $state()
-  let minimapVisible = $state(false)
-  let minimapTop = $state(0)
-  let minimapHeight = $state(0)
   let scrollTop = $state(0)
   let viewportHeight = $state(600)
   let stickToBottom = $state(true)
 
-  const heights: HeightCache = new Map()
+  /* Чат открылся заново (смена сессии, догрузка истории): после первого тика
+     список принудительно встаёт на самый низ и возвращает прилипание.
+     Старый scrollTop прошлой сессии иначе открывает новый чат «с дырой». */
+  let pendingBottom = $state(true)
+
+  $effect(() => {
+    void scrollNonce
+    if (scrollNonce > 0) pendingBottom = true
+  })
+
+  /** Кэш измеренных высот: ключ строки → px. Ключи стабильны внутри сессии,
+      поэтому кэш переживает пересборки derived-массива. */
+  const heights = new Map<string, number>()
   /** Узлы строк по ключу: по ним снимаем измеренную высоту. */
   let rowNodes = new Map<string, HTMLElement>()
   /** Версия кэша высот: растёт от ResizeObserver строк, чтобы derived
@@ -50,8 +70,7 @@
   let rowRO: ResizeObserver | null = null
 
   // C-2 фикс: сбрасываем кэш высот только когда набор ДЕЙСТВИТЕЛЬНО новый
-  // (другая сессия, очистка, поиск), а не на каждую пересборку derived-массива:
-  // иначе totalHeight схлопывался до оценок и список дёргался вверх.
+  // (другая сессия, очистка, поиск), а не на каждую пересборку derived-массива.
   let lastFirstKey: string | null = null
   $effect(() => {
     const first = items[0]?.key ?? null
@@ -62,54 +81,124 @@
     }
   })
 
-  let win: VirtualWindow = $derived.by(() => {
-    // revision — триггер пересчёта: массив items мутируется моделью напрямую.
+  /** Строка окна рендера: индекс элемента плюс готовый ключ для each. */
+  interface WinRow {
+    i: number
+    item: TranscriptItem
+    key: string
+  }
+
+  interface VWin {
+    start: number
+    end: number
+    /** Распорка НАД окном (нерендеренная верхняя часть истории), px. */
+    offsetTop: number
+    /** Распорка ПОД окном, px. */
+    bottomPx: number
+    totalHeight: number
+    rows: WinRow[]
+  }
+
+  /**
+   * Окно виртуализации сверху вниз, с гарантией покрытия вьюпорта.
+   *
+   * Главная болезнь прошлой версии: старт окна искался по ОЦЕНОЧНЫМ высотам,
+   * а измеренные строки оказывались ниже оценок - и над окном повисала дыра
+   * в распорку. Здесь после построения окна оно добивается вверх, пока
+   * суммарная высота строк не покроет вьюпорт: дыра конструктивно невозможна,
+   * а скролл остаётся обычным (колесо, скроллбар и клавиши не инвертированы).
+   */
+  let win: VWin = $derived.by(() => {
     void revision
     void items.length
     void heightsVersion
-    return clampWindow(computeWindow(items.length, scrollTop, viewportHeight, heights), maxRendered)
-  })
-
-  /**
-   * Высота нижней распорки.
-   *
-   * Считаем из тех же измеренных/оценённых высот, а не из DOM: чтение
-   * offsetHeight здесь дало бы принудительный layout на каждый кадр.
-   */
-  let bottomSpacer = $derived.by(() => {
-    void heightsVersion
-    let rendered = 0
-    for (const i of win.indices) {
-      rendered += heights.get(i) ?? ESTIMATED_ITEM_HEIGHT
+    const n = items.length
+    if (n <= 0) {
+      return { start: 0, end: 0, offsetTop: 0, bottomPx: 0, totalHeight: 0, rows: [] }
     }
-    return Math.max(0, win.totalHeight - win.offsetTop - rendered)
+    const heightOf = (i: number): number => {
+      const it = items[i]
+      const h = it ? heights.get(it.key) : undefined
+      return h ?? ESTIMATED_ITEM_HEIGHT
+    }
+    let total = 0
+    let start = 0
+    let offsetTop = 0
+    let found = false
+    for (let i = 0; i < n; i++) {
+      const h = heightOf(i)
+      if (!found && scrollTop < total + h) {
+        start = i
+        offsetTop = total
+        found = true
+      }
+      total += h
+    }
+    if (!found) {
+      start = n - 1
+      offsetTop = total - heightOf(start)
+    }
+    const rawStart = start
+    start = Math.max(0, start - OVERSCAN)
+    for (let i = start; i < rawStart; i++) offsetTop -= heightOf(i)
+    let acc = offsetTop
+    let end = start
+    const bottom = scrollTop + viewportHeight
+    while (end < n && acc < bottom) {
+      acc += heightOf(end)
+      end++
+    }
+    end = Math.min(n, end + OVERSCAN)
+    // Покрытие: добиваем окно вверх, пока измеренные/оценочные высоты строк
+    // не заполнят вьюпорт целиком. Иначе над окном светится распорка-дыра.
+    let rendered = 0
+    for (let i = start; i < end; i++) rendered += heightOf(i)
+    while (start > 0 && rendered < viewportHeight) {
+      start--
+      const h = heightOf(start)
+      rendered += h
+      offsetTop -= h
+    }
+    let rows: WinRow[] = []
+    for (let i = start; i < end; i++) {
+      const item = items[i]
+      if (item) rows.push({ i, item, key: `${item.key}-${item.ver ?? 0}` })
+    }
+    if (rows.length > maxRendered) {
+      // Потолок DOM: режем СВЕРХУ нельзя - отрежем низ экрана; режем низ
+      // только в патологическом случае, когда окно и так огромно.
+      rows = rows.slice(rows.length - maxRendered)
+      start = rows[0].i
+      offsetTop = 0
+      for (let i = 0; i < start; i++) offsetTop += heightOf(i)
+      end = rows[rows.length - 1].i + 1
+    }
+    rendered = 0
+    for (const r of rows) rendered += heightOf(r.i)
+    const bottomPx = Math.max(0, total - offsetTop - rendered)
+    return { start, end, offsetTop, bottomPx, totalHeight: total, rows }
   })
 
   function onScroll(e: Event): void {
     const el = e.currentTarget as HTMLDivElement
     scrollTop = el.scrollTop
     viewportHeight = el.clientHeight
-    // Прилипание считаем по РЕАЛЬНОЙ высоте DOM, а не по оценке виртуализатора:
-    // во время стрима оценка отстаёт от отрисовки, и список «откидывало вверх».
+    // Прилипание считаем по РЕАЛЬНОЙ высоте DOM: во время стрима оценка
+    // отстаёт от отрисовки, и список «откидывало вверх».
     stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 64
-
-    // Мини-карта
-    if (win.totalHeight > 0) {
-      const ratio = el.clientHeight / win.totalHeight
-      minimapHeight = Math.max(20, ratio * 100)
-      minimapTop = (el.scrollTop / win.totalHeight) * 100
-      minimapVisible = ratio < 0.95 // показываем только если есть скролл
-    }
   }
 
   /** Снять реальные высоты отрендеренных строк в кэш. */
   function measure(): void {
-    for (const i of win.indices) {
-      const item = items[i]
-      if (!item) continue
-      const node = rowNodes.get(item.key)
+    for (const r of win.rows) {
+      const node = rowNodes.get(r.item.key)
       if (!node) continue
-      recordHeight(heights, i, node.getBoundingClientRect().height)
+      const measured = node.getBoundingClientRect().height
+      if (measured <= 0) continue
+      const prev = heights.get(r.item.key)
+      if (prev !== undefined && Math.abs(prev - measured) < 1) continue
+      heights.set(r.item.key, measured)
+      heightsVersion++
     }
   }
 
@@ -176,6 +265,16 @@
     openThoughts = next
   }
 
+  /* Раскрыта ли строка мыслей: пока размышление стримится — раскрыта всегда
+     (мысли читаются живьём, настройка show_thoughts='live'). Завершённая
+     строка при 'live' свёрнута до клика, при 'always' раскрыта по умолчанию.
+     Множество openThoughts в фазе «раскрыта по умолчанию» означает
+     «переключили вручную», поэтому один клик тумблера честен в обеих фазах. */
+  function thoughtsOpen(item: TranscriptItem): boolean {
+    const openByDefault = !item.done || showThoughts === 'always'
+    return openByDefault ? !openThoughts.has(item.key) : openThoughts.has(item.key)
+  }
+
   function readerZoomIn(): void {
     readerScale = Math.min(2.5, Math.round((readerScale + 0.1) * 10) / 10)
   }
@@ -205,7 +304,15 @@
     if (!scroller) return
     tick().then(() => {
       measure()
-      if (stickToBottom && scroller) {
+      if (!scroller) return
+      if (pendingBottom) {
+        // Чат открылся заново: встаём на самый низ и возвращаем прилипание,
+        // даже если пользователь в прошлой сессии уехал читать историю.
+        scroller.scrollTop = scroller.scrollHeight
+        scrollTop = scroller.scrollTop
+        stickToBottom = true
+        pendingBottom = false
+      } else if (stickToBottom) {
         scroller.scrollTop = scroller.scrollHeight
         scrollTop = scroller.scrollTop
       }
@@ -230,7 +337,6 @@
        не обрезается по старой высоте. */
     rowRO = new ResizeObserver(() => {
       measure()
-      heightsVersion++
       if (stickToBottom && scroller) {
         scroller.scrollTop = scroller.scrollHeight
         scrollTop = scroller.scrollTop
@@ -259,18 +365,13 @@
   })
 </script>
 
-<div class="scroller" bind:this={scroller} onscroll={onScroll}>
-  <!-- Мини-карта скролла -->
-  {#if minimapVisible}
-    <div class="minimap">
-      <div class="minimap-thumb" style="top: {minimapTop}%; height: {minimapHeight}%"></div>
-    </div>
-  {/if}
-  <!-- Верхняя распорка задаёт позицию видимого окна в полном списке. -->
-  <div class="spacer" style="height: {win.offsetTop}px"></div>
+<div class="wrap">
+  <div class="scroller" bind:this={scroller} onscroll={onScroll}>
+    <!-- Верхняя распорка задаёт позицию видимого окна в полном списке. -->
+    <div class="spacer" style="height: {win.offsetTop}px"></div>
 
-  {#each win.indices as i (items[i]?.key ?? i)}
-    {@const item = items[i]}
+    {#each win.rows as r (r.key)}
+      {@const item = r.item}
     {#if item}
       <div
         class="row row-{item.kind}"
@@ -294,14 +395,15 @@
           {/if}
           <span class="badge">{labelOf(item.kind)}</span>
           {#if item.kind === 'reasoning'}
+            {@const isOpen = thoughtsOpen(item)}
             <button
               class="thoughts-toggle"
-              aria-expanded={openThoughts.has(item.key)}
+              aria-expanded={isOpen}
               onclick={() => toggleThoughts(item.key)}
-              title={openThoughts.has(item.key) ? 'свернуть мысли' : 'раскрыть мысли'}
+              title={isOpen ? 'свернуть мысли' : 'раскрыть мысли'}
             >
               <Icon name="chevron-down" size={11} />
-              {openThoughts.has(item.key) ? 'свернуть' : 'раскрыть'}
+              {isOpen ? 'свернуть' : 'раскрыть'}
             </button>
           {/if}
           {#if item.tool}<span class="tool">{item.tool}</span>{/if}
@@ -323,9 +425,13 @@
             <Icon name="expand" size={13} />
           </button>
         </div>
-        <!-- Мысли свёрнуты, пока их не раскрыли: ответ читается без
-             простыни размышлений, а стрим «думает» виден по волне в шапке. -->
-        {#if item.kind !== 'reasoning' || openThoughts.has(item.key)}
+        <!-- Мысли видны ЖИВЬЁМ, пока модель рассуждает (стрим не завершён):
+             «думает» читается в момент рассуждения, а не после хода.
+             Готовая строка свёрнута, пока её не раскрыли вручную. Множество
+             openThoughts до финиша работает как «свернули вручную», после —
+             как «раскрыли вручную», поэтому один клик тумблера честен в
+             обоих состояниях. -->
+        {#if item.kind !== 'reasoning' || thoughtsOpen(item)}
           <div class="row-body">
             {#if item.kind === 'assistant' || item.kind === 'reasoning'}
               <!-- Маркдаун рендерится ЖИВЬЁМ на каждом батче: «расшифровка»
@@ -338,10 +444,11 @@
         {/if}
       </div>
     {/if}
-  {/each}
+    {/each}
 
-  <!-- Нижняя распорка сохраняет полную высоту скролла. -->
-  <div class="spacer" style="height: {bottomSpacer}px"></div>
+    <!-- Нижняя распорка сохраняет полную высоту скролла. -->
+    <div class="spacer" style="height: {win.bottomPx}px"></div>
+  </div>
 </div>
 
 {#if expanded}
@@ -392,6 +499,11 @@
 {/if}
 
 <style>
+  .wrap {
+    position: relative;
+    height: 100%;
+  }
+
   .scroller {
     height: 100%;
     overflow-y: auto;
@@ -402,28 +514,6 @@
        содержимого в собственный размер, менее хрупко */
     contain: layout paint style;
     position: relative;
-  }
-
-  .minimap {
-    position: sticky;
-    top: 0;
-    right: 2px;
-    width: 4px;
-    height: 100%;
-    background: rgba(255, 255, 255, 0.03);
-    border-radius: 2px;
-    pointer-events: none;
-    z-index: 10;
-    margin-left: auto;
-  }
-
-  .minimap-thumb {
-    position: absolute;
-    left: 0;
-    width: 100%;
-    background: var(--accent-dim);
-    border-radius: 2px;
-    transition: top 0.1s ease-out;
   }
 
   .spacer {

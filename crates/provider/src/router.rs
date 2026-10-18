@@ -72,6 +72,25 @@ pub struct Router {
 /// Секунды, не миллисекунды: reasoning-модели думают до первого чанка.
 pub const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Попыток на один эндпоинт до перехода по цепочке: 503/429 и молчание до
+/// первого чанка - временные глюки гейтвея, один глюк не должен жечь фолбэк.
+pub const ATTEMPTS_PER_ENDPOINT: usize = 3;
+
+/// Глюк временный и повтор осмыслен: перегруз гейтвея (5xx/429), обрыв
+/// соединения, молчание до первого события. Ошибки домена (401/400/лимит
+/// токенов) повторяем - только жжём квоту.
+fn retryable(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "503", "502", "504", "500", "429", "service unavailable", "bad gateway",
+        "gateway timeout", "overloaded", "capacity", "rate limit", "too many requests",
+        "нет первого события", "стрим закрылся", "connection", "timeout", "timed out",
+        "reset by peer", "broken pipe", "eos",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
 impl Router {
     pub fn new(endpoints: Vec<RouterEndpoint>) -> Result<Self, ProviderError> {
         if endpoints.is_empty() {
@@ -237,45 +256,65 @@ impl Provider for Router {
                 if let Some(m) = &ep.model {
                     req.model = m.clone();
                 }
-                match ep.provider.stream(req) {
-                    Ok((mut erx, ehandle)) => {
-                        // Ждём первое событие: Error до контента = эндпоинт
-                        // лежит/отказал, можно переключаться без потерь.
-                        let first = tokio::time::timeout(FIRST_EVENT_TIMEOUT, erx.recv()).await;
-                        match first {
-                            Ok(Some(StreamEvent::Error(m))) => {
-                                last_error = m;
-                                ehandle.abort();
-                            }
-                            Ok(Some(ev)) => {
-                                // Эндпоинт жив: форвардим первое и остальные.
-                                if tx.send(ev).await.is_err() {
+                // Повторы внутри одного эндпоинта: временный глюк гейтвея
+                // переживаем здесь, а не сжигаем следующий фолбэк цепочки.
+                for attempt in 0..ATTEMPTS_PER_ENDPOINT {
+                    let last_attempt = attempt + 1 == ATTEMPTS_PER_ENDPOINT;
+                    match ep.provider.stream(req.clone()) {
+                        Ok((mut erx, ehandle)) => {
+                            // Ждём первое событие: Error до контента = эндпоинт
+                            // лежит/отказал, можно переключаться без потерь.
+                            let first = tokio::time::timeout(FIRST_EVENT_TIMEOUT, erx.recv()).await;
+                            match first {
+                                Ok(Some(StreamEvent::Error(m))) => {
+                                    last_error = m.clone();
                                     ehandle.abort();
-                                    return;
-                                }
-                                while let Some(ev) = erx.recv().await {
-                                    if tx.send(ev).await.is_err() {
+                                    if last_attempt || !retryable(&m) {
                                         break;
                                     }
                                 }
-                                return;
+                                Ok(Some(ev)) => {
+                                    // Эндпоинт жив: форвардим первое и остальные.
+                                    if tx.send(ev).await.is_err() {
+                                        ehandle.abort();
+                                        return;
+                                    }
+                                    while let Some(ev) = erx.recv().await {
+                                        if tx.send(ev).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {
+                                    last_error = "стрим закрылся без событий".into();
+                                    ehandle.abort();
+                                    if last_attempt {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    last_error = format!(
+                                        "нет первого события за {} с",
+                                        FIRST_EVENT_TIMEOUT.as_secs()
+                                    );
+                                    ehandle.abort();
+                                    if last_attempt {
+                                        break;
+                                    }
+                                }
                             }
-                            Ok(None) => {
-                                last_error = "стрим закрылся без событий".into();
-                                ehandle.abort();
-                            }
-                            Err(_) => {
-                                last_error = format!(
-                                    "нет первого события за {} с",
-                                    FIRST_EVENT_TIMEOUT.as_secs()
-                                );
-                                ehandle.abort();
+                        }
+                        Err(e) => {
+                            last_error = e.to_string();
+                            if last_attempt || !retryable(&last_error) {
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        last_error = e.to_string();
-                    }
+                    // Пауза между попытками одного эндпоинта: экспонента с
+                    // джиттером, как между звеньями цепочки.
+                    tokio::time::sleep(backoff_delay(attempt as u32 + 1, attempt as u64 + 7)).await;
                 }
                 if i + 1 < total {
                     let jitter = std::time::SystemTime::now()

@@ -416,7 +416,17 @@ pub(crate) async fn start_turn_core(
                         messages,
                         stream: true,
                         temperature,
-                        max_tokens: None,
+                        // Щедрый потолок вывода: ahmia и прочие шлюзы при
+                        // max_tokens=null режут ответ по своему внутреннему
+                        // дефолту на полуслове («...тон. Ж»). 32k хватает на
+                        // любой ход; реальная длина всё равно ограничивается
+                        // stop-сигналом модели, а не этим числом.
+                        max_tokens: Some(32_768),
+                        // Включаем поток мыслей для reasoning-моделей. Без этого
+                        // флага часть маршрутов rustvy (например abyss/ahmia-v6-lite)
+                        // думает молча — «мыслей не видно». Провайдеры без поддержки
+                        // поля его тихо игнорируют.
+                        reasoning_effort: Some("high".to_string()),
                         tools: tool_wire.clone(),
                     };
                     let stream_started = std::time::Instant::now();
@@ -801,22 +811,67 @@ pub(crate) async fn start_turn_core(
 }
 
 /* F-9: ядро остановки — общее для IPC и loopback REST: кнопка «стоп» на
-телефоне обязана останавливать ход ровно так же, как на десктопе. */
+телефоне обязана останавливать ход ровно так же, как на десктопе.
+
+Остановка ДВУХСТУПЕНЧАТАЯ. Мгновенный `task.abort()` убивал задачу на
+ближайшем await ДО публикации TurnEnded и сброса статуса сессии: ход
+оставался «живым» навсегда (UI висел в «думает», стоп выглядел мёртвым,
+сессия — занятой). Теперь: флаг отмены → стрим замечает его на следующем
+событии и ход завершается ЧИСТО (TurnEnded, запись журнала, статус) → и
+только если за грейс-период задача не умерла сама (залипла в тулзе или в
+немом стриме), бьём abort и убираем за ней вручную. */
 pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Result<(), String> {
-    let handle = {
+    let (turn_id, handle) = {
         let mut turns = state.turns.lock().await;
         let victim = turns
             .iter()
             .find(|(_, h)| h.session == session_id)
             .map(|(tid, _)| tid.clone());
-        victim.and_then(|tid| turns.remove(&tid))
-    };
-    let Some(handle) = handle else {
-        return Err("нет живого хода у сессии".into());
+        match victim {
+            Some(tid) => match turns.remove(&tid) {
+                Some(h) => (tid, h),
+                None => return Err("нет живого хода у сессии".into()),
+            },
+            None => return Err("нет живого хода у сессии".into()),
+        }
     };
     handle
         .cancelled
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    handle.task.abort();
+
+    // Ступень 1: даём ходу завершиться самому — стрим прервётся по флагу,
+    // цикл дойдёт до TurnEnded и уборки. Грейс щедрый, но не бесконечный:
+    // залипший тулз не должен держать кнопку стопа заложницей.
+    // select! с &mut task (не timeout!): JoinHandle остаётся в руках и на
+    // ветке таймера — задачу можно добить abort, timeout бы её съел.
+    let mut task = handle.task;
+    tokio::select! {
+        _ = &mut task => return Ok(()),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            task.abort();
+        }
+    }
+
+    // Ступень 2: задача не умерла за грейс — убираем вручную то, что не
+    // успел сделать цикл хода. Ручку сняли выше, повторный remove не нужен.
+    state.bus.publish(swagcod_core::bus::EventKind::TurnEnded {
+        turn: swagcod_core::TurnId::new(&turn_id),
+        session: swagcod_core::SessionId::new(&session_id),
+        ok: false,
+        reason: Some("остановлено пользователем".to_string()),
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions
+            .iter_mut()
+            .find(|s| s.id.to_string() == session_id)
+        {
+            session.status = swagcod_core::session::SessionStatus::Cancelled;
+            session.current_turn = None;
+        }
+    }
+    if let Ok(mut activity) = state.turn_activity.lock() {
+        activity.remove(&turn_id);
+    }
     Ok(())
 }

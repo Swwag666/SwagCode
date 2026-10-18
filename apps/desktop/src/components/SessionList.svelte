@@ -61,6 +61,29 @@
     contextMenu = null
   }
 
+  /* Меню живёт до первого внешнего действия: любой клик (ЛКМ/ПКМ), колесо
+     или Escape вне меню закрывают его. Без этого оно висело поверх
+     интерфейса навсегда - нативного «клик мимо» у кастомного меню нет. */
+  $effect(() => {
+    if (!contextMenu) return
+    const onDown = (e: Event): void => {
+      const t = e.target as HTMLElement | null
+      if (t && t.closest('.session-context-menu')) return
+      contextMenu = null
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') contextMenu = null
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('wheel', onDown, true)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('wheel', onDown, true)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  })
+
   async function deleteSession(): Promise<void> {
     const target = contextMenu?.session.id
     closeContextMenu()

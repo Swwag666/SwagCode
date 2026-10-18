@@ -106,6 +106,17 @@
     (localStorage.getItem('swagcod-perm') as PermissionMode) || 'on_dangerous'
   )
   let uiLang = $state<UiLang>((localStorage.getItem('swagcod-lang') as UiLang) || 'ru')
+  /** Показ мыслей модели: 'live' — размышления раскрыты, пока стримятся
+      (действия и текст ответа видны вместе с ходом рассуждения), 'always' —
+      плюс раскрыты завершённые строки мыслей прошедших ходов. */
+  let showThoughts = $state<'live' | 'always'>(
+    (localStorage.getItem('swagcod-thoughts') as 'live' | 'always') || 'live'
+  )
+  /* Per-session модель: если включено, каждая сессия помнит свою модель.
+     Если выключено - всегда используется глобальная modelName. */
+  let perSessionModels = $state<boolean>(
+    localStorage.getItem('swagcod-per-session-models') !== 'false'
+  )
   let showModelPicker = $state(false)
   let showPermPicker = $state(false)
   let modelQuery = $state('')
@@ -139,10 +150,30 @@
   )
   const currentSpec = $derived(describeModel(modelName))
 
+  /* Эффективная модель текущей сессии: per-session приоритетнее глобальной.
+     Пустая строка в sessionModels = использовать глобальный дефолт. */
+  const effectiveModel = $derived(
+    perSessionModels && currentSession && sessionModels[currentSession]
+      ? sessionModels[currentSession]
+      : modelName
+  )
+
   function selectModel(id: string): void {
-    modelName = id
+    if (perSessionModels && currentSession) {
+      // Per-session выбор: запоминаем для этой сессии, не трогаем глобальную.
+      sessionModels[currentSession] = id
+    } else {
+      modelName = id
+    }
     showModelPicker = false
     modelQuery = ''
+  }
+
+  /* Сброс per-session модели на глобальный дефолт. */
+  function resetSessionModel(): void {
+    if (currentSession) {
+      delete sessionModels[currentSession]
+    }
   }
 
   const permSpecs = $derived<{ id: PermissionMode; icon: IconName; title: string; desc: string }[]>([
@@ -225,6 +256,13 @@
   $effect(() => { localStorage.setItem('swagcod-sidebar-w', String(Math.round(sidebarWidth))) })
   $effect(() => { localStorage.setItem('swagcod-sidebar-collapsed', sidebarCollapsed ? '1' : '0') })
   $effect(() => {
+    localStorage.setItem('swagcod-thoughts', showThoughts)
+    persistPref('show_thoughts', showThoughts)
+  })
+  $effect(() => {
+    localStorage.setItem('swagcod-per-session-models', perSessionModels ? 'true' : 'false')
+  })
+  $effect(() => {
     localStorage.setItem('swagcod-perm', permissionMode)
     persistPref('perm', permissionMode)
   })
@@ -263,6 +301,10 @@
      $state.raw: реактивна замена ссылки (смена сессии), без глубокого прокси. */
   let items = $state.raw<TranscriptItem[]>([])
   let revision = $state(0)
+  /* Сигнал «чат открылся заново»: Transcript по нему принудительно прижимает
+     список к низу. Без него scrollTop переживает переключение сессии, и новый
+     чат открывается с дырой вместо истории. */
+  let scrollNonce = $state(0)
   let seq = $state(0)
   let eventsTotal = $state(0)
   let batchesTotal = $state(0)
@@ -303,6 +345,7 @@
     transcript = transcriptFor(id)
     items = transcript.items
     revision++
+    scrollNonce++
     /* Последняя область следует за пользователем: переключился в сессию
        проекта — «+» и авто-создание пойдут в ту же папку. */
     const cwd = sessionCwds[id]
@@ -326,6 +369,7 @@
       if (currentSession === id) {
         items = tr.items
         revision++
+        scrollNonce++
       }
     } catch {
       // История недоступна (старое ядро): сессия просто пустая
@@ -340,13 +384,21 @@
   /* id сессии → её cwd: «+» открывает новую сессию в той же папке, где
      сидит пользователь, а не каждый раз в домашней. */
   let sessionCwds = $state<Record<string, string>>({})
+  /* Per-session модель: каждая сессия помнит свою модель, не переключаешься
+     глобально. Пустая строка = использовать глобальный дефолт из prefs. */
+  let sessionModels = $state<Record<string, string>>({})
 
   async function loadWorkspaces(): Promise<void> {
     try {
-      const list = await invoke<{ id: string; cwd: string }[]>('list_sessions')
-      const map: Record<string, string> = {}
-      for (const s of list) map[s.id] = s.cwd
-      sessionCwds = map
+      const list = await invoke<{ id: string; cwd: string; model?: string }[]>('list_sessions')
+      const cwds: Record<string, string> = {}
+      const models: Record<string, string> = {}
+      for (const s of list) {
+        cwds[s.id] = s.cwd
+        if (s.model) models[s.id] = s.model
+      }
+      sessionCwds = cwds
+      sessionModels = models
       const seen = new Set<string>()
       workspaces = list
         .filter((s) => (seen.has(s.cwd) ? false : (seen.add(s.cwd), true)))
@@ -1684,15 +1736,22 @@
 
   async function stopTurn(): Promise<void> {
     if (!currentSession) return
+    const sid = currentSession
     try {
-      await invoke('stop_turn', { sessionId: currentSession })
+      await invoke('stop_turn', { sessionId: sid })
     } catch (err) {
+      /* «нет живого хода у сессии» — ход уже умер или handle потерян:
+         для UI это всё равно остановка. */
       console.warn('stop_turn failed', err)
     }
-    transcriptFor(currentSession).closeAll()
-    items = transcriptFor(currentSession).items
+    /* Состояние сбрасываем ВСЕГДА, даже если бэк не нашёл handle: иначе
+       liveStates остаётся 'running' навсегда и красный квадрат выглядит
+       мёртвым — клик есть, реакции нет. */
+    liveStates[sid] = 'fail'
+    transcriptFor(sid).closeAll()
+    items = transcriptFor(sid).items
     revision++
-    if (sendingSession === currentSession) sendingSession = null
+    if (sendingSession === sid) sendingSession = null
   }
 
   function removeFromQueue(index: number): void {
@@ -1816,7 +1875,10 @@
       if (sid === currentSession && touched > 0) touchedActive += touched
     }
     if (touchedActive > 0) {
-      items = transcriptFor(currentSession ?? '').items
+      // Spread-копия массива: Svelte 5 не видит мутацию свойств элементов
+      // внутри того же массива (ex.text += ...). Новая ссылка триггерит
+      // перерисовку всех строк, включая live-reasoning.
+      items = [...transcriptFor(currentSession ?? '').items]
       revision++
     }
     /* Список сессий обновляем только по ходовым событиям, а не таймером:
@@ -1965,7 +2027,6 @@
       queueFor(sid).push({ text, attach: attach ?? [] })
       return
     }
-    if (sendingSession !== null) return
     try {
       if (!sid) {
         const brief = await invoke<{ id: string; cwd: string }>('create_session', {
@@ -1989,7 +2050,9 @@
       await invoke('start_turn', {
         sessionId: sid,
         message: text,
-        model: modelName || null,
+        // Per-session модель приоритетнее глобальной (если включено): каждая
+        // сессия помнит свою модель, не нужно переключаться туда-сюда.
+        model: (perSessionModels && sessionModels[sid]) ? sessionModels[sid] : (modelName || null),
         // Температура — автоматом от провайдера: None не сериализуется в тело
         // запроса (crates/provider/src/types.rs), провайдер применяет свой дефолт.
         temperature: null,
@@ -2230,6 +2293,8 @@
   bind:appearance={appearance}
   bind:fontSize={fontSize}
   bind:glowLevel={glowLevel}
+  bind:showThoughts={showThoughts}
+  bind:perSessionModels={perSessionModels}
   {uiZoom}
   bind:uiLang={uiLang}
   bind:effectsEnabled={effectsEnabled}
@@ -2590,7 +2655,7 @@
               <span class="birth-label">{t('chatCreating')}</span>
             </div>
           {/if}
-          <Transcript items={filteredItems} {revision} {bookmarks} onToggleBookmark={toggleBookmark} />
+          <Transcript items={filteredItems} {revision} {bookmarks} showThoughts={showThoughts} scrollNonce={scrollNonce} onToggleBookmark={toggleBookmark} />
         </div>
       {:else if activeTab === 'trajectory'}
         {@const trajectoryItems = items.filter(i => i.kind === 'tool_call' || i.kind === 'status')}
@@ -2710,13 +2775,13 @@
             {#each filteredModels as m (m.id)}
               <button
                 class="model-card"
-                class:selected={m.id === modelName}
+                class:selected={m.id === effectiveModel}
                 role="option"
-                aria-selected={m.id === modelName}
+                aria-selected={m.id === effectiveModel}
                 onclick={() => selectModel(m.id)}
               >
                 <span class="model-name">{m.id}</span>
-                {#if m.id === modelName}<span class="model-current">{t('currentModel')}</span>{/if}
+                {#if m.id === effectiveModel}<span class="model-current">{t('currentModel')}</span>{/if}
                 <span class="model-chips">
                   <span class="chip">{t('ctx')} {m.ctx}</span>
                   <span class="chip" class:fast={m.speed === 'fast'} class:heavy={m.speed === 'heavy'}>
@@ -2736,11 +2801,21 @@
           <div class="popover-foot">
             <div class="popover-foot-row">
               <span class="temp-auto" title={t('tempAutoDesc')}>{t('tempAuto')}: {t('auto')}</span>
+              {#if perSessionModels && currentSession && sessionModels[currentSession]}
+                <button
+                  class="popover-link"
+                  onclick={resetSessionModel}
+                  title={t('resetSessionModel')}
+                >{t('resetToGlobal')} ({modelName})</button>
+              {/if}
               <button
                 class="popover-link"
                 onclick={() => { showModelPicker = false; showSettings = true; settingsTab = 'models' }}
               >{t('openModelSettings')} →</button>
             </div>
+            {#if perSessionModels && currentSession && sessionModels[currentSession]}
+              <div class="popover-hint">{t('sessionModelHint')}</div>
+            {/if}
           </div>
         </div>
       {/if}
@@ -2812,10 +2887,11 @@
           ><Icon name={permSpec(permissionMode).icon} size={13} /> {permSpec(permissionMode).title}</button>
           <button
             class="model-selector"
+            class:session-override={perSessionModels && currentSession && sessionModels[currentSession]}
             aria-expanded={showModelPicker}
-            title={t('modelTitle')}
+            title={perSessionModels && currentSession && sessionModels[currentSession] ? t('sessionModelHint') : t('modelTitle')}
             onclick={() => { showPermPicker = false; showModelPicker = !showModelPicker; modelQuery = '' }}
-          >{modelName} <Icon name="chevron-down" size={12} /></button>
+          >{effectiveModel} <Icon name="chevron-down" size={12} /></button>
           {#if thinking || sending}
             <button
               class="send-btn stop"
@@ -4087,6 +4163,14 @@
     color: var(--accent);
     border: 1px solid var(--accent-dim);
     box-shadow: 0 0 8px rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
+  }
+
+  /* Per-session модель: визуальный индикатор что сессия использует свою,
+     а не глобальную модель. Тонкая подсветка границы. */
+  .model-selector.session-override {
+    border-color: var(--accent);
+    color: var(--accent);
+    box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.15);
   }
 
   .send-btn {
