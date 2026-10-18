@@ -32,6 +32,20 @@
     scope: 'global' | 'session'
     busy?: boolean
     status?: string | null
+    /** Сессии для селектора заметок. Заметки видны одной сессии, но править
+        можно любую — переключать активный чат ради этого не нужно. */
+    sessions?: { id: string; title: string }[]
+    /** Сессия, чьи заметки показаны сейчас (уже разрешённая родителем). */
+    sessionId?: string | null
+    onPickSession?: (id: string) => void
+    pickSessionLabel?: string
+    pickSessionHint?: string
+    /** Импорт промпта из txt/md: возвращает текст файла или null при отмене
+        диалога. Родитель сам читает файл и сам показывает ошибку. */
+    onImportFile?: () => Promise<string | null>
+    importLabel?: string
+    importingLabel?: string
+    importBusy?: boolean
     onScope: (scope: 'global' | 'session') => void
     onAdd: (text: string) => void
     onForget: (id: number) => void
@@ -52,6 +66,15 @@
     scope,
     busy = false,
     status = null,
+    sessions = [],
+    sessionId = null,
+    onPickSession,
+    pickSessionLabel = '',
+    pickSessionHint = '',
+    onImportFile,
+    importLabel = '',
+    importingLabel = '',
+    importBusy = false,
     onScope,
     onAdd,
     onForget,
@@ -63,11 +86,26 @@
    * «живая» только когда есть что сохранить. */
   const canAdd = $derived(draft.trim().length > 0 && !busy)
 
+  /** Селектор показываем только там, где он что-то решает: в глобальной
+   * области сессии нет вовсе, а пустой список рисовать бессмысленно. */
+  const showSessionPicker = $derived(
+    scope === 'session' && sessions.length > 0 && onPickSession !== undefined
+  )
+
   function submit(): void {
     const text = draft.trim()
     if (!text || busy) return
     onAdd(text)
     draft = ''
+  }
+
+  /** Импорт файла в черновик, а не сразу в базу: владелец видит текст до
+   * сохранения и может его обрезать. Отмена диалога (null) черновик не трогает
+   * — уже набранное руками не теряется. */
+  async function importFromFile(): Promise<void> {
+    if (!onImportFile || busy || importBusy) return
+    const text = await onImportFile()
+    if (text !== null && text.length > 0) draft = text
   }
 
   /** Короткая метка времени: список читается как лента, а не как журнал. */
@@ -99,10 +137,28 @@
   </div>
   <p class="mem-hint">{scope === 'global' ? globalHint : sessionHint}</p>
 
+  {#if showSessionPicker}
+    <label class="mem-session">
+      <span class="mem-session-label">{pickSessionLabel}</span>
+      <select
+        class="mem-select"
+        data-testid="memory-session-select"
+        value={sessionId ?? ''}
+        aria-label={pickSessionHint}
+        disabled={busy}
+        onchange={(e) => onPickSession?.(e.currentTarget.value)}
+      >
+        {#each sessions as s (s.id)}
+          <option value={s.id}>{s.title}</option>
+        {/each}
+      </select>
+    </label>
+  {/if}
+
   <div class="mem-add">
     <textarea
       class="mem-input"
-      rows="2"
+      rows="4"
       data-testid="memory-input"
       placeholder={placeholder}
       bind:value={draft}
@@ -115,13 +171,26 @@
         }
       }}
     ></textarea>
-    <button
-      type="button"
-      class="btn primary"
-      data-testid="memory-add"
-      disabled={!canAdd}
-      onclick={() => submit()}>{addLabel}</button
-    >
+    <div class="mem-actions">
+      {#if onImportFile}
+        <button
+          type="button"
+          class="btn"
+          data-testid="memory-import"
+          disabled={busy || importBusy}
+          title={importLabel}
+          onclick={() => void importFromFile()}
+          >{importBusy ? importingLabel : importLabel}</button
+        >
+      {/if}
+      <button
+        type="button"
+        class="btn primary"
+        data-testid="memory-add"
+        disabled={!canAdd}
+        onclick={() => submit()}>{addLabel}</button
+      >
+    </div>
   </div>
 
   {#if status}<p class="mem-status" data-testid="memory-status">{status}</p>{/if}
@@ -197,6 +266,37 @@
     display: flex;
     gap: 8px;
     align-items: flex-start;
+  }
+  /* Импорт и сохранение — колонкой справа от поля: обе кнопки про черновик,
+     и рядом с полем они читаются как одна группа действий. */
+  .mem-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mem-session {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .mem-session-label {
+    color: var(--text-dim);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .mem-select {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  .mem-select:disabled {
+    opacity: 0.5;
   }
   .mem-input {
     flex: 1;

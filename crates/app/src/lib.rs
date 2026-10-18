@@ -3214,6 +3214,44 @@ async fn read_file(
     std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))
 }
 
+/// Потолок импортируемого промпта: системный промпт хода и без того несёт
+/// память, факты и правила папки; файл больше 64 КБ в «факт» не помещается
+/// и в редакторе не читается.
+const PROMPT_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Расширения, из которых UI-редактор памяти принимает текст: человек держит
+/// промпт в txt или md, всё остальное (скрипты, бинарники) в факты не тащим.
+fn is_prompt_file_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "txt" | "md" | "markdown" | "text"
+    )
+}
+
+/// Прочитать txt/md-файл как текст для редактора памяти. Путь приходит из
+/// нативного диалога выбора файла, поэтому песочница сессии здесь не применима:
+/// [`read_file`] заперт в cwd сессии, а владелец хочет держать промпт где
+/// удобно. Ограничения вместо песочницы: расширение (txt/md/markdown/text),
+/// размер (64 КБ) и содержимое — только UTF-8, битые байты заменяются.
+#[tauri::command]
+fn read_prompt_file(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("не файл: {path}"));
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if !is_prompt_file_ext(ext) {
+        return Err(format!("промпт импортируется из txt/md, а не .{ext}"));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| format!("metadata: {e}"))?;
+    if meta.len() > PROMPT_FILE_MAX_BYTES {
+        return Err(format!("файл больше {} КБ", PROMPT_FILE_MAX_BYTES / 1024));
+    }
+    // lossy: файл из блокнота с кривой кодировкой не должен ронять импорт.
+    let bytes = std::fs::read(p).map_err(|e| format!("read: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Список моделей АКТИВНОГО провайдера (вкладка провайдеров).
 #[tauri::command]
 async fn list_models(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
@@ -4442,6 +4480,7 @@ pub fn run() {
             respond_approval,
             list_dir,
             read_file,
+            read_prompt_file,
             list_models,
             providers::list_provider_presets,
             providers::providers_state,
@@ -7142,6 +7181,57 @@ rl.on('line', (l) => {
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Импорт промпта из файла: расширение, размер, битая кодировка.
+    #[test]
+    fn read_prompt_file_accepts_txt_and_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("prompt.md");
+        std::fs::write(&md, "# Роль\nТы ревьюер.").unwrap();
+        assert_eq!(
+            crate::read_prompt_file(md.to_string_lossy().into_owned()).unwrap(),
+            "# Роль\nТы ревьюер."
+        );
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "факт из txt").unwrap();
+        assert_eq!(
+            crate::read_prompt_file(txt.to_string_lossy().into_owned()).unwrap(),
+            "факт из txt"
+        );
+        // Расширение в верхнем регистре — тот же файл из диалога Windows.
+        let up = dir.path().join("PROMPT.MD");
+        std::fs::write(&up, "капс-расширение").unwrap();
+        assert!(crate::read_prompt_file(up.to_string_lossy().into_owned()).is_ok());
+    }
+
+    #[test]
+    fn read_prompt_file_rejects_wrong_ext_and_big_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Бинарник не тащим в факты: расширение — фильтр намерения.
+        let exe = dir.path().join("tool.exe");
+        std::fs::write(&exe, b"MZ...").unwrap();
+        let err = crate::read_prompt_file(exe.to_string_lossy().into_owned()).unwrap_err();
+        assert!(err.contains("txt/md"), "ошибка называет причину: {err}");
+        // Файл сверх потолка отклоняется до чтения.
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'a'; 64 * 1024 + 1]).unwrap();
+        assert!(crate::read_prompt_file(big.to_string_lossy().into_owned()).is_err());
+        // Нет файла — понятный отказ, а не паника.
+        let missing = dir.path().join("nope.md");
+        assert!(crate::read_prompt_file(missing.to_string_lossy().into_owned()).is_err());
+    }
+
+    /// Битые байты не роняют импорт: файл из блокнота с чужой кодировкой
+    /// заменяется символами подстановки, владелец видит текст и решает сам.
+    #[test]
+    fn read_prompt_file_replaces_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mixed.txt");
+        std::fs::write(&f, b"ok\xff\xfe tail").unwrap();
+        let text = crate::read_prompt_file(f.to_string_lossy().into_owned()).unwrap();
+        assert!(text.starts_with("ok"));
+        assert!(text.ends_with(" tail"));
     }
 
     #[test]

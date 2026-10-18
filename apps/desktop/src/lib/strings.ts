@@ -190,14 +190,24 @@ export const STR = {
       memoryGlobalHint:
         'Вшиваются в системный промпт каждого хода — держите их короткими и только про вас и ваш рабочий процесс.',
       memorySessionHint:
-        'Видны только в текущей сессии и не попадают в промпт других сессий.',
-      memoryPlaceholder: 'Короткий факт, одна строка (Ctrl+Enter — сохранить)',
+        'Видны только в выбранной сессии и не попадают в промпт других сессий.',
+      /* Факт — это не обязательно одна строка: владелец держит промпты в
+         txt/md и подгружает их целиком, поэтому редактор многострочный, а
+         импорт из файла — обычный способ наполнить заметку. */
+      memoryPlaceholder:
+        'Факт или промпт целиком — сколько нужно строк (Ctrl+Enter — сохранить)',
       memoryAdd: 'Сохранить',
       memoryForget: 'Забыть',
       memoryEmpty: 'Пока пусто: добавьте факт или попросите агента запомнить его.',
       memoryAdded: 'Сохранено',
       memoryRemoved: 'Удалено',
       memoryFailed: 'Не получилось: {msg}',
+      memoryPickSession: 'Сессия',
+      memoryPickSessionHint: 'Заметки какой сессии показаны',
+      memoryFromFile: 'Из файла…',
+      memoryImporting: 'Читаю файл…',
+      memoryImportFailed: 'Импорт не удался: {msg}',
+      memoryImportTitle: 'Промпт или заметка (txt, md)',
       memoryCmdDesc: 'Открыть память приложения',
       approvalLogTitle: 'Журнал подтверждений',
       approvalLogBtn: 'Обновить',
@@ -508,14 +518,20 @@ export const STR = {
       memoryGlobalHint:
         'Injected into the system prompt of every turn — keep them short and only about you and your workflow.',
       memorySessionHint:
-        'Visible in the current session only; they never reach other sessions.',
-      memoryPlaceholder: 'One short fact (Ctrl+Enter to save)',
+        'Visible in the selected session only; they never reach other sessions.',
+      memoryPlaceholder: 'A fact or a whole prompt — as many lines as you need (Ctrl+Enter to save)',
       memoryAdd: 'Save',
       memoryForget: 'Forget',
       memoryEmpty: 'Nothing here yet: add a fact or ask the agent to remember one.',
       memoryAdded: 'Saved',
       memoryRemoved: 'Removed',
       memoryFailed: 'Failed: {msg}',
+      memoryPickSession: 'Session',
+      memoryPickSessionHint: 'Which session these notes belong to',
+      memoryFromFile: 'From file…',
+      memoryImporting: 'Reading file…',
+      memoryImportFailed: 'Import failed: {msg}',
+      memoryImportTitle: 'Prompt or note (txt, md)',
       memoryCmdDesc: 'Open application memory',
       approvalLogTitle: 'Approval journal',
       approvalLogBtn: 'Refresh',

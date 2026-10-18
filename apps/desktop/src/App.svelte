@@ -970,6 +970,15 @@
   let memoryScope = $state<'global' | 'session'>('global')
   let memoryBusy = $state(false)
   let memoryStatus = $state<string | null>(null)
+  /* Заметки сессии читаются для ВЫБРАННОЙ сессии, а не только для активной:
+     владелец видит сессии в сайдбаре и вправе править память любой из них, не
+     переключая активный чат (переключение сбросило бы ход и транскрипцию).
+     null — выбор не сделан, значит активная сессия. */
+  let memorySessions = $state<{ id: string; title: string }[]>([])
+  let memorySessionId = $state<string | null>(null)
+  let memoryImporting = $state(false)
+
+  const memorySession = $derived(memorySessionId ?? currentSession)
 
   async function refreshMemory(): Promise<void> {
     if (!tauriAvailable) return
@@ -977,7 +986,7 @@
     try {
       memoryItems = await invoke<MemoryItem[]>('memory_list', {
         scope: memoryScope,
-        sessionId: currentSession,
+        sessionId: memorySession,
         limit: 200,
       })
     } catch (e) {
@@ -988,13 +997,64 @@
     }
   }
 
+  /** Список сессий для селектора памяти. Тот же `list_sessions`, что кормит
+      сайдбар (SessionBrief: title никогда не пуст — ядро подставляет cwd),
+      порядок «свежие сверху» как у сайдбара в режиме по обновлению. */
+  async function refreshMemorySessions(): Promise<void> {
+    if (!tauriAvailable) return
+    try {
+      const rows = await invoke<{ id: string; title: string; last_activity_ms: number }[]>(
+        'list_sessions'
+      )
+      memorySessions = rows
+        .slice()
+        .sort((a, b) => b.last_activity_ms - a.last_activity_ms)
+        .map((s) => ({ id: s.id, title: s.title }))
+    } catch {
+      memorySessions = []
+    }
+  }
+
+  function pickMemorySession(id: string): void {
+    if (memorySessionId === id) return
+    memorySessionId = id
+    memoryStatus = null
+    void refreshMemory()
+  }
+
+  /* Импорт промпта из txt/md. Путь выбирает нативный диалог, а читает ядро
+     командой `read_prompt_file`: существующий `read_file` заперт песочницей в
+     cwd сессии, а промпт владельца может лежать где угодно. Возврат null —
+     отмена диалога, а не ошибка: молча ничего не делаем. */
+  async function importPromptFile(): Promise<string | null> {
+    if (!tauriAvailable) return null
+    memoryImporting = true
+    try {
+      const sel = await openDialog({
+        multiple: false,
+        title: t('memoryImportTitle'),
+        filters: [{ name: 'Text / Markdown', extensions: ['txt', 'md', 'markdown', 'text'] }],
+      })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return null
+      const text = await invoke<string>('read_prompt_file', { path })
+      memoryStatus = null
+      return text
+    } catch (e) {
+      memoryStatus = t('memoryImportFailed').replace('{msg}', String(e))
+      return null
+    } finally {
+      memoryImporting = false
+    }
+  }
+
   async function addMemory(text: string): Promise<void> {
     if (!tauriAvailable || memoryBusy) return
     memoryBusy = true
     try {
       await invoke<number>('memory_add', {
         scope: memoryScope,
-        sessionId: currentSession,
+        sessionId: memorySession,
         text,
       })
       memoryStatus = t('memoryAdded')
@@ -1031,7 +1091,20 @@
   }
 
   $effect(() => {
-    if (showSettings && settingsTab === 'memory') void refreshMemory()
+    if (showSettings && settingsTab === 'memory') {
+      /* Чтение выбранной сессии регистрируется как зависимость: смена выбора
+         в селекторе перечитывает список, а не оставляет заметки прежней. */
+      const sid = memorySession
+      void sid
+      void refreshMemory()
+      void refreshMemorySessions()
+    }
+  })
+
+  $effect(() => {
+    /* Диалог настроек закрыли — выбор сессии сбрасывается: в следующий раз
+       память открывается на активной сессии, а не на вчерашнем выборе. */
+    if (!showSettings && memorySessionId !== null) memorySessionId = null
   })
 
   /* B-8: watchdog в UI — живой ход без событий 5 минут показываем как
@@ -2346,6 +2419,12 @@
   {addMemory}
   {forgetMemory}
   {setMemoryScope}
+  /* выбор сессии и импорт промпта из txt/md */
+  {memorySessions}
+  {memorySession}
+  {memoryImporting}
+  {pickMemorySession}
+  {importPromptFile}
 
   /* js-плагины */
   {jsPlugTools}

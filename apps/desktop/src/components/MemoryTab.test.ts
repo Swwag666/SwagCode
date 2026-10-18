@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
+import { tick } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import MemoryTab, { type MemoryItem } from './MemoryTab.svelte'
 import { STR } from '../lib/strings'
@@ -128,5 +129,86 @@ describe('MemoryTab: smoke', () => {
     render(MemoryTab, { ...props, scope: 'session' })
     expect(screen.getByTestId('scope-session').classList.contains('active')).toBe(true)
     expect(screen.getByTestId('scope-global').classList.contains('active')).toBe(false)
+  })
+
+  /* ── rev55: выбор сессии и импорт промпта из txt/md ───────────────────────
+     Заметки привязаны к одной сессии, но править можно любую: без селектора
+     память показывала только активный чат, и чтобы поправить заметки другой
+     сессии, её пришлось бы делать активной. */
+  const sessionProps = {
+    sessions: [
+      { id: 's-aaa11111', title: 'Ревизия 54' },
+      { id: 's-bbb22222', title: 'D:/SwagCod' },
+    ],
+    sessionId: 's-bbb22222',
+    pickSessionLabel: STR.ru.memoryPickSession,
+    pickSessionHint: STR.ru.memoryPickSessionHint,
+  }
+
+  it('в области session показывает селектор и передаёт выбор родителю', async () => {
+    const onPickSession = vi.fn()
+    render(MemoryTab, { ...props, scope: 'session', ...sessionProps, onPickSession })
+    const select = screen.getByTestId('memory-session-select') as HTMLSelectElement
+    expect(select.value).toBe('s-bbb22222')
+    expect(select.options.length).toBe(2)
+    await fireEvent.change(select, { target: { value: 's-aaa11111' } })
+    expect(onPickSession).toHaveBeenCalledWith('s-aaa11111')
+  })
+
+  it('в глобальной области селектора нет: там сессия ни на что не влияет', () => {
+    render(MemoryTab, { ...props, scope: 'global', ...sessionProps, onPickSession: vi.fn() })
+    expect(screen.queryByTestId('memory-session-select')).toBeNull()
+  })
+
+  it('пустой список сессий не рисует пустой селектор', () => {
+    render(MemoryTab, { ...props, scope: 'session', sessions: [], onPickSession: vi.fn() })
+    expect(screen.queryByTestId('memory-session-select')).toBeNull()
+  })
+
+  it('без колбэка выбора селектора нет: компонент не может выбирать сам', () => {
+    render(MemoryTab, { ...props, scope: 'session', sessions: sessionProps.sessions })
+    expect(screen.queryByTestId('memory-session-select')).toBeNull()
+  })
+
+  it('импорт из файла кладёт текст в черновик, сохранение отправляет его дословно', async () => {
+    const onAdd = vi.fn()
+    const text = '# Роль\nТы ревьюер.\nПроверяй тесты.'
+    const onImportFile = vi.fn().mockResolvedValue(text)
+    render(MemoryTab, {
+      ...props,
+      onAdd,
+      onImportFile,
+      importLabel: STR.ru.memoryFromFile,
+      importingLabel: STR.ru.memoryImporting,
+    })
+    await fireEvent.click(screen.getByTestId('memory-import'))
+    await tick()
+    const input = screen.getByTestId('memory-input') as HTMLTextAreaElement
+    expect(input.value).toBe(text)
+    /* Многострочный факт уходит целиком: промпт из файла — не «одна строка»,
+       и ломать его переносы на пути в базу нельзя. */
+    await fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true })
+    expect(onAdd).toHaveBeenCalledWith(text)
+  })
+
+  it('отмена диалога импорта не стирает набранный руками черновик', async () => {
+    const onImportFile = vi.fn().mockResolvedValue(null)
+    render(MemoryTab, { ...props, onImportFile, importLabel: STR.ru.memoryFromFile })
+    await fireEvent.input(screen.getByTestId('memory-input'), { target: { value: 'руками' } })
+    await fireEvent.click(screen.getByTestId('memory-import'))
+    await tick()
+    expect(onImportFile).toHaveBeenCalled()
+    expect((screen.getByTestId('memory-input') as HTMLTextAreaElement).value).toBe('руками')
+  })
+
+  it('без колбэка импорта кнопки нет, а в busy она не работает', async () => {
+    render(MemoryTab, { ...props })
+    expect(screen.queryByTestId('memory-import')).toBeNull()
+    const onImportFile = vi.fn()
+    const { getByTestId } = render(MemoryTab, { ...props, busy: true, onImportFile, importLabel: 'x' })
+    const btn = getByTestId('memory-import') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    await fireEvent.click(btn)
+    expect(onImportFile).not.toHaveBeenCalled()
   })
 })

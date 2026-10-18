@@ -3,11 +3,13 @@
    * F-10: модальное окно настроек — вкладки general/security/telemetry/
    * providers/memory (+ models, plugins, mcp).
    *
-   * Компонент чисто презентационный: всё состояние живёт в App.svelte и
-   * приходит пропсами, действия уходят колбэками, а флаги и поля, которые
-   * окно правит само, объявлены $bindable (тот же приём, что в Palette и
-   * MemoryTab). Ни invoke, ни шины здесь нет — поэтому разметка переехала
-   * дословно, без изменения поведения.
+   * Компонент презентационный для того, что живёт в App: состояние приходит
+   * пропсами, действия уходят колбэками, а флаги и поля, которые окно правит
+   * само, объявлены $bindable (тот же приём, что в Palette и MemoryTab).
+   * Исключение — ревизии 52 и 54: собственные разделы окна (уведомления,
+   * автоочистка, folder rules) ходят в ядро `invoke`'ом напрямую и держат своё
+   * состояние здесь, потому что оно не нужно больше никому (прецедент —
+   * SessionList и FileTree, которые тоже зовут команды сами).
    */
   import CommandRules from './CommandRules.svelte'
   import HooksEditor from './HooksEditor.svelte'
@@ -17,6 +19,9 @@
   import { type StrKey } from '../lib/strings'
   import { polylinePoints, barHeights } from '../lib/charts'
   import { invoke } from '@tauri-apps/api/core'
+  /* Нативный диалог выбора папки: тот же plugin-dialog, что App использует для
+     рабочих областей, поэтому в бандл он уже входит и здесь стоит ноль байт. */
+  import { open as openDialog } from '@tauri-apps/plugin-dialog'
 
   /* ── Уведомления: типы совпадают с бэкендом (serde snake_case). ── */
   type NotifyTrigger = 'turn_complete' | 'turn_error' | 'approval_required'
@@ -440,6 +445,45 @@
     }
   }
 
+  /** Нативный выбор папки для правил. Вбивать путь руками — лишний повод для
+      опечатки, а диалог тот же, что App использует для рабочих областей. */
+  async function pickDirCwd() {
+    try {
+      const sel = await openDialog({ directory: true, multiple: false, title: 'Rules folder' })
+      const path = typeof sel === 'string' ? sel : ''
+      if (!path) return
+      dirCwd = path
+      /* Правила прежней папки больше не про этот путь: снимаем dirLoaded и
+         предпросмотр, иначе Save записал бы чужой конфиг в новый каталог, а
+         Preview показывал бы резолв старой папки. */
+      dirLoaded = false
+      dirView = null
+      dirSkills = null
+      dirStatus = null
+    } catch (e) {
+      dirStatus = `Browse failed: ${e}`
+    }
+  }
+
+  /** Импорт в `system_prompt_append` из txt/md — тот же механизм, что у памяти:
+      промпт папки обычно длиннее, чем удобно набирать в поле руками. */
+  async function importDirAppend() {
+    dirBusy = true
+    try {
+      const text = await importPromptFile()
+      if (text !== null && text.length > 0) {
+        dirAppend = text
+        dirStatus = null
+      } else if (memoryStatus) {
+        /* Ошибка чтения ушла в статус памяти — дублируем её сюда, иначе на
+           вкладке безопасности отказ выглядел бы как «ничего не случилось». */
+        dirStatus = memoryStatus
+      }
+    } finally {
+      dirBusy = false
+    }
+  }
+
   function resolvedEmpty(v: FolderRulesView): boolean {
     const r = v.resolved
     return (
@@ -667,6 +711,14 @@
     addMemory: (text: string) => Promise<void>
     forgetMemory: (id: number) => Promise<void>
     setMemoryScope: (scope: 'global' | 'session') => void
+    /* Выбор сессии для заметок и импорт промпта из txt/md. `memorySession` —
+       уже разрешённый id (выбранный вручную или активная сессия), поэтому
+       компонент не знает про currentSession. */
+    memorySessions: { id: string; title: string }[]
+    memorySession: string | null
+    memoryImporting: boolean
+    pickMemorySession: (id: string) => void
+    importPromptFile: () => Promise<string | null>
 
     /* ── js-плагины ── */
     jsPlugTools: { name: string; description: string; file: string }[]
@@ -805,6 +857,11 @@
     addMemory,
     forgetMemory,
     setMemoryScope,
+    memorySessions,
+    memorySession,
+    memoryImporting,
+    pickMemorySession,
+    importPromptFile,
 
     /* js-плагины */
     jsPlugTools,
@@ -1445,6 +1502,7 @@
                     placeholder={sessionCwd ?? 'folder path'}
                     aria-label="Folder path"
                   />
+                  <button class="appearance-btn" data-testid="dir-browse" onclick={() => void pickDirCwd()}>Browse…</button>
                   <button class="appearance-btn" disabled={dirBusy} onclick={() => void loadDirRules()}>Load</button>
                   <button class="appearance-btn" disabled={dirBusy || !dirLoaded} onclick={() => void saveDirRules()}>Save</button>
                   <button class="appearance-btn" disabled={dirBusy} onclick={() => void previewDirRules()}>Preview</button>
@@ -1461,11 +1519,19 @@
                       </label>
                     {/each}
                   </div>
-                  <label class="settings-label">
+                  <!-- div, а не label: кнопка внутри label ловила бы клики
+                       поля и дёргала бы фокус на textarea. -->
+                  <div class="settings-label">
                     <span class="label-title">System prompt append</span>
                     <span class="label-desc">Added to the system prompt of sessions started in this folder; empty clears it</span>
                     <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirAppend} aria-label="System prompt append"></textarea>
-                  </label>
+                    <button
+                      class="text-btn step-btn"
+                      data-testid="dir-append-import"
+                      disabled={dirBusy}
+                      onclick={() => void importDirAppend()}
+                    >Load from txt/md…</button>
+                  </div>
                   <div class="settings-row">
                     <div class="settings-label">
                       <span class="label-title">Session TTL, seconds</span>
@@ -1759,6 +1825,15 @@
                 scope={memoryScope}
                 busy={memoryBusy}
                 status={memoryStatus}
+                sessions={memorySessions}
+                sessionId={memorySession}
+                pickSessionLabel={t('memoryPickSession')}
+                pickSessionHint={t('memoryPickSessionHint')}
+                onPickSession={pickMemorySession}
+                onImportFile={importPromptFile}
+                importLabel={t('memoryFromFile')}
+                importingLabel={t('memoryImporting')}
+                importBusy={memoryImporting}
                 onScope={setMemoryScope}
                 onAdd={(text) => void addMemory(text)}
                 onForget={(id) => void forgetMemory(id)}
