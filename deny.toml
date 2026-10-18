@@ -44,6 +44,12 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # zvariant_derive 5.15.0 помечен unmaintained (RUSTSEC-2026-0372).
+    # Транзитив tauri-plugin-single-instance → zbus 5 → zvariant.
+    # Безопасного апгрейда нет: zbus 6+ ломает API, tauri-plugin-single-instance
+    # 2.5.2 требует zbus ^5. Пересмотреть при выходе tauri-plugin-single-instance
+    # на zbus 6+.
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
