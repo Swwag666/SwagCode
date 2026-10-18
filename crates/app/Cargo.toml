@@ -35,6 +35,10 @@ tokio.workspace = true
 thiserror.workspace = true
 swagcod-core.workspace = true
 swagcod-provider.workspace = true
+glob.workspace = true
+# Фича 2: allow/deny из .swagcod/rules.json — те же regex, что core::rules
+# собирает для хода. Валидируем синтаксис до записи файла на диск.
+regex.workspace = true
 swagcod-pty.workspace = true
 swagcod-fsx.workspace = true
 dotenvy = "0.15"
@@ -58,3 +62,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
 ] }
+
+[dev-dependencies]
+tempfile = "3"

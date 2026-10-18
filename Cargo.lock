@@ -4683,7 +4683,9 @@ name = "swagcod-app"
 version = "0.2.0"
 dependencies = [
  "dotenvy",
+ "glob",
  "notify 8.2.0",
+ "regex",
  "rodio",
  "serde",
  "serde_json",
@@ -4698,6 +4700,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "windows-sys 0.59.0",
@@ -4708,12 +4711,14 @@ dependencies = [
 name = "swagcod-core"
 version = "0.2.0"
 dependencies = [
+ "glob",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
  "swagcod-provider",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]

@@ -118,6 +118,359 @@
     if (showSettings && !notifyLoaded) {
       void loadNotifyConfig()
     }
+    if (showSettings && !cleanupLoaded) {
+      void loadCleanupConfig()
+    }
+  })
+
+  /* ── Автоочистка: поля один в один с serde-структурой cleanup.rs.
+     Переименование на фронте означало бы тихий рассинхрон при сохранении. ── */
+  interface CleanupConfig {
+    max_sessions: number
+    max_age_days: number
+    max_log_size_mb: number
+    enabled: boolean
+    exempt_patterns: string[]
+    honor_folder_rules: boolean
+    cleanup_empty_dirs: boolean
+  }
+  interface CleanupReport {
+    sessions_deleted: number
+    sessions_exempted: number
+    logs_truncated: number
+    dirs_removed: number
+    space_freed_bytes: number
+    emptied_dirs: string[]
+  }
+  /* ── Правила папок: DTO из core::folder_rules и app::lib. ── */
+  interface FolderRuleDto { pattern: string; rules: string[]; priority: number }
+  interface FolderRulesConfig {
+    allow: string[]
+    deny: string[]
+    disabled_mcp: string[]
+    disabled_plugins: string[]
+    disabled_skills: string[]
+    system_prompt_append: string | null
+    session_ttl_secs: number | null
+    exempt_from_cleanup: boolean
+  }
+  interface ResolvedRulesDto {
+    prompt_lines: string[]
+    allow: string[]
+    deny: string[]
+    disabled_mcp: string[]
+    disabled_plugins: string[]
+    disabled_skills: string[]
+    system_prompt_append: string
+    session_ttl_secs: number | null
+    exempt_from_cleanup: boolean
+    sources: string[]
+  }
+  interface FolderRulesView {
+    cwd: string
+    own: FolderRulesConfig
+    own_file: string | null
+    resolved: ResolvedRulesDto
+  }
+  interface SkillSummary { name: string; description: string; placeholders: string[]; defaults: Record<string, string> }
+
+  type CleanupNumKey = 'max_sessions' | 'max_age_days' | 'max_log_size_mb'
+  type CleanupBoolKey = 'enabled' | 'honor_folder_rules' | 'cleanup_empty_dirs'
+
+  /* Три предела устроены одинаково, поэтому ряды собираются из описания:
+     подпись не может разъехаться с полем, а правка текста одна на все три. */
+  const CLEANUP_FIELDS = [
+    { key: 'max_sessions', title: 'Keep sessions', desc: 'Newest N sessions stay, older ones are deleted', min: 1 },
+    { key: 'max_age_days', title: 'Max age, days', desc: 'Sessions older than this are deleted', min: 1 },
+    { key: 'max_log_size_mb', title: 'Max log size, MB', desc: 'Bigger session logs are truncated to this size', min: 1 },
+  ] as const
+
+  /* Пять списков правил папки — тоже один each: отличаются только подписи. */
+  const DIR_LIST_FIELDS = [
+    { key: 'allow', title: 'Allow (regex)', desc: 'Matching calls run without an approval dialog' },
+    { key: 'deny', title: 'Deny (regex)', desc: 'Checked first: matching calls are blocked silently' },
+    { key: 'disabled_mcp', title: 'Disabled MCP', desc: 'MCP servers hidden in this folder' },
+    { key: 'disabled_plugins', title: 'Disabled plugins', desc: 'Plugins hidden in this folder' },
+    { key: 'disabled_skills', title: 'Disabled skills', desc: 'Skills hidden in this folder' },
+  ] as const
+
+  let cleanupCfg = $state<CleanupConfig>({
+    max_sessions: 100,
+    max_age_days: 90,
+    max_log_size_mb: 50,
+    enabled: true,
+    exempt_patterns: [],
+    honor_folder_rules: true,
+    cleanup_empty_dirs: false,
+  })
+  /* Паттерны живёт текстом: textarea держит строку, а в DTO список
+     собирается только на сохранении (приём CommandRules). */
+  let cleanupExempt = $state('')
+  let cleanupLoaded = $state(false)
+  let cleanupStatus = $state<string | null>(null)
+  let cleanupBusy = $state(false)
+  let cleanupTimer: ReturnType<typeof setTimeout> | null = null
+
+  function splitLines(text: string): string[] {
+    return text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
+  }
+
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+  }
+
+  async function loadCleanupConfig() {
+    try {
+      const cfg = await invoke<CleanupConfig>('get_cleanup_config')
+      cleanupCfg = cfg
+      cleanupExempt = cfg.exempt_patterns.join('\n')
+      cleanupLoaded = true
+    } catch (e) {
+      cleanupStatus = `Load failed: ${e}`
+    }
+  }
+
+  /* Свой таймер, а не общий saveTimer уведомлений: две секции сохраняются
+     независимо, и общий таймер отменял бы чужой pending-save. */
+  function scheduleCleanupSave() {
+    if (cleanupTimer) clearTimeout(cleanupTimer)
+    cleanupTimer = setTimeout(() => {
+      void saveCleanupConfig()
+    }, 500)
+  }
+
+  async function saveCleanupConfig() {
+    cleanupStatus = null
+    try {
+      cleanupCfg.exempt_patterns = splitLines(cleanupExempt)
+      await invoke('set_cleanup_config', { config: cleanupCfg })
+      cleanupStatus = 'Saved'
+      setTimeout(() => { if (cleanupStatus === 'Saved') cleanupStatus = null }, 1500)
+    } catch (e) {
+      cleanupStatus = `Save failed: ${e}`
+    }
+  }
+
+  function onCleanupToggle(field: CleanupBoolKey, val: boolean) {
+    cleanupCfg[field] = val
+    scheduleCleanupSave()
+  }
+
+  function onCleanupNumber(field: CleanupNumKey, val: number) {
+    // Пустое поле number-input даёт NaN: на бэк должен уйти валидный предел.
+    cleanupCfg[field] = Number.isFinite(val) ? Math.max(1, Math.round(val)) : 1
+    scheduleCleanupSave()
+  }
+
+  async function runCleanupNow() {
+    cleanupBusy = true
+    cleanupStatus = null
+    try {
+      const r = await invoke<CleanupReport>('run_cleanup_now')
+      cleanupStatus = `Deleted sessions: ${r.sessions_deleted}, spared by rules: ${r.sessions_exempted}, logs truncated: ${r.logs_truncated}, dirs removed: ${r.dirs_removed}, freed ${fmtBytes(r.space_freed_bytes)}`
+    } catch (e) {
+      cleanupStatus = `Run failed: ${e}`
+    } finally {
+      cleanupBusy = false
+    }
+  }
+
+  /* ── Глобальные glob-правила (~/.swagcod/folder_rules.json) ── */
+  /* Строка редактора держит текст правил, а не массив: bind на textarea
+     работает со строкой, список собирается при сохранении. */
+  interface RuleRow { id: number; pattern: string; text: string; priority: number }
+  let ruleSeq = 0
+  let ruleRows = $state<RuleRow[]>([])
+  let rulesLoaded = $state(false)
+  let rulesStatus = $state<string | null>(null)
+  let rulesTimer: ReturnType<typeof setTimeout> | null = null
+  let ruleTestId = $state<number | null>(null)
+  let ruleTestPath = $state('')
+  let ruleTestOut = $state<string | null>(null)
+
+  async function loadGlobalRules() {
+    try {
+      const list = await invoke<FolderRuleDto[]>('get_folder_rules')
+      ruleRows = list.map((r) => ({ id: ruleSeq++, pattern: r.pattern, text: r.rules.join('\n'), priority: r.priority }))
+      rulesLoaded = true
+    } catch (e) {
+      rulesStatus = `Load failed: ${e}`
+    }
+  }
+
+  function scheduleRulesSave() {
+    if (rulesTimer) clearTimeout(rulesTimer)
+    rulesTimer = setTimeout(() => {
+      void saveGlobalRules()
+    }, 500)
+  }
+
+  async function saveGlobalRules() {
+    rulesStatus = null
+    const rules: FolderRuleDto[] = ruleRows.map((r) => ({
+      pattern: r.pattern.trim(),
+      rules: splitLines(r.text),
+      priority: Number.isFinite(r.priority) ? Math.max(0, Math.round(r.priority)) : 0,
+    }))
+    try {
+      await invoke('set_folder_rules', { rules })
+      rulesStatus = 'Saved'
+      setTimeout(() => { if (rulesStatus === 'Saved') rulesStatus = null }, 1500)
+    } catch (e) {
+      // Бэк валидирует glob до записи: битый паттерн обязан быть виден.
+      rulesStatus = `Save failed: ${e}`
+    }
+  }
+
+  function addRuleRow() {
+    ruleRows.push({ id: ruleSeq++, pattern: '', text: '', priority: 0 })
+  }
+
+  function removeRuleRow(id: number) {
+    ruleRows = ruleRows.filter((r) => r.id !== id)
+    if (ruleTestId === id) ruleTestId = null
+    scheduleRulesSave()
+  }
+
+  function toggleRuleTest(id: number) {
+    ruleTestId = ruleTestId === id ? null : id
+    ruleTestPath = ''
+    ruleTestOut = null
+  }
+
+  async function testRuleRow(row: RuleRow) {
+    ruleTestOut = null
+    try {
+      const hit = await invoke<boolean>('test_folder_rule', { pattern: row.pattern, path: ruleTestPath })
+      ruleTestOut = hit ? 'matches' : 'no match'
+    } catch (e) {
+      ruleTestOut = `Test failed: ${e}`
+    }
+  }
+
+  /* ── Правила конкретной папки (.swagcod/rules.json) и предпросмотр ── */
+  let dirCwd = $state('')
+  let dirText = $state<Record<string, string>>({})
+  let dirAppend = $state('')
+  let dirTtl = $state('')
+  let dirExempt = $state(false)
+  let dirLoaded = $state(false)
+  let dirBusy = $state(false)
+  let dirStatus = $state<string | null>(null)
+  let dirView = $state<FolderRulesView | null>(null)
+  let dirSkills = $state<string[] | null>(null)
+
+  function emptyDirText(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const f of DIR_LIST_FIELDS) out[f.key] = ''
+    return out
+  }
+
+  function applyDirConfig(cfg: FolderRulesConfig) {
+    const text = emptyDirText()
+    for (const f of DIR_LIST_FIELDS) text[f.key] = cfg[f.key].join('\n')
+    dirText = text
+    dirAppend = cfg.system_prompt_append ?? ''
+    dirTtl = cfg.session_ttl_secs === null ? '' : String(cfg.session_ttl_secs)
+    dirExempt = cfg.exempt_from_cleanup
+  }
+
+  async function loadDirRules() {
+    const cwd = dirCwd.trim()
+    if (!cwd) { dirStatus = 'Enter a folder path first'; return }
+    dirBusy = true
+    dirStatus = null
+    try {
+      applyDirConfig(await invoke<FolderRulesConfig>('get_dir_rules', { cwd }))
+      dirLoaded = true
+    } catch (e) {
+      dirStatus = `Load failed: ${e}`
+    } finally {
+      dirBusy = false
+    }
+  }
+
+  async function saveDirRules() {
+    const cwd = dirCwd.trim()
+    if (!cwd) { dirStatus = 'Enter a folder path first'; return }
+    const raw = dirTtl.trim()
+    const ttl = raw === '' ? null : Number(raw)
+    if (ttl !== null && (!Number.isFinite(ttl) || ttl < 0)) { dirStatus = 'TTL must be a non-negative number of seconds'; return }
+    const config: FolderRulesConfig = {
+      allow: splitLines(dirText.allow ?? ''),
+      deny: splitLines(dirText.deny ?? ''),
+      disabled_mcp: splitLines(dirText.disabled_mcp ?? ''),
+      disabled_plugins: splitLines(dirText.disabled_plugins ?? ''),
+      disabled_skills: splitLines(dirText.disabled_skills ?? ''),
+      // Пустая строка уходит как null: бэк различает «добавки нет» и «добавка пустая».
+      system_prompt_append: dirAppend.trim() === '' ? null : dirAppend,
+      session_ttl_secs: ttl === null ? null : Math.round(ttl),
+      exempt_from_cleanup: dirExempt,
+    }
+    dirBusy = true
+    dirStatus = null
+    try {
+      await invoke('set_dir_rules', { cwd, config })
+      dirStatus = 'Saved'
+      setTimeout(() => { if (dirStatus === 'Saved') dirStatus = null }, 1500)
+    } catch (e) {
+      // Бэк собирает каждый regex из allow/deny: ошибка синтаксиса должна быть видна.
+      dirStatus = `Save failed: ${e}`
+    } finally {
+      dirBusy = false
+    }
+  }
+
+  async function previewDirRules() {
+    const cwd = dirCwd.trim()
+    if (!cwd) { dirStatus = 'Enter a folder path first'; return }
+    dirBusy = true
+    dirStatus = null
+    try {
+      dirView = await invoke<FolderRulesView>('resolve_dir_rules', { cwd })
+      // Скиллы сразу отфильтрованы правилами этой папки — видно, что останется.
+      dirSkills = (await invoke<SkillSummary[]>('get_skills_list_for', { cwd })).map((s) => s.name)
+    } catch (e) {
+      dirStatus = `Preview failed: ${e}`
+    } finally {
+      dirBusy = false
+    }
+  }
+
+  function resolvedEmpty(v: FolderRulesView): boolean {
+    const r = v.resolved
+    return (
+      r.prompt_lines.length === 0 && r.allow.length === 0 && r.deny.length === 0 &&
+      r.disabled_mcp.length === 0 && r.disabled_plugins.length === 0 && r.disabled_skills.length === 0 &&
+      r.system_prompt_append.trim() === '' && r.session_ttl_secs === null && !r.exempt_from_cleanup
+    )
+  }
+
+  /** Непустые списки резолва парами «имя + значения» — вместо пяти копий разметки. */
+  function resolvedLists(r: ResolvedRulesDto): { label: string; items: string[] }[] {
+    return [
+      { label: 'allow', items: r.allow },
+      { label: 'deny', items: r.deny },
+      { label: 'disabled_mcp', items: r.disabled_mcp },
+      { label: 'disabled_plugins', items: r.disabled_plugins },
+      { label: 'disabled_skills', items: r.disabled_skills },
+    ].filter((g) => g.items.length > 0)
+  }
+
+  /* Ленивая загрузка: правила папок нужны только на вкладке security, а путь
+     подставляем из текущей сессии — руками его вбивать незачем. */
+  $effect(() => {
+    if (showSettings && settingsTab === 'security') {
+      if (!rulesLoaded) {
+        void loadGlobalRules()
+      }
+      if (sessionCwd && !dirCwd && !dirLoaded) {
+        dirCwd = sessionCwd
+      }
+    }
   })
 
   /* ── Типы, которые нужны и окну, и App: объявлены здесь и экспортируются
@@ -248,6 +601,8 @@
     hooksError: string | null
     saveHooks: (raw: string) => Promise<void>
     currentSession: string | null
+    /* Рабочая папка текущей сессии: из неё берётся cwd для правил папки. */
+    sessionCwd: string | null
     dshImportBusy: boolean
     dshImportNote: string
     runDshImport: () => Promise<void>
@@ -385,6 +740,7 @@
     hooksError,
     saveHooks,
     currentSession,
+    sessionCwd = null,
     dshImportBusy,
     dshImportNote,
     runDshImport,
@@ -792,6 +1148,76 @@
                   </div>
                 </div>
               {/each}
+
+              <!-- ── Maintenance subsection ── -->
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Maintenance</span>
+                  <span class="label-desc">{cleanupStatus ?? (cleanupLoaded ? 'Auto-cleanup of stale sessions and oversized logs' : 'Loading...')}</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" checked={cleanupCfg.enabled} onchange={(e) => onCleanupToggle('enabled', e.currentTarget.checked)} />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              {#each CLEANUP_FIELDS as f (f.key)}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{f.title}</span>
+                    <span class="label-desc">{f.desc}</span>
+                  </div>
+                  <input
+                    type="number"
+                    class="settings-number"
+                    min={f.min}
+                    value={cleanupCfg[f.key]}
+                    onchange={(e) => onCleanupNumber(f.key, Number(e.currentTarget.value))}
+                    aria-label={f.title}
+                  />
+                </div>
+              {/each}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Honor folder rules</span>
+                  <span class="label-desc">A folder's .swagcod/rules.json may set its own session TTL or exempt the folder from cleanup</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" checked={cleanupCfg.honor_folder_rules} onchange={(e) => onCleanupToggle('honor_folder_rules', e.currentTarget.checked)} />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Remove emptied work folders</span>
+                  <span class="label-desc">Only completely empty directories go; a folder survives while .swagcod/ holds foreign files - an owner's MEMORY.md keeps it</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" checked={cleanupCfg.cleanup_empty_dirs} onchange={(e) => onCleanupToggle('cleanup_empty_dirs', e.currentTarget.checked)} />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row rules-row">
+                <div class="settings-label">
+                  <span class="label-title">Exempt patterns</span>
+                  <span class="label-desc">One glob per line, matched against the session work folder</span>
+                </div>
+                <textarea
+                  class="settings-area"
+                  rows="3"
+                  spellcheck="false"
+                  placeholder="D:\work\**"
+                  aria-label="Exempt patterns"
+                  bind:value={cleanupExempt}
+                  onchange={() => scheduleCleanupSave()}
+                ></textarea>
+              </div>
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Run cleanup</span>
+                  <span class="label-desc">{cleanupBusy ? 'Running...' : 'Apply these limits now and report what was freed'}</span>
+                </div>
+                <button class="appearance-btn" disabled={cleanupBusy} onclick={() => void runCleanupNow()}>Run now</button>
+              </div>
             </div>
           {:else if settingsTab === 'security'}
             <div class="settings-section">
@@ -941,6 +1367,168 @@
                     </table>
                   </div>
                 {/if}
+              {/if}
+
+              <!-- ── Folder rules subsection ── -->
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Global folder rules</span>
+                  <span class="label-desc">{rulesStatus ?? (rulesLoaded ? 'Glob patterns from ~/.swagcod/folder_rules.json, matched against the work folder' : 'Loading...')}</span>
+                </div>
+                <button class="step-btn" onclick={addRuleRow} aria-label="add rule">+</button>
+              </div>
+              {#each ruleRows as row (row.id)}
+                <div class="settings-row rules-row">
+                  <div class="rules-grid">
+                    <label class="settings-label">
+                      <span class="label-desc">Glob pattern</span>
+                      <input
+                        class="settings-number rules-input"
+                        bind:value={row.pattern}
+                        onchange={() => scheduleRulesSave()}
+                        placeholder="D:\work\**"
+                        aria-label="Glob pattern"
+                      />
+                    </label>
+                    <label class="settings-label">
+                      <span class="label-desc">Priority (higher is applied on top)</span>
+                      <input
+                        type="number"
+                        class="settings-number rules-input"
+                        min="0"
+                        value={row.priority}
+                        onchange={(e) => { row.priority = Math.max(0, Math.round(Number(e.currentTarget.value) || 0)); scheduleRulesSave() }}
+                        aria-label="Priority"
+                      />
+                    </label>
+                  </div>
+                  <label class="settings-label">
+                    <span class="label-desc">Rule lines injected into the prompt, one per line</span>
+                    <textarea
+                      class="settings-area"
+                      rows="3"
+                      spellcheck="false"
+                      bind:value={row.text}
+                      onchange={() => scheduleRulesSave()}
+                      aria-label="Rule lines"
+                    ></textarea>
+                  </label>
+                  <div class="notify-controls">
+                    <button class="step-btn text-btn" onclick={() => toggleRuleTest(row.id)}>Test</button>
+                    <button class="step-btn" onclick={() => removeRuleRow(row.id)} aria-label="remove rule">x</button>
+                  </div>
+                  {#if ruleTestId === row.id}
+                    <div class="notify-controls">
+                      <input
+                        class="settings-number rules-input"
+                        style="width:280px"
+                        bind:value={ruleTestPath}
+                        placeholder="path to check"
+                        aria-label="Path to test"
+                      />
+                      <button class="step-btn text-btn" disabled={!ruleTestPath.trim()} onclick={() => void testRuleRow(row)}>Match</button>
+                      {#if ruleTestOut}<span class="label-desc">{ruleTestOut}</span>{/if}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">Folder rules</span>
+                  <span class="label-desc">{dirStatus ?? 'What this working folder keeps in its own .swagcod/rules.json'}</span>
+                </div>
+                <div class="notify-controls">
+                  <input
+                    class="settings-number rules-input"
+                    style="width:300px"
+                    bind:value={dirCwd}
+                    placeholder={sessionCwd ?? 'folder path'}
+                    aria-label="Folder path"
+                  />
+                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void loadDirRules()}>Load</button>
+                  <button class="appearance-btn" disabled={dirBusy || !dirLoaded} onclick={() => void saveDirRules()}>Save</button>
+                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void previewDirRules()}>Preview</button>
+                </div>
+              </div>
+              {#if dirLoaded}
+                <div class="settings-row rules-row">
+                  <div class="rules-grid">
+                    {#each DIR_LIST_FIELDS as f (f.key)}
+                      <label class="settings-label">
+                        <span class="label-title">{f.title}</span>
+                        <span class="label-desc">{f.desc}</span>
+                        <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirText[f.key]} aria-label={f.title}></textarea>
+                      </label>
+                    {/each}
+                  </div>
+                  <label class="settings-label">
+                    <span class="label-title">System prompt append</span>
+                    <span class="label-desc">Added to the system prompt of sessions started in this folder; empty clears it</span>
+                    <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirAppend} aria-label="System prompt append"></textarea>
+                  </label>
+                  <div class="settings-row">
+                    <div class="settings-label">
+                      <span class="label-title">Session TTL, seconds</span>
+                      <span class="label-desc">How long cleanup keeps sessions of this folder; empty means the global limit</span>
+                    </div>
+                    <input
+                      type="number"
+                      class="settings-number"
+                      min="0"
+                      style="width:120px"
+                      value={dirTtl}
+                      onchange={(e) => (dirTtl = e.currentTarget.value)}
+                      placeholder="global"
+                      aria-label="Session TTL in seconds"
+                    />
+                  </div>
+                  <div class="settings-row">
+                    <div class="settings-label">
+                      <span class="label-title">Exempt from cleanup</span>
+                      <span class="label-desc">Sessions of this folder are never deleted</span>
+                    </div>
+                    <label class="toggle-switch">
+                      <input type="checkbox" bind:checked={dirExempt} />
+                      <span class="toggle-slider"></span>
+                    </label>
+                  </div>
+                </div>
+              {/if}
+              {#if dirView}
+                <div class="settings-row rules-row">
+                  <div class="settings-label">
+                    <span class="label-title">Resolved for {dirView.cwd}</span>
+                    <span class="label-desc">{dirView.own_file ?? 'no rules file in this folder'}</span>
+                  </div>
+                  {#if resolvedEmpty(dirView)}
+                    <div class="settings-label">
+                      <span class="label-desc">No rules for this folder: turns run as usual</span>
+                    </div>
+                  {:else}
+                    <div class="settings-label">
+                      {#each resolvedLists(dirView.resolved) as g (g.label)}
+                        <span class="label-desc"><span class="chip">{g.label}</span> {g.items.join(', ')}</span>
+                      {/each}
+                      {#if dirView.resolved.prompt_lines.length > 0}
+                        <span class="label-desc"><span class="chip">prompt_lines</span> {dirView.resolved.prompt_lines.join(' | ')}</span>
+                      {/if}
+                      {#if dirView.resolved.system_prompt_append}
+                        <span class="label-desc"><span class="chip">system_prompt_append</span> {dirView.resolved.system_prompt_append}</span>
+                      {/if}
+                      <span class="label-desc">
+                        <span class="chip">session_ttl_secs</span> {dirView.resolved.session_ttl_secs ?? 'global'}
+                        <span class="chip">exempt_from_cleanup</span> {dirView.resolved.exempt_from_cleanup ? 'yes' : 'no'}
+                      </span>
+                      {#if dirSkills}
+                        <span class="label-desc"><span class="chip">skills visible</span> {dirSkills.length > 0 ? dirSkills.join(', ') : 'none'}</span>
+                      {/if}
+                      <span class="label-desc"><span class="chip">sources</span></span>
+                      {#each dirView.resolved.sources as s, i (`src-${i}`)}
+                        <span class="label-desc">{s}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
               {/if}
             </div>
           {:else if settingsTab === 'models'}
@@ -2306,6 +2894,43 @@
 
 .notify-vol-range {
     width: 100px;
+  }
+
+/* ── Maintenance / folder rules subsections ── */
+.settings-area {
+    width: 100%;
+    min-height: 56px;
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    padding: 6px 8px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+.settings-area:focus {
+    border-color: var(--accent);
+  }
+
+/* Списковые поля правил идут парами в ряд: у glob-правила паттерн и
+   приоритет, у папки — allow рядом с deny. */
+.rules-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    width: 100%;
+  }
+
+/* .settings-number узкий и центрирует текст, а полям правил нужны левый
+   край и вся ширина колонки. */
+.rules-input {
+    width: 100%;
+    text-align: left;
   }
 
 </style>

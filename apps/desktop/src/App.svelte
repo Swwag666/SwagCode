@@ -2279,6 +2279,9 @@
   {hooksError}
   {saveHooks}
   {currentSession}
+  /* cwd текущей сессии: тот же filesRoot, что и у панели Files, — правилами
+     папки правят для той директории, где реально идёт ход. */
+  sessionCwd={filesRoot || null}
   {dshImportBusy}
   {dshImportNote}
   {runDshImport}

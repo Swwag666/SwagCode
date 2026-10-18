@@ -359,6 +359,22 @@ END;
 /// [`SqliteStore`] (встроенный rusqlite, если Node нет). Выбор — через
 /// фабрики [`open`]/[`open_memory`]. Send обязателен: состояние приложения
 /// носит трейт-объект за Mutex между потоками.
+/// Минимальный снимок сессии для задач, которым не нужно её содержимое.
+///
+/// Автоочистка решает «удалить или нет» по трём полям: id, рабочая папка и
+/// время создания. [`Store::load_all`] для этого не годится — он через
+/// `fill_session` поднимает ВЕСЬ текст ходов и сообщений каждой сессии, то есть
+/// на живой базе (46 МБ, 71 сессия, 6337 сообщений — замер D-193) стартовая
+/// уборка прочитала бы всю историю в память и съела бюджет старта 400 мс
+/// (D-013). Это тот же принцип, что D-121 для сайдбара: тяжёлое содержимое
+/// грузится лениво и только тем, кому оно правда нужно.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStub {
+    pub id: String,
+    pub cwd: String,
+    pub created_ms: u64,
+}
+
 pub trait Store: Send {
     fn create_session(&self, s: &Session) -> StoreResult<()>;
     fn set_session_title(&self, id: &str, title: &str) -> StoreResult<()>;
@@ -367,6 +383,10 @@ pub trait Store: Send {
     fn delete_session(&self, id: &str) -> StoreResult<()>;
     /// Все сессии с историей и ходами, в порядке создания.
     fn load_all(&self) -> StoreResult<Vec<Session>>;
+    /// Все сессии БЕЗ истории и ходов, в порядке создания — тот же порядок,
+    /// что у [`Store::load_all`]. Один SELECT, никакой десериализации
+    /// содержимого; для автоочистки и подобных списочных задач.
+    fn session_stubs(&self) -> StoreResult<Vec<SessionStub>>;
     fn load_session(&self, id: &str) -> StoreResult<Option<Session>>;
     /// Ход плюс снимок истории пишутся одной транзакцией.
     fn save_turn(
@@ -667,6 +687,22 @@ impl Store for SqliteStore {
             out.push(ses);
         }
         Ok(out)
+    }
+
+    fn session_stubs(&self) -> StoreResult<Vec<SessionStub>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, cwd, created_ms FROM sessions ORDER BY created_ms, id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SessionStub {
+                    id: r.get(0)?,
+                    cwd: r.get(1)?,
+                    created_ms: r.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn load_session(&self, id: &str) -> StoreResult<Option<Session>> {
@@ -1392,6 +1428,61 @@ mod tests {
             .unwrap();
         assert_eq!(turns, 0);
         assert_eq!(msgs, 0);
+    }
+
+    /// Лёгкий снимок для автоочистки: тот же порядок и те же поля, что даёт
+    /// `load_all`, но без ходов и сообщений. Порядок сверяется с `load_all`
+    /// попарно, потому что «самые старые» в лимите `max_sessions` определён
+    /// именно этим ORDER BY, и расхождение молча резало бы не те сессии.
+    #[test]
+    fn session_stubs_match_load_all_order_without_payload() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = sample_session();
+        let mut b = Session::new(SessionId::new("s-2"), "D:/other", "test-model");
+        b.created_ms = a.created_ms + 5;
+        let mut c = Session::new(SessionId::new("s-3"), "D:/third", "test-model");
+        c.created_ms = a.created_ms + 1;
+        store.create_session(&a).unwrap();
+        store.create_session(&b).unwrap();
+        store.create_session(&c).unwrap();
+        // Тяжёлое содержимое: снимок обязан его не тащить, но и не терять.
+        store
+            .save_turn(a.id.as_str(), &sample_turn(1), &a.history)
+            .unwrap();
+
+        let stubs = store.session_stubs().unwrap();
+        let all = store.load_all().unwrap();
+        assert_eq!(stubs.len(), 3);
+        assert_eq!(all.len(), 3);
+        for (stub, full) in stubs.iter().zip(all.iter()) {
+            assert_eq!(stub.id, full.id.as_str());
+            assert_eq!(stub.cwd, full.cwd);
+            assert_eq!(stub.created_ms, full.created_ms);
+        }
+        assert_eq!(
+            stubs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-1", "s-3", "s-2"],
+            "порядок created_ms asc"
+        );
+        // Снимок не несёт содержимого — проверять нечего, но полный ход
+        // при этом остаётся в базе и доступен тому, кому он нужен.
+        assert!(!all[0].turns.is_empty());
+
+        store.delete_session("s-3").unwrap();
+        let stubs = store.session_stubs().unwrap();
+        assert_eq!(stubs.len(), 2);
+        assert_eq!(
+            stubs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-1", "s-2"]
+        );
+    }
+
+    /// Пустая база — пустой снимок, а не ошибка: первый запуск приложения
+    /// проходит уборку до того, как появилась хотя бы одна сессия.
+    #[test]
+    fn session_stubs_on_empty_store() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(store.session_stubs().unwrap().is_empty());
     }
 
     #[test]

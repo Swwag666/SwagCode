@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+pub mod cleanup;
 pub mod crashlog;
 pub mod dpapi;
 pub mod dsh_import;
@@ -111,8 +112,11 @@ pub struct AppState {
     /// Флаг фокуса окна для suppress_when_focused.
     pub window_focused: Arc<std::sync::atomic::AtomicBool>,
     /// Скиллы: markdown-шаблоны с YAML-frontmatter, hot-reload из
-    /// ~/.swagcod/skills/. std-мьютекс: операции чтения/записи миллисекундные.
+    /// ~/.swagcod/skills/. std-мьютекс: операции чтения/записи миллисекунтные.
     pub skills: std::sync::Mutex<swagcod_core::skills::SkillRegistry>,
+    /// Folder-scoped rules: glob-паттерны → правила для инъекции в контекст
+    /// модели. Hot-reload через watcher. std-мьютекс: чтение/запись быстрые.
+    pub folder_rules: std::sync::Mutex<swagcod_core::folder_rules::FolderRulesCache>,
 }
 
 /// D-121: лёгкий снимок сессии — то, что нужно сайдбару, без мегабайтов
@@ -239,6 +243,11 @@ impl Default for AppState {
                         swagcod_core::skills::default_skills_dir(),
                     )
                 }),
+            ),
+            folder_rules: std::sync::Mutex::new(
+                swagcod_core::folder_rules::FolderRulesCache::load(
+                    &swagcod_core::folder_rules::default_rules_path(),
+                ),
             ),
         }
     }
@@ -2673,13 +2682,41 @@ fn pref_rule_lines(
 }
 
 /// Собрать списки хода из store.
+///
+/// Ход с Фичи 2 собирает правила сам — из строк [`command_rule_lines`],
+/// дополненных allow/deny рабочей папки, поэтому здесь функция нужна только
+/// тестам: они проверяют чтение prefs и дефолты в собранном виде.
+#[cfg(test)]
 pub(crate) fn load_command_rules(
     store: &dyn swagcod_core::store::Store,
 ) -> swagcod_core::rules::CommandRules {
-    use swagcod_core::rules::{CommandRules, DEFAULT_ALLOW, DEFAULT_DENY};
-    CommandRules::from_lines(
+    let (allow, deny) = command_rule_lines(store);
+    swagcod_core::rules::CommandRules::from_lines(allow, deny)
+}
+
+/// Строки allow/deny хода без компиляции в regex.
+///
+/// Фича 2: folder-rules рабочей папки дополняют эти списки, поэтому ход
+/// забирает именно строки и собирает [`swagcod_core::rules::CommandRules`]
+/// уже после слияния — собрать дважды и «склеить» нельзя, поля `CommandRules`
+/// приватные и обратно в строки не отдаются.
+pub(crate) fn command_rule_lines(
+    store: &dyn swagcod_core::store::Store,
+) -> (Vec<String>, Vec<String>) {
+    use swagcod_core::rules::{DEFAULT_ALLOW, DEFAULT_DENY};
+    (
         pref_rule_lines(store, CMD_ALLOW_PREF, DEFAULT_ALLOW),
         pref_rule_lines(store, CMD_DENY_PREF, DEFAULT_DENY),
+    )
+}
+
+/// Дефолтные строки правил, когда store недоступен. Отравленный мьютекс не
+/// должен снимать запреты: возвращается ровно то, что вернули бы дефолты F-3.
+pub(crate) fn default_rule_lines() -> (Vec<String>, Vec<String>) {
+    use swagcod_core::rules::{DEFAULT_ALLOW, DEFAULT_DENY};
+    (
+        DEFAULT_ALLOW.iter().map(|s| (*s).to_string()).collect(),
+        DEFAULT_DENY.iter().map(|s| (*s).to_string()).collect(),
     )
 }
 
@@ -4244,6 +4281,42 @@ pub fn run() {
                 let st = state.clone();
                 tauri::async_runtime::spawn(tasks_worker(st));
             }
+            /* Auto-cleanup при старте: удаляем старые сессии, обрезаем логи и
+            сносим опустевшие рабочие папки (если включено). Синхронный,
+            быстрый (SQLite + обход дерева правил), не блокирует event loop
+            надолго. Порядок захвата мьютексов — store, затем folder_rules;
+            он же в cleanup_worker и единственный в приложении. */
+            {
+                if let Ok(store) = state.store.lock() {
+                    let cfg = cleanup::load_config(store.as_ref());
+                    if cfg.enabled {
+                        if let Ok(mut rules) = state.folder_rules.lock() {
+                            let report = cleanup::run_cleanup(&cfg, store.as_ref(), &mut rules);
+                            if report.sessions_deleted > 0
+                                || report.logs_truncated > 0
+                                || report.dirs_removed > 0
+                            {
+                                eprintln!(
+                                    "cleanup: удалено сессий {}, обрезано логов {}, папок {}, \
+                                     освобождено {} байт, пощажено правилами {}",
+                                    report.sessions_deleted,
+                                    report.logs_truncated,
+                                    report.dirs_removed,
+                                    report.space_freed_bytes,
+                                    report.sessions_exempted
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            /* Фоновая очистка: долгое приложение не должно копить мёртвые
+            сессии до следующего перезапуска. Первый тик сразу, дальше раз в
+            cleanup::period_secs(). */
+            {
+                let st = state.clone();
+                tauri::async_runtime::spawn(cleanup::cleanup_worker(st));
+            }
             /* E-8: сэмплер телеметрии — точка раз в минуту с первого тика
             (interval стартует сразу), хранение 30 дней. */
             {
@@ -4273,13 +4346,23 @@ pub fn run() {
             // B-8: watchdog живых ходов.
             spawn_watchdog(state.clone());
 
-            // Hot-reload: watcher за MCP-конфигами, JS-плагинами и скиллами.
+            // Hot-reload: watcher за MCP-конфигами, JS-плагинами, скиллами
+            // и folder-rules.
             {
                 let st = state.clone();
                 let skills_dir = swagcod_core::skills::default_skills_dir();
                 let plugins_dir = jsplugins::plugins_dir();
+                let swagcod_dir = swagcod_core::folder_rules::default_rules_path()
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| {
+                        let base = std::env::var("USERPROFILE")
+                            .or_else(|_| std::env::var("HOME"))
+                            .unwrap_or_else(|_| ".".to_string());
+                        std::path::PathBuf::from(base).join(".swagcod")
+                    });
                 tauri::async_runtime::spawn(async move {
-                    let watch_dirs = vec![skills_dir, plugins_dir];
+                    let watch_dirs = vec![skills_dir, plugins_dir, swagcod_dir];
                     match hot_reload::HotReloadCoordinator::new(watch_dirs) {
                         Ok(coord) => coord.run(st).await,
                         Err(e) => eprintln!("hot-reload: не запустился: {e}"),
@@ -4372,12 +4455,252 @@ pub fn run() {
             update_check,
             update_install,
             restart_app,
+            get_folder_rules,
+            set_folder_rules,
+            test_folder_rule,
+            get_dir_rules,
+            set_dir_rules,
+            resolve_dir_rules,
+            get_skills_list_for,
+            get_cleanup_config,
+            set_cleanup_config,
+            run_cleanup_now,
             get_notification_config,
             set_notification_config,
             test_notification,
         ])
         .run(tauri::generate_context!())
         .expect("не удалось запустить SwagCod");
+}
+
+/* ── Auto-cleanup: команды для UI ────────────────────────────────────────────
+ * Конфигурация и ручной запуск очистки. Автозапуск — в setup при старте. */
+
+#[tauri::command]
+fn get_cleanup_config(state: State<'_, Arc<AppState>>) -> Result<cleanup::CleanupConfig, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    Ok(cleanup::load_config(store.as_ref()))
+}
+
+#[tauri::command]
+fn set_cleanup_config(
+    state: State<'_, Arc<AppState>>,
+    config: cleanup::CleanupConfig,
+) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    cleanup::save_config(store.as_ref(), &config)
+}
+
+#[tauri::command]
+fn run_cleanup_now(state: State<'_, Arc<AppState>>) -> Result<cleanup::CleanupReport, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let config = cleanup::load_config(store.as_ref());
+    // Порядок захвата тот же, что в startup-прогоне и в cleanup_worker.
+    let mut rules = state.folder_rules.lock().map_err(|e| e.to_string())?;
+    Ok(cleanup::run_cleanup(&config, store.as_ref(), &mut rules))
+}
+
+/* ── Folder-scoped rules: команды для UI ─────────────────────────────────────
+ * Чтение/запись правил и тестирование паттерна. Правила хранятся в
+ * ~/.swagcod/folder_rules.json, hot-reload через watcher. */
+
+#[tauri::command]
+fn get_folder_rules(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<swagcod_core::folder_rules::FolderRule>, String> {
+    let cache = state.folder_rules.lock().map_err(|e| e.to_string())?;
+    Ok(cache.rules.clone())
+}
+
+#[tauri::command]
+fn set_folder_rules(
+    state: State<'_, Arc<AppState>>,
+    rules: Vec<swagcod_core::folder_rules::FolderRule>,
+) -> Result<(), String> {
+    // Валидация паттернов до записи.
+    for r in &rules {
+        glob::Pattern::new(&r.pattern)
+            .map_err(|e| format!("битый паттерн {:?}: {e}", r.pattern))?;
+    }
+    let path = swagcod_core::folder_rules::default_rules_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&rules).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &json).map_err(|e| format!("запись: {e}"))?;
+    // Обновляем кэш in-memory.
+    let mut cache = state.folder_rules.lock().map_err(|e| e.to_string())?;
+    *cache = swagcod_core::folder_rules::FolderRulesCache::from_rules(rules, path);
+    Ok(())
+}
+
+#[tauri::command]
+fn test_folder_rule(
+    _state: State<'_, Arc<AppState>>,
+    pattern: String,
+    path: String,
+) -> Result<bool, String> {
+    let pat = glob::Pattern::new(&pattern).map_err(|e| format!("битый паттерн: {e}"))?;
+    Ok(pat.matches(&path))
+}
+
+/// Состояние правил конкретной папки: что в её `.swagcod/rules.json` лежит и
+/// что в итоге применяется к сессии с этой рабочей папкой (с учётом всех
+/// предков и глобальных glob-правил). UI показывает обе половины — иначе
+/// владелец не поймёт, откуда взялся запрет из родительского каталога.
+#[derive(Serialize, Clone)]
+pub struct FolderRulesView {
+    /// Рабочая папка, для которой считали.
+    pub cwd: String,
+    /// Конфиг самой папки (дефолт, если файла нет).
+    pub own: swagcod_core::folder_rules::FolderRulesConfig,
+    /// Путь к файлу configs самой папки, если он существует.
+    pub own_file: Option<String>,
+    /// Итог слияния всего дерева.
+    pub resolved: ResolvedRulesDto,
+}
+
+/// `ResolvedFolderRules` для провода: источники строками, остальное как есть.
+#[derive(Serialize, Clone)]
+pub struct ResolvedRulesDto {
+    pub prompt_lines: Vec<String>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub disabled_mcp: Vec<String>,
+    pub disabled_plugins: Vec<String>,
+    pub disabled_skills: Vec<String>,
+    pub system_prompt_append: String,
+    pub session_ttl_secs: Option<u64>,
+    pub exempt_from_cleanup: bool,
+    pub sources: Vec<String>,
+}
+
+impl From<swagcod_core::folder_rules::ResolvedFolderRules> for ResolvedRulesDto {
+    fn from(r: swagcod_core::folder_rules::ResolvedFolderRules) -> Self {
+        Self {
+            prompt_lines: r.prompt_lines,
+            allow: r.allow,
+            deny: r.deny,
+            disabled_mcp: r.disabled_mcp,
+            disabled_plugins: r.disabled_plugins,
+            disabled_skills: r.disabled_skills,
+            system_prompt_append: r.system_prompt_append,
+            session_ttl_secs: r.session_ttl_secs,
+            exempt_from_cleanup: r.exempt_from_cleanup,
+            sources: r
+                .sources
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+}
+
+/// Файл правил папки: `.swagcod/rules.json`, либо `.swagcod/rules.md`, если
+/// JSON нет. Тот же приоритет, что в резолве хода.
+fn dir_rules_file(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    use swagcod_core::folder_rules::{RULES_JSON, RULES_MD, SWAGCOD_DIR};
+    let json = cwd.join(SWAGCOD_DIR).join(RULES_JSON);
+    if json.exists() {
+        return Some(json);
+    }
+    let md = cwd.join(SWAGCOD_DIR).join(RULES_MD);
+    if md.exists() {
+        return Some(md);
+    }
+    None
+}
+
+/// Прочитать конфиг конкретной папки (без обхода предков).
+#[tauri::command]
+fn get_dir_rules(cwd: String) -> Result<swagcod_core::folder_rules::FolderRulesConfig, String> {
+    let dir = std::path::PathBuf::from(&cwd);
+    if !dir.is_dir() {
+        return Err(format!("папка не найдена: {cwd}"));
+    }
+    let Some(file) = dir_rules_file(&dir) else {
+        return Ok(swagcod_core::folder_rules::FolderRulesConfig::default());
+    };
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("чтение {cwd}: {e}"))?;
+    if file.extension().and_then(|e| e.to_str()) == Some("md") {
+        return Ok(swagcod_core::folder_rules::FolderRulesConfig {
+            system_prompt_append: Some(text.trim().to_string()),
+            ..Default::default()
+        });
+    }
+    serde_json::from_str(&text).map_err(|e| format!("битый rules.json в {cwd}: {e}"))
+}
+
+/// Записать конфиг конкретной папки. Пишем именно `rules.json`: если рядом
+/// лежал `rules.md`, он остаётся на диске, но JSON приоритетнее — ровно как в
+/// резолве хода, так что расхождения между увиденным и применённым не будет.
+#[tauri::command]
+fn set_dir_rules(
+    cwd: String,
+    config: swagcod_core::folder_rules::FolderRulesConfig,
+) -> Result<(), String> {
+    use swagcod_core::folder_rules::{RULES_JSON, SWAGCOD_DIR};
+    let dir = std::path::PathBuf::from(&cwd);
+    if !dir.is_dir() {
+        return Err(format!("папка не найдена: {cwd}"));
+    }
+    for pat in config.allow.iter().chain(config.deny.iter()) {
+        // Allow/deny — regex (core::rules), а не glob: проверяем синтаксис
+        // сразу, чтобы ход не получил правило, которое не соберётся.
+        regex::Regex::new(pat).map_err(|e| format!("битый regex {pat:?}: {e}"))?;
+    }
+    let swag = dir.join(SWAGCOD_DIR);
+    std::fs::create_dir_all(&swag).map_err(|e| format!("mkdir {cwd}: {e}"))?;
+    let file = swag.join(RULES_JSON);
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&file, json).map_err(|e| format!("запись {}: {e}", file.display()))
+}
+
+/// Что применится к сессии с рабочей папкой `cwd` — предпросмотр для UI и
+/// способ проверить правила, не запуская ход.
+#[tauri::command]
+fn resolve_dir_rules(
+    state: State<'_, Arc<AppState>>,
+    cwd: String,
+) -> Result<FolderRulesView, String> {
+    let dir = std::path::PathBuf::from(&cwd);
+    if !dir.is_dir() {
+        return Err(format!("папка не найдена: {cwd}"));
+    }
+    let own = get_dir_rules(cwd.clone())?;
+    let own_file = dir_rules_file(&dir).map(|p| p.to_string_lossy().into_owned());
+    let mut cache = state.folder_rules.lock().map_err(|e| e.to_string())?;
+    let resolved = cache.resolve(&dir).into();
+    Ok(FolderRulesView {
+        cwd,
+        own,
+        own_file,
+        resolved,
+    })
+}
+
+/// Список скиллов с учётом правил папки: `cwd` не задан — полный список.
+#[tauri::command]
+fn get_skills_list_for(
+    state: State<'_, Arc<AppState>>,
+    cwd: Option<String>,
+) -> Result<Vec<swagcod_core::skills::SkillSummary>, String> {
+    let reg = state.skills.lock().map_err(|e| e.to_string())?;
+    let mut list = reg.list();
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        drop(reg);
+        let mut cache = state.folder_rules.lock().map_err(|e| e.to_string())?;
+        let resolved = cache.resolve(std::path::Path::new(&dir));
+        if !resolved.disabled_skills.is_empty() {
+            list.retain(|s| {
+                !resolved
+                    .disabled_skills
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&s.name))
+            });
+        }
+    }
+    Ok(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -6790,5 +7113,418 @@ rl.on('line', (l) => {
         );
         drop(g);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ── Фича 2: folder-scoped rules ────────────────────────────────────────
+     * Проверяем то, что ход действительно применяет: резолв дерева папок,
+     * фильтрацию плагинов и слияние allow/deny с prefs. UI-команды, которым
+     * нужен Tauri-State, здесь не дёргаем — под ними та же логика. */
+
+    use crate::turn_driver::{plugin_disabled, resolve_folder_rules};
+    use swagcod_core::folder_rules::{FolderRulesCache, FolderRulesConfig, ResolvedFolderRules};
+
+    /// AppState с кэшем правил, привязанным к временному файлу: дефолтный
+    /// конструктор смотрит в реальный домашний каталог, а тесту нужна
+    /// воспроизводимость.
+    fn state_with_rules(rules_file: &std::path::Path) -> AppState {
+        let state = AppState::default();
+        *state.folder_rules.lock().unwrap() =
+            FolderRulesCache::from_rules(Vec::new(), rules_file.to_path_buf());
+        state
+    }
+
+    /// Записать `.swagcod/rules.json` в папку.
+    fn write_dir_rules(dir: &std::path::Path, cfg: serde_json::Value) {
+        let d = dir.join(".swagcod");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("rules.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plugin_disabled_matches_short_and_full_names() {
+        let dis = vec!["shout".to_string(), "Weather".to_string()];
+        // Short-имя, полное имя с префиксом и другой регистр — всё глушится.
+        assert!(plugin_disabled(&dis, "shout"));
+        assert!(plugin_disabled(&dis, "js:shout"));
+        assert!(plugin_disabled(&dis, "weather"));
+        assert!(plugin_disabled(&dis, "js:WEATHER"));
+        // Чужой плагин не задет.
+        assert!(!plugin_disabled(&dis, "js:calc"));
+        assert!(!plugin_disabled(&dis, "calculator"));
+        // Пустой список не глушит ничего.
+        assert!(!plugin_disabled(&[], "js:shout"));
+    }
+
+    /// Пустое имя плагина не должно совпасть с пустой строкой в правилах:
+    /// иначе одна опечатка в rules.json выключила бы все инструменты.
+    #[test]
+    fn plugin_disabled_ignores_empty_rule() {
+        assert!(!plugin_disabled(&["".to_string()], "js:shout"));
+        assert!(!plugin_disabled(&["  ".to_string()], "shout"));
+    }
+
+    #[test]
+    fn resolve_folder_rules_reads_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let proj = root.path().join("proj");
+        let leaf = proj.join("src");
+        std::fs::create_dir_all(&leaf).unwrap();
+        write_dir_rules(
+            root.path(),
+            serde_json::json!({"deny": ["^rm "], "system_prompt_append": "Корень."}),
+        );
+        write_dir_rules(
+            &proj,
+            serde_json::json!({
+                "disabled_mcp": ["danger-server"],
+                "disabled_plugins": ["shout"],
+                "system_prompt_append": "Проект."
+            }),
+        );
+
+        let state = state_with_rules(&root.path().join("folder_rules.json"));
+        let res = resolve_folder_rules(&state, &leaf);
+        assert_eq!(res.deny, vec!["^rm "]);
+        assert_eq!(res.disabled_mcp, vec!["danger-server"]);
+        assert_eq!(res.disabled_plugins, vec!["shout"]);
+        assert_eq!(res.system_prompt_append, "Корень.\nПроект.");
+        assert_eq!(res.sources.len(), 2);
+        assert!(!res.is_noop());
+    }
+
+    /// Папка без правил — ход идёт как до Фичи 2: пустой резолв, пустой промпт.
+    #[test]
+    fn resolve_folder_rules_without_files_is_noop() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_with_rules(&root.path().join("folder_rules.json"));
+        let res = resolve_folder_rules(&state, root.path());
+        assert!(res.is_noop());
+        assert!(res.prompt_text().is_empty());
+    }
+
+    /// Отравленный мьютекс кэша не роняет ход: возвращаются пустые правила.
+    /// Синхронизация явная — дочерний поток сообщает о захвате лока и только
+    /// потом паникует, так что гонки за мьютекс в тесте нет.
+    #[test]
+    fn resolve_folder_rules_survives_poisoned_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(state_with_rules(&root.path().join("folder_rules.json")));
+
+        let st = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let child = std::thread::spawn(move || {
+            let _guard = st.folder_rules.lock().unwrap();
+            tx.send(()).expect("сигнал о захвате лока");
+            panic!("намеренно травим мьютекс кэша правил");
+        });
+        rx.recv().expect("лок захвачен дочерним потоком");
+        // join вернёт Err: паника в потоке — ожидаемый исход, а не провал теста.
+        let _ = child.join();
+
+        assert!(state.folder_rules.is_poisoned());
+        let res = resolve_folder_rules(&state, root.path());
+        assert!(res.is_noop(), "отравленный кэш обязан дать пустые правила");
+    }
+
+    /// allow/deny папки дополняют prefs, а не заменяют их: дефолтные запреты
+    /// F-3 обязаны выжить, иначе rules.json в чужом репозитории снял бы защиту.
+    #[test]
+    fn folder_rules_extend_pref_command_rules() {
+        use swagcod_core::rules::{CommandRules, RuleVerdict};
+        let store = swagcod_core::store::open_memory();
+        let (mut allow, mut deny) = command_rule_lines(store.as_ref());
+        // Prefs пусты → строки дефолтов на месте.
+        let defaults = CommandRules::defaults();
+        assert_eq!(allow.len() + deny.len(), defaults.len());
+
+        let folder = ResolvedFolderRules {
+            allow: vec!["^cargo fmt$".into()],
+            deny: vec!["^git push --force".into()],
+            ..Default::default()
+        };
+        allow.extend(folder.allow.iter().cloned());
+        deny.extend(folder.deny.iter().cloned());
+        let rules = CommandRules::from_lines(allow, deny);
+
+        // Правило папки работает: deny сильнее политики.
+        assert!(matches!(
+            rules.verdict("git push --force origin main"),
+            RuleVerdict::Deny { .. }
+        ));
+        // Правило папки из allow пропускает команду без подтверждения.
+        assert!(matches!(
+            rules.verdict("cargo fmt"),
+            RuleVerdict::Allow { .. }
+        ));
+        // Дефолтные запреты не потеряны — ровно +2 правила к дефолтам.
+        assert_eq!(rules.len(), defaults.len() + 2);
+    }
+
+    /// Folder-rules проходят через тот же `CommandRules`, что и prefs, поэтому
+    /// трим строк у них одинаковый: движок правил один, расхождений быть не
+    /// должно. Проверяем на реальном вердикте, а не на тексте паттерна.
+    #[test]
+    fn folder_deny_verdict_matches_pref_semantics() {
+        use swagcod_core::rules::{CommandRules, RuleVerdict};
+        let folder_line = "^rm ".to_string();
+        let pref_line = "^rm ".to_string();
+
+        let from_folder = {
+            let res = ResolvedFolderRules {
+                deny: vec![folder_line],
+                ..Default::default()
+            };
+            CommandRules::from_lines(Vec::<String>::new(), res.deny)
+        };
+        let from_pref = CommandRules::from_lines(Vec::<String>::new(), [pref_line]);
+
+        for subject in ["rm -rf /tmp/x", "rmdir empty", "ls -la"] {
+            assert_eq!(
+                std::mem::discriminant(&from_folder.verdict(subject)),
+                std::mem::discriminant(&from_pref.verdict(subject)),
+                "расхождение вердикта для {subject:?}"
+            );
+        }
+        assert!(matches!(
+            from_folder.verdict("rm -rf /tmp/x"),
+            RuleVerdict::Deny { .. }
+        ));
+        assert!(matches!(from_folder.verdict("ls -la"), RuleVerdict::Pass));
+    }
+
+    /// Дефолтные строки совпадают с `CommandRules::defaults()`: fallback при
+    /// отравленном мьютексе store не снимает и не добавляет запретов.
+    #[test]
+    fn default_rule_lines_match_command_rules_defaults() {
+        let (allow, deny) = default_rule_lines();
+        let from_helper = swagcod_core::rules::CommandRules::from_lines(allow, deny);
+        let defaults = swagcod_core::rules::CommandRules::defaults();
+        assert_eq!(from_helper.len(), defaults.len());
+        assert!(!from_helper.is_empty());
+    }
+
+    #[test]
+    fn dir_rules_file_prefers_json_over_md() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        let swag = dir.join(".swagcod");
+        std::fs::create_dir_all(&swag).unwrap();
+
+        // Ничего нет.
+        assert!(dir_rules_file(&dir).is_none());
+
+        // Появился MD.
+        std::fs::write(swag.join("rules.md"), "правила текстом").unwrap();
+        assert_eq!(
+            dir_rules_file(&dir).unwrap().file_name().unwrap(),
+            "rules.md"
+        );
+
+        // JSON вытесняет MD, но MD остаётся на диске.
+        std::fs::write(swag.join("rules.json"), "{}").unwrap();
+        assert_eq!(
+            dir_rules_file(&dir).unwrap().file_name().unwrap(),
+            "rules.json"
+        );
+        assert!(swag.join("rules.md").exists());
+    }
+
+    #[test]
+    fn get_dir_rules_returns_default_when_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = get_dir_rules(dir.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(cfg, FolderRulesConfig::default());
+    }
+
+    #[test]
+    fn get_dir_rules_rejects_missing_folder() {
+        let err = get_dir_rules("Z:/точно/нет/такой/папки".into()).unwrap_err();
+        assert!(err.contains("папка не найдена"), "{err}");
+    }
+
+    #[test]
+    fn get_dir_rules_reads_md_as_prompt_append() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        let swag = dir.join(".swagcod");
+        std::fs::create_dir_all(&swag).unwrap();
+        std::fs::write(swag.join("rules.md"), "  Всегда гоняй fmt.  ").unwrap();
+        let cfg = get_dir_rules(dir.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            cfg.system_prompt_append.as_deref(),
+            Some("Всегда гоняй fmt.")
+        );
+    }
+
+    #[test]
+    fn set_dir_rules_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        let cfg = FolderRulesConfig {
+            allow: vec!["^cargo test$".into()],
+            deny: vec!["^rm ".into()],
+            disabled_mcp: vec!["fs-server".into()],
+            disabled_plugins: vec!["shout".into()],
+            disabled_skills: vec!["deploy".into()],
+            system_prompt_append: Some("Держи стиль.".into()),
+            session_ttl_secs: Some(3600),
+            exempt_from_cleanup: true,
+        };
+        set_dir_rules(cwd.clone(), cfg.clone()).unwrap();
+
+        // Каталог создан, файл на месте.
+        assert!(dir.join(".swagcod").join("rules.json").exists());
+        assert_eq!(get_dir_rules(cwd.clone()).unwrap(), cfg);
+
+        // Запись поверх — без дублей и без потери полей.
+        let cfg2 = FolderRulesConfig {
+            deny: vec!["^git push$".into()],
+            ..Default::default()
+        };
+        set_dir_rules(cwd.clone(), cfg2.clone()).unwrap();
+        assert_eq!(get_dir_rules(cwd).unwrap(), cfg2);
+    }
+
+    /// Битый regex в allow/deny отклоняется ДО записи: ход не должен получить
+    /// правило, которое core::rules не соберёт.
+    #[test]
+    fn set_dir_rules_rejects_broken_regex() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        let bad = FolderRulesConfig {
+            deny: vec!["[незакрытая".into()],
+            ..Default::default()
+        };
+        let err = set_dir_rules(cwd.clone(), bad).unwrap_err();
+        assert!(err.contains("битый regex"), "{err}");
+        assert!(
+            !dir.join(".swagcod").join("rules.json").exists(),
+            "файл не должен появиться при отказе валидации"
+        );
+
+        let bad_allow = FolderRulesConfig {
+            allow: vec!["(a".into()],
+            ..Default::default()
+        };
+        assert!(set_dir_rules(cwd, bad_allow).is_err());
+    }
+
+    #[test]
+    fn set_dir_rules_rejects_missing_folder() {
+        let err = set_dir_rules(
+            "Z:/точно/нет/такой/папки".into(),
+            FolderRulesConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("папка не найдена"), "{err}");
+    }
+
+    /// Записанный через UI конфиг обязан применяться ходом: это сквозная
+    /// проверка того, что запись и резолв смотрят на один файл.
+    #[test]
+    fn set_dir_rules_then_resolve_sees_them() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = FolderRulesConfig {
+            deny: vec!["^danger ".into()],
+            disabled_plugins: vec!["shout".into()],
+            system_prompt_append: Some("Не трогай прод.".into()),
+            ..Default::default()
+        };
+        set_dir_rules(dir.to_string_lossy().into_owned(), cfg).unwrap();
+
+        let state = state_with_rules(&root.path().join("folder_rules.json"));
+        let res = resolve_folder_rules(&state, &dir);
+        assert_eq!(res.deny, vec!["^danger "]);
+        assert_eq!(res.disabled_plugins, vec!["shout"]);
+        assert_eq!(res.system_prompt_append, "Не трогай прод.");
+        assert!(res.prompt_text().contains("Не трогай прод."));
+    }
+
+    /// Правка файла подхватывается без reload и без перезапуска: кэш сверяет
+    /// mtime. Именно это обещает hot-reload владельцу.
+    #[test]
+    fn resolve_picks_up_file_edit_via_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        write_dir_rules(&dir, serde_json::json!({"deny": ["v1"]}));
+
+        let state = state_with_rules(&root.path().join("folder_rules.json"));
+        assert_eq!(resolve_folder_rules(&state, &dir).deny, vec!["v1"]);
+
+        let file = dir.join(".swagcod").join("rules.json");
+        std::fs::write(
+            &file,
+            serde_json::to_string(&serde_json::json!({"deny": ["v2"]})).unwrap(),
+        )
+        .unwrap();
+        // Гранулярность mtime на части ФС секундная — двигаем время явно.
+        let fut = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(fut)
+            .unwrap();
+
+        assert_eq!(resolve_folder_rules(&state, &dir).deny, vec!["v2"]);
+    }
+
+    #[test]
+    fn resolved_rules_dto_carries_sources_as_strings() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("proj");
+        write_dir_rules(&dir, serde_json::json!({"deny": ["x"]}));
+
+        let state = state_with_rules(&root.path().join("folder_rules.json"));
+        let res = resolve_folder_rules(&state, &dir);
+        let dto: ResolvedRulesDto = res.into();
+        assert_eq!(dto.deny, vec!["x"]);
+        assert_eq!(dto.sources.len(), 1);
+        assert!(dto.sources[0].ends_with("rules.json"), "{}", dto.sources[0]);
+        // DTO сериализуется: UI получает JSON, а не ошибку на лету.
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["deny"][0], "x");
+        assert!(json["session_ttl_secs"].is_null());
+    }
+
+    /// Глобальные glob-правила матчатся по пути папки относительно корня
+    /// проекта: владелец пишет `crates/**`, а не абсолютный путь.
+    #[test]
+    fn global_glob_rules_apply_to_work_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let sub = root.path().join("crates").join("core");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let rules_file = root.path().join("folder_rules.json");
+        std::fs::write(
+            &rules_file,
+            serde_json::to_string(&serde_json::json!([
+                {"pattern": "crates/**", "rules": ["без unsafe"], "priority": 5}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = AppState::default();
+        *state.folder_rules.lock().unwrap() = FolderRulesCache::load(&rules_file);
+        let res = resolve_folder_rules(&state, &sub);
+        assert_eq!(res.prompt_lines, vec!["без unsafe"]);
+        assert!(res.prompt_text().contains("- без unsafe"));
     }
 }

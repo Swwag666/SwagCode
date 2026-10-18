@@ -25,6 +25,8 @@ pub enum HotReloadEvent {
     PluginChanged { path: PathBuf },
     /// Изменился файл скилла.
     SkillChanged { name: String, path: PathBuf },
+    /// Изменился файл folder-rules.
+    FolderRulesChanged,
 }
 
 /// Координатор hot-reload: watcher + каналы + дебаунс.
@@ -139,6 +141,12 @@ async fn dispatch_reload(state: &Arc<AppState>, path: &std::path::Path) {
         return;
     }
 
+    // Folder rules: folder_rules.json.
+    if file_name == "folder_rules.json" {
+        reload_folder_rules(state).await;
+        return;
+    }
+
     // Скиллы: *.md в skills/.
     if ext == "md" {
         reload_skills(state, path).await;
@@ -190,6 +198,22 @@ async fn reload_plugins(state: &Arc<AppState>) {
 
     state.bus.publish(swagcod_core::bus::EventKind::Status {
         message: "hot-reload: JS-плагины перезагружены".into(),
+    });
+}
+
+/// Перечитать folder-rules из файла.
+async fn reload_folder_rules(state: &Arc<AppState>) {
+    let Ok(mut cache) = state.folder_rules.lock() else {
+        eprintln!("hot-reload folder_rules: кэш заблокирован");
+        return;
+    };
+    cache.reload();
+    eprintln!("hot-reload folder_rules: {} правил", cache.len());
+    state.bus.publish(swagcod_core::bus::EventKind::Status {
+        message: format!(
+            "hot-reload: folder-rules обновлены ({} правил)",
+            cache.len()
+        ),
     });
 }
 

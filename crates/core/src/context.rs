@@ -192,6 +192,26 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 /// потерять разницу в происхождении: модель должна понимать, что файл
 /// проектный, а факты — из базы приложения.
 pub fn system_prompt(summary: &str, memory_md: &str, facts: &str) -> ChatMessage {
+    system_prompt_with(summary, memory_md, facts, "")
+}
+
+/// То же, что [`system_prompt`], плюс правила рабочей папки (Фича 2).
+///
+/// Третий источник инструкций намеренно отделён от памяти: `MEMORY.md` и
+/// факты — это знания о проекте, а folder-rules — предписания владельца о том,
+/// как в этой папке работать. Они приходят из `.swagcod/rules.json` дерева
+/// папок и из глобальных glob-правил, сливаются в
+/// [`crate::folder_rules::ResolvedFolderRules::prompt_text`] и вшиваются
+/// отдельной секцией, чтобы модель видела их происхождение.
+///
+/// Пустая строка `folder_rules` даёт промпт, байт-в-байт равный старому
+/// трёхаргументному: правила не найдены — ход идёт как раньше.
+pub fn system_prompt_with(
+    summary: &str,
+    memory_md: &str,
+    facts: &str,
+    folder_rules: &str,
+) -> ChatMessage {
     let mut text = String::from(
         "Ты SwagCod — агент-программист в рабочем каталоге пользователя. \
          Отвечай на языке пользователя. Инструменты работают только внутри \
@@ -215,6 +235,18 @@ pub fn system_prompt(summary: &str, memory_md: &str, facts: &str) -> ChatMessage
                        и обнови факт инструментом memory_add.\n",
         );
         text.push_str(&truncate_chars(facts.trim(), FACTS_MAX_CHARS));
+        text.push('\n');
+    }
+    if !folder_rules.trim().is_empty() {
+        text.push_str("\n## Правила рабочей папки (.swagcod/rules)\n");
+        text.push_str(
+            "Инструкции владельца для этого каталога; соблюдай их, \
+                       пока они не противоречат запросу пользователя.\n",
+        );
+        text.push_str(&truncate_chars(
+            folder_rules.trim(),
+            crate::folder_rules::FOLDER_RULES_MAX_CHARS,
+        ));
         text.push('\n');
     }
     ChatMessage::system(text)
@@ -362,6 +394,56 @@ mod tests {
         и сравнение по `len()` ловило бы не переполнение, а кодировку. */
         let chars = huge.content.chars().count();
         assert!(chars < FACTS_MAX_CHARS + 700, "{chars} символов в промпте");
+    }
+
+    /// Фича 2: правила рабочей папки вшиваются отдельной секцией и идут
+    /// после памяти — модель читает их как самые свежие предписания.
+    #[test]
+    fn folder_rules_section_is_injected_last() {
+        let m = system_prompt_with("сводка", "# память", "- факт", "- не трогай target/");
+        let pos_facts = m.content.find("- факт").unwrap();
+        let pos_rules = m.content.find("не трогай target/").unwrap();
+        assert!(m.content.contains("Правила рабочей папки"), "{}", m.content);
+        assert!(pos_facts < pos_rules, "правила папки идут после фактов");
+
+        // Пустые правила не оставляют заголовка.
+        let none = system_prompt_with("", "", "", "");
+        assert!(!none.content.contains("Правила рабочей папки"));
+        assert!(!system_prompt_with("", "", "", "   \n ")
+            .content
+            .contains("Правила"));
+    }
+
+    /// Трёхаргументный `system_prompt` обязан быть байт-в-байт равен
+    /// четырёхаргументному с пустыми правилами: старые вызовы не меняют ход.
+    #[test]
+    fn system_prompt_is_stable_without_folder_rules() {
+        for (s, m, f) in [
+            ("", "", ""),
+            ("сводка", "память", "факты"),
+            ("длинная сводка", "# MEMORY", "- факт один\n- факт два"),
+        ] {
+            assert_eq!(
+                system_prompt(s, m, f).content,
+                system_prompt_with(s, m, f, "").content
+            );
+        }
+    }
+
+    /// Потолок правил папки держит контекст предсказуемым.
+    #[test]
+    fn folder_rules_section_is_capped() {
+        let huge = "п".repeat(crate::folder_rules::FOLDER_RULES_MAX_CHARS * 2);
+        let m = system_prompt_with("", "", "", &huge);
+        assert!(
+            m.content.contains("[... обрезано ...]"),
+            "потолок не сработал"
+        );
+        let chars = m.content.chars().count();
+        assert!(
+            chars < crate::folder_rules::FOLDER_RULES_MAX_CHARS + 700,
+            "{chars} символов в промпте"
+        );
     }
 
     #[test]
