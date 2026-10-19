@@ -4914,8 +4914,8 @@ async fn test_notification(
 mod tests {
     use super::*;
     use crate::turn_driver::{
-        approval_preview, render_attachments, start_turn_core, ATTACH_MAX_BYTES,
-        PREVIEW_SOURCE_MAX_BYTES,
+        approval_preview, render_attachments, start_turn_core, turn_guard_reason, turn_limits,
+        ATTACH_MAX_BYTES, PREVIEW_SOURCE_MAX_BYTES, TURN_BUDGET_TOKENS, TURN_MAX_ROUNDS,
     };
 
     #[test]
@@ -6018,6 +6018,64 @@ rl.on('line', (l) => {
         // Аргументы сильнее env.
         assert_eq!(subagent_limits(&wild).0, 12);
         std::env::remove_var("SWAGCOD_SUBAGENT_MAX_ROUNDS");
+    }
+
+    /* ── rev62: предел автономии главного хода ── */
+
+    #[test]
+    fn turn_guard_lets_a_normal_turn_through() {
+        assert!(turn_guard_reason(0, 0, 40, 2_000_000).is_none());
+        /* Последний разрешённый раунд: сделан 39-й, уходит 40-й. */
+        assert!(turn_guard_reason(39, 1_999_999, 40, 2_000_000).is_none());
+    }
+
+    #[test]
+    fn turn_guard_stops_at_rounds_limit_with_numbers() {
+        let reason =
+            turn_guard_reason(40, 0, 40, 2_000_000).expect("предел раундов должен остановить ход");
+        assert!(
+            reason.contains("40 из 40"),
+            "в причине должны быть числа, иначе владелец не поймёт масштаб: {reason}"
+        );
+        assert!(
+            reason.contains("SWAGCOD_TURN_MAX_ROUNDS"),
+            "причина обязана называть рычаг: {reason}"
+        );
+        assert!(
+            reason.contains("сохранено"),
+            "владельцу важно знать, что сделанное не потеряно: {reason}"
+        );
+    }
+
+    #[test]
+    fn turn_guard_stops_at_budget_and_rounds_wins() {
+        let reason = turn_guard_reason(0, 2_000_000, 40, 2_000_000)
+            .expect("бюджет токенов должен остановить ход");
+        assert!(reason.contains("SWAGCOD_TURN_BUDGET_TOKENS"), "{reason}");
+        /* Исчерпаны оба предела - сообщаем про раунды: причина не должна
+        разъезжаться между двумя равенствами. */
+        let both = turn_guard_reason(40, 2_000_000, 40, 2_000_000).expect("останов");
+        assert!(both.contains("раундов"), "{both}");
+    }
+
+    #[test]
+    fn turn_limits_default_clamp_and_env_override() {
+        std::env::remove_var("SWAGCOD_TURN_MAX_ROUNDS");
+        std::env::remove_var("SWAGCOD_TURN_BUDGET_TOKENS");
+        assert_eq!(turn_limits(), (TURN_MAX_ROUNDS, TURN_BUDGET_TOKENS));
+
+        /* Ноль остановил бы ход на первом же раунде: это выглядело бы поломкой,
+        а не настройкой, поэтому клампы держат нижнюю границу. */
+        std::env::set_var("SWAGCOD_TURN_MAX_ROUNDS", "0");
+        std::env::set_var("SWAGCOD_TURN_BUDGET_TOKENS", "0");
+        assert_eq!(turn_limits(), (1, 1_000));
+
+        std::env::set_var("SWAGCOD_TURN_MAX_ROUNDS", "3");
+        std::env::set_var("SWAGCOD_TURN_BUDGET_TOKENS", "5000");
+        assert_eq!(turn_limits(), (3, 5_000));
+
+        std::env::remove_var("SWAGCOD_TURN_MAX_ROUNDS");
+        std::env::remove_var("SWAGCOD_TURN_BUDGET_TOKENS");
     }
 
     #[test]

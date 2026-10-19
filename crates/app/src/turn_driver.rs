@@ -35,6 +35,74 @@ use crate::{
 /// Лимит 200 КБ на файл бережёт контекст (B-3) от одного жирного лога.
 pub(crate) const ATTACH_MAX_BYTES: u64 = 200 * 1024;
 
+/* ── rev62: предел автономии главного хода ──────────────────────────────────
+ * Суб-агент ограничен с самого начала (SUBAGENT_MAX_ROUNDS 6 и бюджет 100k), а
+ * главный цикл не был ограничен ничем: с политикой «always» ход крутил
+ * инструменты один за другим, пока владелец не заметит. При 32k вывода на
+ * раунд и повторах роутера (до трёх таймаутов по 60 с на эндпоинт) ночной
+ * прогон без этого капа - способ спалить бюджет за одну ночь.
+ * Остановка честная: в журнал уезжает причина с числами, а история хода
+ * сохраняется целиком, поэтому сделанное не теряется. */
+
+/// Предел раундов (запросов модели) главного хода по умолчанию.
+///
+/// Нарочно щедрый: 40 раундов - это большая законная работа (правка десятка
+/// файлов с проверками), поэтому порог ловит бесконечный цикл, а не усердие.
+pub const TURN_MAX_ROUNDS: u32 = 40;
+
+/// Бюджет токенов главного хода (вход+выход всех раундов) по умолчанию.
+///
+/// Второй пояс к первому: раундов может быть мало, но один раунд бывает
+/// огромным (контекст в сотни тысяч токенов), и тогда расход режет бюджет.
+pub const TURN_BUDGET_TOKENS: u64 = 2_000_000;
+
+/// Лимиты главного хода: env, затем дефолты.
+///
+/// Клампы защищают и от нуля, и от абсурда: ноль остановил бы ход на первом же
+/// раунде, то есть выглядел бы как поломка, а не как настройка.
+pub fn turn_limits() -> (u32, u64) {
+    let env_rounds = std::env::var("SWAGCOD_TURN_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let env_budget = std::env::var("SWAGCOD_TURN_BUDGET_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let rounds = env_rounds.unwrap_or(TURN_MAX_ROUNDS).clamp(1, 1000);
+    let budget = env_budget
+        .unwrap_or(TURN_BUDGET_TOKENS)
+        .clamp(1_000, 100_000_000);
+    (rounds, budget)
+}
+
+/// Пора ли остановить ход: пусто - идём дальше, иначе причина для журнала.
+///
+/// Чистая функция без шины и провайдера - поэтому границы проверяются тестом,
+/// а не прогоном хода. Вызывается ПЕРЕД очередным запросом модели, значит
+/// `rounds_used` - число уже сделанных раундов: при `rounds_used == max_rounds`
+/// следующий запрос не уходит, и в журнале стоит ровно сделанное число.
+pub fn turn_guard_reason(
+    rounds_used: u32,
+    tokens_used: u64,
+    max_rounds: u32,
+    budget_tokens: u64,
+) -> Option<String> {
+    if rounds_used >= max_rounds {
+        return Some(format!(
+            "ход остановлен: сделан предел раундов {rounds_used} из {max_rounds}. \
+             Сделанное сохранено в истории хода. Предел поднимается переменной \
+             SWAGCOD_TURN_MAX_ROUNDS."
+        ));
+    }
+    if tokens_used >= budget_tokens {
+        return Some(format!(
+            "ход остановлен: израсходован бюджет токенов {tokens_used} из {budget_tokens}. \
+             Сделанное сохранено в истории хода. Бюджет поднимается переменной \
+             SWAGCOD_TURN_BUDGET_TOKENS."
+        ));
+    }
+    None
+}
+
 pub(crate) fn render_attachments(paths: &[String]) -> String {
     let mut out = String::new();
     for p in paths {
@@ -478,6 +546,12 @@ pub(crate) async fn start_turn_core(
         let mut fail_reason: Option<String> = None;
         // B-3: точный счёт от провайдера, если он отдаёт usage в стриме.
         let mut last_usage: Option<(u32, u32)> = None;
+        /* rev62: автономия хода под счётчиком. Раунд - это запрос модели;
+        расход считается по тому же материалу, что уходит провайдеру, поэтому
+        бюджет работает и на эндпоинтах, где usage приходит null (живой шлюз). */
+        let (turn_max_rounds, turn_budget) = turn_limits();
+        let mut rounds_used: u32 = 0;
+        let mut turn_tokens: u64 = 0;
 
         let outcome = loop {
             /* F-8: отказ pre_turn-хука закрывает ход до первого запроса
@@ -494,6 +568,25 @@ pub(crate) async fn start_turn_core(
             }
             match step {
                 TurnStep::RequestModel { history } => {
+                    /* rev62: проверка перед очередным запросом. Останавливаем
+                    ДО обращения к провайдеру, поэтому в журнал уезжает ровно
+                    сделанное число раундов, а не «сделано плюс один». */
+                    if let Some(reason) =
+                        turn_guard_reason(rounds_used, turn_tokens, turn_max_rounds, turn_budget)
+                    {
+                        fail_reason = Some(reason.clone());
+                        bus.publish(EventKind::Error {
+                            turn: Some(tid.clone()),
+                            message: reason,
+                        });
+                        step = TurnStep::Finish {
+                            outcome: TurnOutcome::Failed,
+                        };
+                        continue;
+                    }
+                    rounds_used += 1;
+                    turn_tokens +=
+                        swagcod_core::context::estimate_history_tokens(&history, cpt) as u64;
                     // System не хранится в истории сессии: подставляется
                     // свежим в каждый запрос, иначе сообщения множились бы.
                     let messages = {
@@ -615,6 +708,12 @@ pub(crate) async fn start_turn_core(
                             outcome: TurnOutcome::Failed,
                         };
                     } else {
+                        /* rev62: выход раунда в тот же счётчик, что и вход -
+                        иначе бюджет видел бы только контекст и не замечал
+                        генерацию. Оценка снята до on_stream: он забирает acc. */
+                        turn_tokens += swagcod_core::context::estimate_tokens(&acc.content, cpt)
+                            as u64
+                            + swagcod_core::context::estimate_tokens(&acc.reasoning, cpt) as u64;
                         step = machine.on_stream(acc);
                     }
                 }

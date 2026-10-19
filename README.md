@@ -261,6 +261,7 @@ python tools\verify-updater-signature.py releases\SwagCod-setup.exe releases\Swa
 | `SWAGCOD_PLUGINS_DIR` · `SWAGCOD_JS_TIMEOUT_MS` | E-4: каталог и дедлайн JS-плагинов |
 | `SWAGCOD_TASKS_POLL_MS` | E-5: период воркера задач (дефолт 15000) |
 | `SWAGCOD_SUBAGENT_MAX_ROUNDS` · `SWAGCOD_SUBAGENT_BUDGET_TOKENS` | E-6: лимиты ветки суб-агента |
+| `SWAGCOD_TURN_MAX_ROUNDS` · `SWAGCOD_TURN_BUDGET_TOKENS` | ревизия 62: лимиты главного хода (40 раундов, 2 млн токенов) — останавливают ход, который крутит инструменты без конца; сделанное остаётся в истории |
 | `SWAGCOD_HTTP_PORT` | E-7: порт loopback REST API (не задан — выключен) |
 | `SWAGCOD_APPEARANCE` · `SWAGCOD_BG_MODE` | оверрайды темы и фона при старте |
 | `SWAGCOD_ECHO_PROVIDER` | F-11: вместо боевого провайдера — встроенное эхо (ответ = «эхо: <сообщение>», счёт токенов честный). Сети и ключа не требует, в журнале провайдер виден как `echo`. Для сквозных проверок и CI; `0`/`false`/`off`/пусто — выключено |
