@@ -4680,7 +4680,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swagcod-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dotenvy",
  "glob",
@@ -4709,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "swagcod-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "glob",
  "regex",
@@ -4725,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "swagcod-fsx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "globset",
  "ignore",
@@ -4744,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "swagcod-provider"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-util",
  "reqwest 0.12.28",
@@ -4756,7 +4756,7 @@ dependencies = [
 
 [[package]]
 name = "swagcod-pty"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "portable-pty",
  "serde",
