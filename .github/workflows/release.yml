@@ -77,7 +77,7 @@ jobs:
           releaseBody: |
             SwagCod __VERSION__
 
-            Windows x64: `SwagCod_<version>_x64-setup.exe` ниже.
+            Windows x64: установщик в ассетах ниже.
             Установленные приложения подхватят эту версию сами
             (Настройки → General → «Обновления»).
           releaseDraft: false
