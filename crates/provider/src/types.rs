@@ -90,10 +90,11 @@ struct WireFunction {
 impl serde::Serialize for ChatMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut len = 1;
-        if !self.content.is_empty() {
-            len += 1;
-        }
+        /* content пишем ВСЕГДА и всегда строкой: строгие шлюзы требуют ключ
+        content типа string|array даже у assistant с tool_calls, где текст
+        пустой. Пропуск ключа даёт 400 «message content must be a string
+        or an array». */
+        let mut len = 2;
         if !self.reasoning.is_empty() {
             len += 1;
         }
@@ -105,9 +106,7 @@ impl serde::Serialize for ChatMessage {
         }
         let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry("role", &self.role)?;
-        if !self.content.is_empty() {
-            map.serialize_entry("content", &self.content)?;
-        }
+        map.serialize_entry("content", &self.content)?;
         if !self.reasoning.is_empty() {
             map.serialize_entry("reasoning", &self.reasoning)?;
         }
@@ -375,5 +374,22 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["path"], serde_json::json!("a.txt"));
+        // content присутствует всегда и строкой: шлюз требует ключ даже у
+        // assistant без текста (только tool_calls).
+        assert_eq!(v["content"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn content_key_always_present_as_string() {
+        let m = ChatMessage {
+            role: Role::Tool,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            tool_call_id: Some("c9".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["content"], serde_json::json!(""));
+        assert_eq!(v["tool_call_id"], serde_json::json!("c9"));
     }
 }
