@@ -1294,11 +1294,14 @@ fn list_plugin_tools(state: State<'_, Arc<AppState>>) -> Result<Vec<PluginTool>,
 /// Резолвить путь внутри cwd сессии; всё снаружи отклоняется.
 pub(crate) fn sandbox_path(cwd: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(raw);
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    };
+    // Абсолютный путь разрешён везде: доступ к опасным операциям уже
+    // регулируется approval-политикой сессии, и второй молчаливый запрет
+    // поверх решения пользователя только ломает работу модели.
+    // Относительные выходы за cwd (`../..`) по-прежнему отклоняются.
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    let abs = cwd.join(p);
     if !swagcod_fsx::is_within(cwd, &abs) {
         return Err(format!("путь вне рабочей директории сессии: {raw}"));
     }
@@ -1311,6 +1314,80 @@ pub(crate) fn arg_str(call: &ToolCall, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// Декодирование текстовых байтов для тулзов: UTF-8 (с BOM и без),
+/// UTF-16LE/BE по BOM (так пишет PowerShell `>` redirect), дальше OEM-кодовая
+/// страница Windows (cp866/cp437 — так пишет cmd redirect), и лишь потом
+/// lossy-фолбэк. Строгая read_to_string здесь падала на каждом не-UTF-8 файле.
+pub(crate) fn decode_text_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16_lossy(&bytes[2..], false);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_lossy(&bytes[2..], true);
+    }
+    let body = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    if let Ok(s) = std::str::from_utf8(body) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    if let Some(s) = decode_oem_cp(body) {
+        return s;
+    }
+    String::from_utf8_lossy(body).into_owned()
+}
+
+fn decode_utf16_lossy(bytes: &[u8], big_endian: bool) -> String {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2 + 1);
+    for c in bytes.chunks_exact(2) {
+        units.push(if big_endian {
+            u16::from_be_bytes([c[0], c[1]])
+        } else {
+            u16::from_le_bytes([c[0], c[1]])
+        });
+    }
+    String::from_utf16_lossy(&units)
+}
+
+#[cfg(windows)]
+fn decode_oem_cp(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    unsafe {
+        let cp = GetOEMCP();
+        let len = MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if len <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize];
+        let n = MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            buf.as_mut_ptr(),
+            len,
+        );
+        if n <= 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(String::from_utf16_lossy(&buf))
+    }
 }
 
 /* ===================== E-2: семантический поиск по кодовой базе ===================== */
@@ -2272,10 +2349,10 @@ pub(crate) async fn execute_tool(
             if meta.len() > 1_048_576 {
                 return fail("файл больше 1 МБ, читайте частями".into());
             }
-            match std::fs::read_to_string(&path) {
-                Ok(s) => ToolOutcome {
+            match std::fs::read(&path) {
+                Ok(bytes) => ToolOutcome {
                     ok: true,
-                    output: s,
+                    output: decode_text_bytes(&bytes),
                 },
                 Err(e) => fail(format!("read: {e}")),
             }
@@ -2376,8 +2453,8 @@ pub(crate) async fn execute_tool(
                     ok: output.status.success(),
                     output: format!(
                         "stdout:\n{}\nstderr:\n{}\nexit: {}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr),
+                        decode_text_bytes(&output.stdout),
+                        decode_text_bytes(&output.stderr),
                         output.status.code().unwrap_or(-1)
                     ),
                 },
@@ -2576,8 +2653,8 @@ async fn run_plugin(
             ok: output.status.success(),
             output: format!(
                 "stdout:\n{}\nstderr:\n{}\nexit: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                decode_text_bytes(&output.stdout),
+                decode_text_bytes(&output.stderr),
                 output.status.code().unwrap_or(-1)
             ),
         },
@@ -3362,7 +3439,9 @@ async fn read_file(
     if meta.len() > 1_048_576 {
         return Err("файл слишком большой (> 1 МБ)".into());
     }
-    std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))
+    Ok(decode_text_bytes(
+        &std::fs::read(path).map_err(|e| format!("read: {e}"))?,
+    ))
 }
 
 /// Потолок импортируемого промпта: системный промпт хода и без того несёт
@@ -4891,7 +4970,7 @@ fn get_dir_rules(cwd: String) -> Result<swagcod_core::folder_rules::FolderRulesC
     let Some(file) = dir_rules_file(&dir) else {
         return Ok(swagcod_core::folder_rules::FolderRulesConfig::default());
     };
-    let text = std::fs::read_to_string(&file).map_err(|e| format!("чтение {cwd}: {e}"))?;
+    let text = decode_text_bytes(&std::fs::read(&file).map_err(|e| format!("чтение {cwd}: {e}"))?);
     if file.extension().and_then(|e| e.to_str()) == Some("md") {
         return Ok(swagcod_core::folder_rules::FolderRulesConfig {
             system_prompt_append: Some(text.trim().to_string()),
@@ -5588,6 +5667,81 @@ mod tests {
         assert!(!out.ok, "запись вне cwd обязана отклоняться: {out:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_allows_absolute_paths_outside_cwd() {
+        let dir = std::env::temp_dir().join(format!("swagcod-abs-{}", short_id()));
+        let other = std::env::temp_dir().join(format!("swagcod-other-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("far.txt"), "далеко").unwrap();
+
+        let out = execute_tool(
+            &call(
+                "read",
+                serde_json::json!({"path": other.join("far.txt").to_string_lossy()}),
+            ),
+            &dir,
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(
+            out.ok && out.output.contains("далеко"),
+            "абсолютный путь вне cwd теперь разрешён: {out:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_read_decodes_utf16_and_non_utf8() {
+        let dir = std::env::temp_dir().join(format!("swagcod-enc-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // UTF-16LE с BOM — так пишет powershell `> file`.
+        let text = "Привет, диск";
+        let mut bytes = vec![0xFFu8, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.join("ps.txt"), &bytes).unwrap();
+
+        let out = execute_tool(
+            &call("read", serde_json::json!({"path": "ps.txt"})),
+            &dir,
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(
+            out.ok && out.output.contains("Привет, диск"),
+            "UTF-16LE обязан декодироваться: {out:?}"
+        );
+
+        // Бинарный мусор не UTF-8 — read больше не падает, отдаёт lossy.
+        std::fs::write(dir.join("raw.bin"), [0xC3u8, 0x28, 0xA0, 0xA1]).unwrap();
+        let out = execute_tool(
+            &call("read", serde_json::json!({"path": "raw.bin"})),
+            &dir,
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .await;
+        assert!(out.ok, "не-UTF-8 файл читается без ошибки: {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decode_text_bytes_handles_bom_and_plain_utf8() {
+        assert_eq!(decode_text_bytes(b"plain"), "plain");
+        assert_eq!(decode_text_bytes(&[0xEF, 0xBB, 0xBF, b'a']), "a");
+        let mut le = vec![0xFF, 0xFE];
+        le.extend_from_slice(&0x044Fu16.to_le_bytes()); // 'я' в UTF-16LE
+        assert_eq!(decode_text_bytes(&le), "я");
     }
 
     #[tokio::test]
