@@ -17,6 +17,7 @@ pub mod context;
 pub mod folder_rules;
 pub mod hooks;
 pub mod node_store;
+pub mod pricing;
 pub mod rules;
 pub mod semantic;
 pub mod session;

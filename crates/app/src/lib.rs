@@ -1973,9 +1973,13 @@ pub(crate) async fn run_subagent(
     });
 
     // Отчёт родительскому ходу: текст ветки + честная статистика.
+    /* rev67: рядом с токенами - деньги. Токены сами по себе не говорят, во что
+    обошлась ветка, а именно это нужно при ночном прогоне. Модели нет в таблице
+    цен - пишем «неизвестна», а не ноль. */
     let mut output = format!(
-        "[суб-агент {child_id} · {model}] раундов: {rounds_used}, инструментов: {}, токенов (оценка): {est_in} in / {est_out} out\n",
-        all_tools.len()
+        "[суб-агент {child_id} · {model}] раундов: {rounds_used}, инструментов: {}, токенов (оценка): {est_in} in / {est_out} out, {}\n",
+        all_tools.len(),
+        swagcod_core::pricing::cost_note(&model, est_in, est_out)
     );
     if final_content.trim().is_empty() {
         output.push_str("(пустой ответ)");
