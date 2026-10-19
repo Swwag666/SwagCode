@@ -349,6 +349,62 @@ pub async fn restore_checkpoint(cwd: &Path, sha: &str) -> Result<RestoreReport, 
     })
 }
 
+/// Что сейчас изменено в worktree, включая новые файлы (rev76).
+///
+/// `git diff` не показывает новые файлы, а агент создаёт их регулярно: коммит
+/// без них был бы половиной работы. `status --porcelain` показывает и то, и
+/// другое, поэтому список берётся оттуда же, откуда его берёт откат.
+pub async fn pending_paths(cwd: &Path) -> Result<Vec<String>, FsxError> {
+    let out = git_out(
+        cwd,
+        &["--no-optional-locks", "status", "--porcelain", "--", "."],
+        QUICK_TIMEOUT,
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.get(3..))
+        .map(|p| p.trim().trim_matches('"').to_string())
+        .filter(|p| !p.is_empty())
+        .collect())
+}
+
+/// Сообщение коммита из списка изменённых файлов (rev76).
+///
+/// Первая строка - что сделано, дальше перечисление путей: по списку видно, что
+/// именно тронуто, а по слову «правки» не видно ничего. Слишком длинный список
+/// обрезается по [`REPORT_FILE_CAP`] с честной пометкой, сколько не влезло:
+/// молча укоротить список значило бы соврать о размере работы.
+///
+/// Пустая `note` заменяется служебной строкой, чтобы коммит без текста не
+/// появился.
+pub fn commit_message(note: &str, paths: &[String]) -> String {
+    let head = {
+        let n = note.trim();
+        if n.is_empty() {
+            "swagcod: изменения хода"
+        } else {
+            n
+        }
+    };
+    let mut out = String::from(head);
+    if paths.is_empty() {
+        return out;
+    }
+    out.push_str("\n\n");
+    for p in paths.iter().take(REPORT_FILE_CAP) {
+        out.push_str("- ");
+        out.push_str(p);
+        out.push('\n');
+    }
+    if paths.len() > REPORT_FILE_CAP {
+        out.push_str(&format!(
+            "… и ещё {} файлов\n",
+            paths.len() - REPORT_FILE_CAP
+        ));
+    }
+    out.trim_end().to_string()
+}
 /// Закоммитить текущие изменения worktree (rev75).
 ///
 /// Нужно авто-коммиту хода: снимок F-5 показывает, что менялось, но сам коммит
@@ -390,6 +446,42 @@ pub async fn commit_all(cwd: &Path, message: &str) -> Result<Option<String>, Fsx
     Ok(Some(sha.trim().to_string()))
 }
 
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+
+    fn paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("src/f{i}.rs")).collect()
+    }
+
+    #[test]
+    fn message_lists_paths_under_the_head_line() {
+        let m = commit_message("правка парсера", &paths(2));
+        assert_eq!(m, "правка парсера\n\n- src/f0.rs\n- src/f1.rs");
+    }
+
+    #[test]
+    fn empty_note_and_empty_paths_stay_honest() {
+        assert_eq!(commit_message("   ", &[]), "swagcod: изменения хода");
+        assert_eq!(
+            commit_message("", &paths(1)),
+            "swagcod: изменения хода\n\n- src/f0.rs"
+        );
+    }
+
+    #[test]
+    fn long_list_is_cut_with_a_count() {
+        /* Молча укоротить список значило бы соврать о размере работы. */
+        let n = REPORT_FILE_CAP + 3;
+        let m = commit_message("много", &paths(n));
+        assert!(m.contains("- src/f0.rs"));
+        assert!(
+            !m.contains(&format!("src/f{}.rs", n - 1)),
+            "хвост не влезает"
+        );
+        assert!(m.contains("… и ещё 3 файлов"), "{m}");
+    }
+}
 #[cfg(test)]
 mod commit_tests {
     use super::*;
