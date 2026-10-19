@@ -1354,6 +1354,7 @@
      замкнуты на состояние приложения. */
   const commands: PaletteCommand[] = [
     { slash: '/new', group: 'palGroupSession', desc: 'cmdNewDesc', action: () => createNewSession() },
+      { slash: '/fork', group: 'palGroupSession', desc: 'cmdForkDesc', action: () => forkCurrentSession() },
     { slash: '/clear', group: 'palGroupSession', desc: 'cmdClearDesc', action: () => { transcriptFor(currentSession ?? '').clear(); items = transcriptFor(currentSession ?? '').items; revision++; eventsTotal = 0; batchesTotal = 0 } },
     { slash: '/compact', group: 'palGroupSession', desc: 'cmdCompactDesc', action: () => void compactNow() },
     { slash: '/search', group: 'palGroupSession', desc: 'cmdSearchDesc', action: () => { showHistorySearch = true } },
@@ -2178,6 +2179,24 @@
     }
   }
 
+  /** Ответвить текущую сессию: та же история, чистый журнал (rev74).
+      Модель продолжает разговор, но ходы ветки считаются заново. */
+  async function forkCurrentSession(): Promise<void> {
+    const from = currentSession
+    if (!from) return
+    try {
+      const brief = await invoke<{ id: string; cwd: string }>('session_fork', { sessionId: from })
+      currentSession = brief.id
+      sessionCwds[brief.id] = brief.cwd
+      transcript = transcriptFor(brief.id)
+      items = transcript.items
+      revision++
+      sessionRefreshTick++
+      void loadWorkspaces()
+    } catch (err) {
+      console.error('session_fork failed:', err)
+    }
+  }
   /** Отправка одной реплики в конкретную сессию. Очередь вызывает её же
       после конца хода — и всегда в ту сессию, где реплику написали. */
   async function sendText(text: string, targetSession?: string, attach?: string[]): Promise<void> {
