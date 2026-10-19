@@ -4852,22 +4852,160 @@ fn get_skills_list_for(
     state: State<'_, Arc<AppState>>,
     cwd: Option<String>,
 ) -> Result<Vec<swagcod_core::skills::SkillSummary>, String> {
-    let reg = state.skills.lock().map_err(|e| e.to_string())?;
+    Ok(visible_skills(&state, cwd.as_deref()))
+}
+
+/// Скиллы, видимые в этой папке: реестр минус `disabled_skills` из правил.
+///
+/// rev63: вынесено из Tauri-команды, потому что тот же список нужен самому
+/// ходу. До этой ревизии у скиллов не было ни одного потребителя: реестр с
+/// frontmatter и плейсхолдерами (412 строк), hot-reload, выключение по папке и
+/// две команды списка существовали, а модель скиллов не видела вообще - то
+/// есть правило «skills visible» в настройках ни на что не влияло.
+pub(crate) fn visible_skills(
+    state: &AppState,
+    cwd: Option<&str>,
+) -> Vec<swagcod_core::skills::SkillSummary> {
+    let Ok(reg) = state.skills.lock() else {
+        eprintln!("skills: реестр заблокирован");
+        return Vec::new();
+    };
     let mut list = reg.list();
-    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        drop(reg);
-        let mut cache = state.folder_rules.lock().map_err(|e| e.to_string())?;
-        let resolved = cache.resolve(std::path::Path::new(&dir));
-        if !resolved.disabled_skills.is_empty() {
-            list.retain(|s| {
-                !resolved
-                    .disabled_skills
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(&s.name))
-            });
+    /* Лок реестра снимается до лока правил: порядок лока один и тот же во всех
+    вызовах, и держать один мьютекс, ожидая второй, здесь незачем. */
+    drop(reg);
+    let Some(dir) = cwd.filter(|d| !d.is_empty()) else {
+        return list;
+    };
+    let Ok(mut cache) = state.folder_rules.lock() else {
+        /* Fail closed: правила папки умеют только запрещать, поэтому не знать
+        их - значит показать модели скилл, который владелец выключил. Пустой
+        список честнее нарушения настройки, и он оставляет след в логе. */
+        eprintln!("skills: правила папки недоступны, скиллы скрыты");
+        return Vec::new();
+    };
+    let resolved = cache.resolve(std::path::Path::new(dir));
+    if !resolved.disabled_skills.is_empty() {
+        list.retain(|s| {
+            !resolved
+                .disabled_skills
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&s.name))
+        });
+    }
+    list
+}
+
+// ---------------------------------------------------------------------------
+// Скиллы: инструмент агента
+// ---------------------------------------------------------------------------
+
+/// Имя инструмента скиллов.
+pub const SKILL_TOOL: &str = "skill";
+
+/// Сколько символов описания скилла уходит в спецификацию инструмента.
+///
+/// Описания пишет владелец, поэтому длину держим под контролем: спецификация
+/// уезжает в каждый запрос модели, и один многословный скилл не должен
+/// раздувать её на весь контекст.
+const SKILL_DESC_MAX_CHARS: usize = 160;
+
+/// Спецификация инструмента `skill` для модели.
+///
+/// Список скиллов живёт в описании инструмента, а не отдельной секцией
+/// системного промпта: модель узнаёт имена, назначение и переменные ровно там,
+/// откуда вызывает, а промпт не растёт ещё одной секцией. Пустой список даёт
+/// `None` - вызывать нечего, и пустой тул только тратил бы внимание модели.
+pub fn skill_tool_spec(list: &[swagcod_core::skills::SkillSummary]) -> Option<ToolSpec> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut desc = String::from(
+        "Развернуть шаблон промпта (скилл владельца) и получить его текст целиком. \
+         Вызывай, когда задача совпадает с назначением скилла: вернётся готовый текст \
+         с подставленными значениями. Доступные скиллы:\n",
+    );
+    for s in list {
+        let about = if s.description.chars().count() > SKILL_DESC_MAX_CHARS {
+            let cut: String = s.description.chars().take(SKILL_DESC_MAX_CHARS).collect();
+            format!("{cut}…")
+        } else {
+            s.description.clone()
+        };
+        desc.push_str(&format!("- {}: {}", s.name, about));
+        if !s.placeholders.is_empty() {
+            desc.push_str(&format!(" (переменные: {})", s.placeholders.join(", ")));
+        }
+        desc.push('\n');
+    }
+    Some(ToolSpec {
+        name: SKILL_TOOL.into(),
+        description: desc,
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Имя скилла из списка"
+                },
+                "vars": {
+                    "type": "object",
+                    "description": "Значения переменных шаблона; пропущенные берутся из defaults скилла"
+                }
+            },
+            "required": ["name"]
+        }),
+    })
+}
+
+/// Инструмент `skill`: развернуть шаблон скилла.
+///
+/// Скилл не исполняет код и не трогает диск: результат - текст, который модель
+/// получает обычным выводом инструмента. Неизвестное имя возвращает список
+/// доступных, иначе опечатка модели выглядела бы как пустой ответ и она пошла бы
+/// выдумывать содержимое вместо того, чтобы исправить имя.
+pub(crate) async fn run_skill_tool(state: &Arc<AppState>, call: &ToolCall) -> ToolOutcome {
+    let name = arg_str(call, "name");
+    let name = name.trim();
+    if name.is_empty() {
+        return ToolOutcome {
+            ok: false,
+            output: "skill: не указано имя скилла".into(),
+        };
+    }
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(obj) = call.arguments.get("vars").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            vars.insert(k.clone(), value);
         }
     }
-    Ok(list)
+    let Ok(reg) = state.skills.lock() else {
+        return ToolOutcome {
+            ok: false,
+            output: "skill: реестр скиллов заблокирован".into(),
+        };
+    };
+    match reg.render(name, &vars) {
+        Ok(text) => ToolOutcome {
+            ok: true,
+            output: text,
+        },
+        Err(e) => {
+            let known: Vec<String> = reg.list().into_iter().map(|s| s.name).collect();
+            ToolOutcome {
+                ok: false,
+                output: if known.is_empty() {
+                    format!("skill: {e}. Скиллов нет: каталог ~/.swagcod/skills/ пуст")
+                } else {
+                    format!("skill: {e}. Доступные скиллы: {}", known.join(", "))
+                },
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6076,6 +6214,84 @@ rl.on('line', (l) => {
 
         std::env::remove_var("SWAGCOD_TURN_MAX_ROUNDS");
         std::env::remove_var("SWAGCOD_TURN_BUDGET_TOKENS");
+    }
+
+    /* ── rev63: скиллы как инструмент агента ── */
+
+    fn skill_summary(
+        name: &str,
+        description: &str,
+        placeholders: &[&str],
+    ) -> swagcod_core::skills::SkillSummary {
+        swagcod_core::skills::SkillSummary {
+            name: name.into(),
+            description: description.into(),
+            placeholders: placeholders.iter().map(|p| p.to_string()).collect(),
+            defaults: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn skill_tool_is_absent_without_skills() {
+        assert!(
+            skill_tool_spec(&[]).is_none(),
+            "нет скиллов - нет инструмента: пустой тул тратил бы внимание модели"
+        );
+    }
+
+    #[test]
+    fn skill_tool_lists_names_descriptions_and_placeholders() {
+        let spec = skill_tool_spec(&[
+            skill_summary("code-review", "Обзор кода", &["language", "focus"]),
+            skill_summary("deploy", "Выкатка", &[]),
+        ])
+        .expect("два скилла - инструмент есть");
+        assert_eq!(spec.name, "skill");
+        assert!(
+            spec.description.contains("code-review"),
+            "{}",
+            spec.description
+        );
+        assert!(
+            spec.description.contains("Обзор кода"),
+            "{}",
+            spec.description
+        );
+        assert!(
+            spec.description.contains("language, focus"),
+            "переменные шаблона должны доехать до модели: {}",
+            spec.description
+        );
+        assert!(spec.description.contains("deploy"), "{}", spec.description);
+        /* Скилл без переменных не должен получать пустую скобку. */
+        assert!(
+            !spec.description.contains("Выкатка ()"),
+            "{}",
+            spec.description
+        );
+        assert_eq!(spec.parameters["required"][0], "name");
+    }
+
+    #[test]
+    fn skill_tool_truncates_long_descriptions() {
+        let long = "я".repeat(SKILL_DESC_MAX_CHARS + 50);
+        let spec = skill_tool_spec(&[skill_summary("wordy", &long, &[])]).unwrap();
+        assert!(
+            spec.description.contains('…'),
+            "длинное описание должно быть обрезано, иначе один скилл съест контекст"
+        );
+        /* Проверяем именно обрезку: начало доезжает, хвост нет. Сравнивать
+        длину всей спецификации с исходным описанием нельзя - в спецификации
+        ещё шапка и имя скилла. */
+        let head: String = long.chars().take(SKILL_DESC_MAX_CHARS).collect();
+        assert!(
+            spec.description.contains(&head),
+            "начало описания должно доехать"
+        );
+        assert!(
+            !spec.description.contains(&long),
+            "исходное описание целиком доезжать не должно"
+        );
     }
 
     #[test]

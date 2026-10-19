@@ -419,6 +419,15 @@ pub(crate) async fn start_turn_core(
                 }),
         );
     }
+    /* rev63: скиллы владельца встают в тот же список, что встроенные
+    инструменты, плагины и MCP. Список берётся по cwd хода, поэтому правило
+    disabled_skills папки глушит скилл у модели так же, как disabled_plugins
+    глушит плагин, - и «skills visible» в настройках наконец что-то значит.
+    Скиллов нет - инструмента нет: пустой тул только тратил бы внимание модели. */
+    let skills = crate::visible_skills(state.as_ref(), Some(cwd.as_str()));
+    if let Some(skill_spec) = crate::skill_tool_spec(&skills) {
+        specs.push(skill_spec);
+    }
     /* Текст правил папки уходит в задачу хода отдельной строкой: сам
     ResolvedFolderRules нужен здесь (фильтрация tools, allow/deny), а в задаче
     из него используется только промпт-секция. */
@@ -845,6 +854,11 @@ pub(crate) async fn start_turn_core(
                         В whitelist суб-агента этих имён нет, поэтому ветка
                         писать память не может. */
                         run_memory_tool(&app_state, sid.as_str(), &call).await
+                    } else if call.name == crate::SKILL_TOOL {
+                        /* rev63: скилл разворачивается в текст - ни сети, ни
+                        диска, поэтому подтверждения не требует. В whitelist
+                        суб-агента имени нет: ветка не наследует скиллы. */
+                        crate::run_skill_tool(&app_state, &call).await
                     } else if call.name.starts_with(mcp::MCP_PREFIX) {
                         run_mcp_call(&app_state, &call).await
                     } else if call.name.starts_with(jsplugins::JS_PREFIX) {
