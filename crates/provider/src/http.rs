@@ -173,19 +173,13 @@ impl OpenAiProvider {
         let (tx, rx) = mpsc::channel::<StreamEvent>(256);
 
         let handle = tokio::spawn(async move {
-            let body = match serde_json::to_string(&req) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = tx
-                        .send(StreamEvent::Error(format!("serialize request: {e}")))
-                        .await;
-                    return;
-                }
-            };
+            /* rev71: тело собирает `openai_body` - он же подставляет картинки в
+            content последнего сообщения пользователя. Структура сериализуется
+            всегда, поэтому ветка ошибки сериализации больше не нужна. */
             let mut rb = client
                 .post(&url)
                 .header("accept", "text/event-stream")
-                .json(&serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default());
+                .json(&crate::types::openai_body(&req));
             if !key.is_empty() {
                 rb = rb.bearer_auth(&key);
             }

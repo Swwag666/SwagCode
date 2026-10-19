@@ -107,6 +107,46 @@ pub struct ChatRequest {
     pub images: Vec<ImageAttachment>,
 }
 
+/// Тело OpenAI-совместимого запроса (rev71).
+///
+/// Обычно это просто сериализация [`ChatRequest`], но с картинками `content`
+/// последнего сообщения пользователя обязан стать массивом частей: строку с
+/// картинкой OpenAI не примет. Поле `images` в тело не попадает (`serde(skip)`),
+/// поэтому картинки подставляются здесь, а не сериализатором.
+pub fn openai_body(req: &ChatRequest) -> serde_json::Value {
+    let mut v = serde_json::to_value(req).unwrap_or(serde_json::Value::Null);
+    if req.images.is_empty() {
+        return v;
+    }
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return v;
+    };
+    let Some(idx) = msgs
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return v;
+    };
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    for img in &req.images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", img.media_type, img.data_base64),
+            },
+        }));
+    }
+    let text = msgs[idx]
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    msgs[idx]["content"] = serde_json::Value::Array(parts);
+    v
+}
 fn default_true() -> bool {
     true
 }

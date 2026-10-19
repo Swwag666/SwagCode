@@ -88,3 +88,43 @@ fn images_do_not_leak_into_the_openai_body() {
     );
     assert_eq!(v["messages"][0]["content"], serde_json::json!("привет"));
 }
+
+#[test]
+fn openai_body_turns_content_into_parts_when_images_are_present() {
+    /* Строку с картинкой OpenAI не примет: content обязан стать массивом
+    частей, картинка первой, текст после. */
+    use crate::types::openai_body;
+    let req = ChatRequest::new(
+        "m",
+        vec![
+            ChatMessage::user("старое"),
+            ChatMessage::user("что на фото?"),
+        ],
+    )
+    .with_images(vec![png()]);
+
+    let v = openai_body(&req);
+    let content = v["messages"][1]["content"]
+        .as_array()
+        .expect("массив частей");
+    assert_eq!(content[0]["type"], serde_json::json!("image_url"));
+    assert_eq!(
+        content[0]["image_url"]["url"],
+        serde_json::json!("data:image/png;base64,AAAA")
+    );
+    assert_eq!(content[1]["type"], serde_json::json!("text"));
+    assert_eq!(content[1]["text"], serde_json::json!("что на фото?"));
+    assert_eq!(
+        v["messages"][0]["content"],
+        serde_json::json!("старое"),
+        "старое сообщение остаётся строкой"
+    );
+    assert!(v.get("images").is_none(), "служебное поле не утекает");
+}
+
+#[test]
+fn openai_body_without_images_stays_a_plain_string() {
+    let req = ChatRequest::new("m", vec![ChatMessage::user("привет")]);
+    let v = crate::types::openai_body(&req);
+    assert_eq!(v["messages"][0]["content"], serde_json::json!("привет"));
+}
