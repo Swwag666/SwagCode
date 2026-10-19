@@ -2983,14 +2983,17 @@ pub(crate) async fn turn_revert_core(
             .find(|t| t.id.to_string() == turn_id)
             .ok_or_else(|| format!("ход не найден: {turn_id}"))?;
         let sha = turn.checkpoint_sha.clone().ok_or_else(|| {
-            "у хода нет git-снимка: рабочая директория не репозиторий, git недоступен \
-             или дерево было чистым"
+            /* rev64: снимок теперь есть и вне git, поэтому отсутствие означает
+            не «не репозиторий», а именно отсутствие снимка: каталога не было
+            на момент хода или снимок не удался (причина была в статусе). */
+            "у хода нет снимка: снимок не создался (смотрите статус хода) \
+             или рабочей директории не было"
                 .to_string()
         })?;
         (session.cwd.clone(), sha, session.id.clone())
     };
 
-    let report = swagcod_fsx::git::restore_checkpoint(std::path::Path::new(&cwd), &sha)
+    let report = swagcod_fsx::checkpoint::restore(std::path::Path::new(&cwd), &sha)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -3027,6 +3030,18 @@ async fn turn_revert(
     turn_revert_core(&st, &session_id, &turn_id).await
 }
 
+/// Короткая подпись снимка для подписи в UI.
+///
+/// rev64: у снимков два вида. У git-снимка подписью были первые символы sha, у
+/// теневого первые десять дали бы «shadow:3f2» - это человеку не говорит
+/// ничего, поэтому отпечаток тени подписан словом.
+pub fn short_checkpoint_label(sha: &str) -> String {
+    if let Some(body) = sha.strip_prefix(swagcod_fsx::checkpoint::SHADOW_PREFIX) {
+        return format!("тени {}", body.chars().take(8).collect::<String>());
+    }
+    sha.chars().take(10).collect()
+}
+
 /// Ход, который есть куда откатить.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct TurnCheckpointDto {
@@ -3054,7 +3069,7 @@ pub(crate) async fn turn_checkpoints_core(
         .filter_map(|t| {
             t.checkpoint_sha.clone().map(|sha| TurnCheckpointDto {
                 turn_id: t.id.to_string(),
-                short_sha: sha.chars().take(10).collect(),
+                short_sha: short_checkpoint_label(&sha),
                 sha,
             })
         })
@@ -6294,6 +6309,26 @@ rl.on('line', (l) => {
         );
     }
 
+    /* ── rev64: подпись снимка для интерфейса ── */
+
+    #[test]
+    fn checkpoint_label_names_shadow_and_truncates_sha() {
+        let sha = "a".repeat(40);
+        assert_eq!(
+            short_checkpoint_label(&sha),
+            "aaaaaaaaaa",
+            "у git-снимка подпись - первые символы sha"
+        );
+
+        let label = short_checkpoint_label("shadow:3f2a1b0c9d8e7f60");
+        assert!(label.starts_with("тени "), "тень подписана словом: {label}");
+        assert!(label.contains("3f2a1b0c"), "отпечаток виден: {label}");
+        assert!(
+            !label.contains("shadow:"),
+            "служебный префикс человеку не нужен: {label}"
+        );
+    }
+
     #[test]
     fn subagent_safe_tools_exclude_dangerous() {
         // E-6: whitelist ветки не пересекается с опасными инструментами —
@@ -6762,7 +6797,9 @@ rl.on('line', (l) => {
         std::fs::create_dir_all(&dir).unwrap();
         let (state, sid, tid) = session_with_checkpoint(&dir, None).await;
         let e = turn_revert_core(&state, &sid, &tid).await.unwrap_err();
-        assert!(e.contains("нет git-снимка"), "{e}");
+        /* rev64: снимок теперь бывает и теневым, поэтому сообщение говорит про
+        отсутствие снимка вообще, а не про отсутствие git-репозитория. */
+        assert!(e.contains("нет снимка"), "{e}");
         // Чужой ход и чужая сессия — внятные ошибки, а не паника.
         let e = turn_revert_core(&state, &sid, "t-nope").await.unwrap_err();
         assert!(e.contains("ход не найден"), "{e}");

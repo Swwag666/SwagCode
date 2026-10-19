@@ -50,7 +50,10 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Таймаут лёгких операций (status/diff/restore/rev-parse).
 const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Потолок списков в отчёте: траектория не должна тонуть в перечислении.
-const REPORT_FILE_CAP: usize = 200;
+///
+/// `pub(crate)`, потому что тот же потолок нужен теневому откату: человек
+/// видит один и тот же предел независимо от того, был в папке git или нет.
+pub(crate) const REPORT_FILE_CAP: usize = 200;
 
 /// Команда git без всплывающего консольного окна на Windows.
 fn git_cmd(cwd: &Path) -> tokio::process::Command {

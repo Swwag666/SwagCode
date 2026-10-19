@@ -120,7 +120,7 @@ flowchart LR
 | POST | `/v1/sessions/transcript` | `{session_id}` → лента сессии в wire-формате B-8 (F-9) |
 | POST | `/v1/turns` | `{session_id, message, model?, temperature?}` → `{turn_id}` |
 | POST | `/v1/turns/stop` | `{session_id}` → остановка живого хода (F-9) |
-| POST | `/v1/turns/revert` | `{session_id, turn_id}` → откат к git-снимку хода (F-5) |
+| POST | `/v1/turns/revert` | `{session_id, turn_id}` → откат к снимку хода: git-объект в репозитории, теневая копия дерева вне его (F-5, rev64) |
 | POST | `/v1/checkpoints` | `{session_id}` → какие ходы можно откатить (F-5) |
 | POST | `/v1/approvals` | `{call_id, decision: approved\|denied}` |
 | GET | `/v1/events` | SSE-поток всех событий шины |
@@ -262,6 +262,7 @@ python tools\verify-updater-signature.py releases\SwagCod-setup.exe releases\Swa
 | `SWAGCOD_TASKS_POLL_MS` | E-5: период воркера задач (дефолт 15000) |
 | `SWAGCOD_SUBAGENT_MAX_ROUNDS` · `SWAGCOD_SUBAGENT_BUDGET_TOKENS` | E-6: лимиты ветки суб-агента |
 | `SWAGCOD_TURN_MAX_ROUNDS` · `SWAGCOD_TURN_BUDGET_TOKENS` | ревизия 62: лимиты главного хода (40 раундов, 2 млн токенов) — останавливают ход, который крутит инструменты без конца; сделанное остаётся в истории |
+| `SWAGCOD_SHADOW_DIR` | ревизия 64: каталог теневых снимков (по умолчанию `~/.swagcod/shadow`) — откат хода в папке без git; каталоги сборки и файлы больше 2 МБ в снимок не входят, снимки старше 30 дней выметаются |
 | `SWAGCOD_HTTP_PORT` | E-7: порт loopback REST API (не задан — выключен) |
 | `SWAGCOD_APPEARANCE` · `SWAGCOD_BG_MODE` | оверрайды темы и фона при старте |
 | `SWAGCOD_ECHO_PROVIDER` | F-11: вместо боевого провайдера — встроенное эхо (ответ = «эхо: <сообщение>», счёт токенов честный). Сети и ключа не требует, в журнале провайдер виден как `echo`. Для сквозных проверок и CI; `0`/`false`/`off`/пусто — выключено |

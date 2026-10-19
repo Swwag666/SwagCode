@@ -480,15 +480,16 @@ pub(crate) async fn start_turn_core(
                 pre_turn_refusal = Some(run.message);
             }
         }
-        /* F-5: снимок worktree ДО первого инструмента хода. Не репозиторий
-        или чистое дерево → None (нечего откатывать), и ход идёт как раньше.
-        Ошибка git — не повод ронять ход: сообщаем в статус и работаем без
-        страховки, но честно. */
-        let checkpoint_sha = match swagcod_fsx::git::create_checkpoint(&cwd).await {
+        /* F-5 + rev64: снимок worktree ДО первого инструмента хода. В репозитории
+        это git-объект, вне репозитория - теневая копия дерева: до rev64 вне git
+        отката не было вовсе, и правки хода в обычной папке были необратимы.
+        Снимать нечего только когда каталога нет. Ошибка снимка - не повод
+        ронять ход: сообщаем в статус и работаем без страховки, но честно. */
+        let checkpoint_sha = match swagcod_fsx::checkpoint::create(&cwd).await {
             Ok(sha) => sha,
             Err(e) => {
                 bus.publish(EventKind::Status {
-                    message: format!("чекпоинт git не создан: {e}"),
+                    message: format!("снимок перед ходом не создан: {e}"),
                 });
                 None
             }
