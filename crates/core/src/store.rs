@@ -623,6 +623,37 @@ impl SqliteStore {
         Ok(Self { conn })
     }
 
+    /// Снять резервную копию базы в `path` (rev65).
+    ///
+    /// Копия делается средствами SQLite (`VACUUM INTO`): файл получается
+    /// целостным снимком, а не копией страниц в произвольный момент, поэтому
+    /// копировать `.db` руками рядом с живым `-wal` не нужно и опасно.
+    ///
+    /// `VACUUM INTO` не перезаписывает существующий файл, и это к лучшему:
+    /// молча затереть уже снятую копию хуже, чем отказать. Уникальное имя -
+    /// забота вызывающего (см. [`crate::backup::backup_name`]).
+    pub fn backup_to(&self, path: &Path) -> StoreResult<()> {
+        if path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("копия базы уже существует: {}", path.display()),
+            )
+            .into());
+        }
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        /* Путь подставляется в SQL, поэтому одинарные кавычки удваиваются по
+        правилам SQLite: апостроф в имени каталога не должен ломать копию и
+        не должен ничего дописывать в запрос. */
+        let escaped = path.to_string_lossy().replace('\'', "''");
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+        Ok(())
+    }
+
     /// F-10: разовая пересборка FTS-индекса из `messages` — только если индекс
     /// пуст, а сообщения есть (база старше FTS5 или оборвавшийся rebuild).
     /// Условие проверяется двумя LIMIT 1, а не COUNT(*): на каждом запуске

@@ -11,6 +11,7 @@
 - [`turn`] — state machine хода.
 */
 
+pub mod backup;
 pub mod bus;
 pub mod context;
 pub mod folder_rules;

@@ -4503,6 +4503,43 @@ pub fn run() {
                 let st = state.clone();
                 tauri::async_runtime::spawn(metrics_worker(st));
             }
+            /* rev65: резервная копия базы при запуске, если срок истёк. История
+            сессий - единственное, что нельзя восстановить из репозитория, а
+            ночной прогон пишет в неё часами. Копию снимает SQLite, поэтому
+            работа уходит в blocking-пул: `VACUUM INTO` на большой базе не
+            должен занимать асинхронный поток. */
+            {
+                if let Ok(path) = db_path() {
+                    let st = state.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let dir = swagcod_core::backup::default_dir(&path);
+                        let done = tokio::task::spawn_blocking(move || {
+                            swagcod_core::backup::run(
+                                &path,
+                                &dir,
+                                swagcod_core::backup::BACKUP_KEEP,
+                                swagcod_core::backup::BACKUP_INTERVAL,
+                                std::time::SystemTime::now(),
+                            )
+                        })
+                        .await;
+                        let message = match done {
+                            Ok(Ok(Some(p))) => format!(
+                                "копия базы: {}",
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            ),
+                            Ok(Ok(None)) => String::new(),
+                            Ok(Err(e)) => format!("копия базы не создана: {e}"),
+                            Err(e) => format!("копия базы: задача упала: {e}"),
+                        };
+                        if !message.is_empty() {
+                            st.bus.publish(EventKind::Status { message });
+                        }
+                    });
+                }
+            }
             /* E-7: loopback REST API стартует, только если порт явно задан
             (env SWAGCOD_HTTP_PORT или prefs http_api_port). По
             умолчанию API выключен — поверхности нет. */
