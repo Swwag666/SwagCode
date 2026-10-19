@@ -300,14 +300,38 @@ pub fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
         "messages": messages,
         "stream": true,
     });
+    /* rev66: кэш промпта. Инструменты и системный промпт - самая стабильная
+    часть запроса: внутри хода они не меняются от раунда к раунду, а чтение из
+    кэша стоит десятую часть цены. Anthropic ставит точку кэша на ПОСЛЕДНИЙ блок
+    префикса, а префикс считается в порядке инструменты → system → сообщения,
+    поэтому одной точки на последнем блоке system хватает, чтобы покрыть и
+    объявления инструментов. System при этом обязан быть массивом блоков, а не
+    строкой - иначе точку ставить некуда. */
     if !system_parts.is_empty() {
-        body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+        let mut blocks: Vec<serde_json::Value> = system_parts
+            .iter()
+            .map(|p| serde_json::json!({"type": "text", "text": p}))
+            .collect();
+        if let Some(last) = blocks.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+        body["system"] = serde_json::Value::Array(blocks);
     }
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
     }
-    let tools = openai_envelope_to_anthropic(&req.tools);
+    let mut tools = openai_envelope_to_anthropic(&req.tools);
     if !tools.is_empty() {
+        /* Системного промпта нет - точку кэша ставим на последний инструмент,
+        иначе кэш не включится вовсе. Проверка на объект обязательна: ветка
+        «уже anthropic-форма» пропускает значение как есть. */
+        if system_parts.is_empty() {
+            if let Some(last) = tools.last_mut() {
+                if last.is_object() {
+                    last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+            }
+        }
         body["tools"] = serde_json::Value::Array(tools);
     }
     body
@@ -607,7 +631,14 @@ mod tests {
     fn body_maps_system_tools_and_tokens() {
         let body = anthropic_body(&req_with_tools());
         assert_eq!(body["model"], serde_json::json!("claude-opus-4-5"));
-        assert_eq!(body["system"], serde_json::json!("ты кодер"));
+        /* rev66: system уходит массивом блоков - иначе точку кэша не поставить. */
+        let system = body["system"].as_array().expect("system - массив блоков");
+        assert_eq!(system[0]["text"], serde_json::json!("ты кодер"));
+        assert_eq!(
+            system[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "точка кэша на последнем блоке system"
+        );
         assert_eq!(body["max_tokens"], serde_json::json!(DEFAULT_MAX_TOKENS));
         assert_eq!(body["stream"], serde_json::json!(true));
         assert_eq!(body["messages"][0]["role"], serde_json::json!("user"));
@@ -619,6 +650,29 @@ mod tests {
             serde_json::json!("string")
         );
         assert!(tools[0].get("function").is_none(), "конверт снят");
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "второй точки не нужно: префикс кэша покрывает инструменты через system"
+        );
+    }
+
+    #[test]
+    fn body_caches_tools_when_there_is_no_system_prompt() {
+        /* Без системы точку кэша ставить больше некуда - иначе кэш не
+        включился бы ни на одном запросе такого вида. */
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "Читать файл".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let req = ChatRequest::new("m", vec![ChatMessage::user("привет")]).with_tools(&[spec]);
+        let body = anthropic_body(&req);
+        assert!(body.get("system").is_none(), "системы нет - ключа нет");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "точка кэша переехала на последний инструмент"
+        );
     }
 
     #[test]
