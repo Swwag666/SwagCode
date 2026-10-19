@@ -1821,6 +1821,8 @@ pub(crate) async fn run_subagent(
         messages.extend(history.iter().cloned());
         est_in += swagcod_core::context::estimate_history_tokens(&messages, cpt) as u64;
         let request = ChatRequest {
+            /* rev69: суб-агент - текстовая ветка, вложений у него нет. */
+            images: Vec::new(),
             model: model.to_string(),
             messages,
             stream: true,

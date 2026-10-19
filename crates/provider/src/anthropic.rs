@@ -230,7 +230,11 @@ pub fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
     let mut system_parts = Vec::new();
     // Роль → блоки контента; соседей одной роли склеим ниже.
     let mut seq: Vec<(&str, Vec<serde_json::Value>)> = Vec::new();
-    for m in &req.messages {
+    /* rev69: картинки идут в ПОСЛЕДНЕЕ сообщение пользователя. История их не
+    хранит, поэтому привязка по индексу, а не к любому user-сообщению: иначе
+    картинка уехала бы в старый ход, и модель увидела бы её не там. */
+    let last_user = req.messages.iter().rposition(|m| m.role == Role::User);
+    for (idx, m) in req.messages.iter().enumerate() {
         match m.role {
             Role::System => {
                 if !m.content.is_empty() {
@@ -238,11 +242,24 @@ pub fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
                 }
             }
             Role::User => {
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                if Some(idx) == last_user && !req.images.is_empty() {
+                    for img in &req.images {
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            },
+                        }));
+                    }
+                }
                 if !m.content.is_empty() {
-                    seq.push((
-                        "user",
-                        vec![serde_json::json!({"type": "text", "text": m.content})],
-                    ));
+                    blocks.push(serde_json::json!({"type": "text", "text": m.content}));
+                }
+                if !blocks.is_empty() {
+                    seq.push(("user", blocks));
                 }
             }
             Role::Tool => {

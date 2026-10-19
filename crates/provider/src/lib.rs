@@ -29,6 +29,8 @@ pub mod types;
 
 #[cfg(feature = "http")]
 pub mod anthropic;
+/* rev69: приёмочные тесты картинок отдельным модулем - проверяют и блоки
+Anthropic, и отсутствие утечки картинок в тело OpenAI-совместимого запроса. */
 #[cfg(feature = "http")]
 pub mod any;
 #[cfg(feature = "http")]
@@ -37,6 +39,8 @@ pub mod echo;
 pub mod http;
 #[cfg(feature = "http")]
 pub mod router;
+#[cfg(all(test, feature = "http"))]
+mod tests_images;
 
 pub use presets::{find_preset, ProviderFlavor, ProviderPreset, PRESETS};
 pub use sse::{SseParser, StreamEvent};

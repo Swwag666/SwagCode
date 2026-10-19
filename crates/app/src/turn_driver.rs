@@ -606,6 +606,8 @@ pub(crate) async fn start_turn_core(
                         v
                     };
                     let request = ChatRequest {
+                        /* rev69: провайдер умеет картинки, но ядро их пока не прикладывает - это следующий шаг. Список пуст намеренно, а не забыт. */
+                        images: Vec::new(),
                         model: effective_model.clone(),
                         messages,
                         stream: true,

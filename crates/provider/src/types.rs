@@ -97,10 +97,30 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<serde_json::Value>,
+    /// Картинки текущего запроса (rev69). Прикладываются к ПОСЛЕДНЕМУ
+    /// сообщению пользователя: история их не хранит, иначе база распухла бы.
+    ///
+    /// `serde(skip)` намеренно: в теле OpenAI-совместимого запроса
+    /// верхнеуровневого `images` нет, и строгий провайдер ответил бы 400.
+    /// Картинки подставляет сборщик тела по своему протоколу.
+    #[serde(skip)]
+    pub images: Vec<ImageAttachment>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Картинка, приложенная к запросу.
+///
+/// Данные лежат в base64 БЕЗ префикса `data:`: оба протокола хотят именно так,
+/// а префикс каждый добавляет по своим правилам.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// MIME-тип: `image/png`, `image/jpeg`, `image/webp`, `image/gif`.
+    pub media_type: String,
+    /// Сами байты в base64.
+    pub data_base64: String,
 }
 
 impl ChatRequest {
@@ -113,6 +133,7 @@ impl ChatRequest {
             reasoning_effort: None,
             stream: true,
             tools: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -131,6 +152,12 @@ impl ChatRequest {
                 })
             })
             .collect();
+        self
+    }
+
+    /// Приложить картинки к запросу (rev69).
+    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+        self.images = images;
         self
     }
 }
