@@ -2439,6 +2439,12 @@ pub(crate) async fn execute_tool(
                 .arg("/C")
                 .arg(&command)
                 .current_dir(cwd)
+                // Без piped-стандартов wait_with_output возвращает пустые
+                // векторы: GUI-процессу нечего наследовать, вывод команды
+                // терялся целиком, доезжал только exit-код.
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn();
             let child = match child {
                 Ok(c) => c,
@@ -5742,6 +5748,33 @@ mod tests {
         let mut le = vec![0xFF, 0xFE];
         le.extend_from_slice(&0x044Fu16.to_le_bytes()); // 'я' в UTF-16LE
         assert_eq!(decode_text_bytes(&le), "я");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn execute_tool_bash_returns_stdout_and_exit_code() {
+        let dir = std::env::temp_dir().join(format!("swagcod-bash-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = execute_tool(
+            &call(
+                "bash",
+                serde_json::json!({"command": "echo swagprobe & exit /b 7"}),
+            ),
+            &dir,
+            std::time::Duration::from_secs(15),
+            &[],
+        )
+        .await;
+        assert!(
+            out.output.contains("swagprobe"),
+            "stdout обязан доезжать: {out:?}"
+        );
+        assert!(
+            out.output.contains("exit: 7"),
+            "exit-код обязан пробрасываться: {out:?}"
+        );
+        assert!(!out.ok, "ненулевой exit — неуспех");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
