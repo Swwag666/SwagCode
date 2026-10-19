@@ -17,6 +17,7 @@ pub mod context;
 pub mod folder_rules;
 pub mod fork;
 pub mod hooks;
+pub mod night;
 pub mod node_store;
 pub mod pricing;
 pub mod rules;
