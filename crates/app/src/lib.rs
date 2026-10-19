@@ -757,6 +757,50 @@ pub(crate) async fn create_session_core(
     Ok(brief)
 }
 
+/// Ответвить сессию: полная история, пустой журнал (rev73).
+///
+/// Ветка - это новая сессия в том же каталоге с той же моделью: разговор
+/// продолжается, журнал ходов начинается с нуля. Ядро решает, что наследовать,
+/// здесь только запись - meta, store и список, ровно как у создания сессии.
+pub(crate) async fn fork_session_core(
+    state: &AppState,
+    session_id: String,
+) -> Result<SessionBrief, String> {
+    let id = SessionId::new(format!("s-{}", short_id()));
+    /* Источник читаем под замком сессий и отпускаем его до записи: store берёт
+    свой замок, и держать оба сразу незачем. */
+    let fork = {
+        let sessions = state.sessions.lock().await;
+        let source = sessions
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия не найдена: {session_id}"))?;
+        swagcod_core::fork::fork_session(source, id.clone(), swagcod_core::bus::now_ms())
+    };
+    let brief = SessionBrief::from(&fork);
+    if let Ok(mut m) = state.session_meta.lock() {
+        m.insert(brief.id.clone(), meta_of(&fork));
+    }
+    if let Ok(store) = state.store.lock() {
+        if let Err(e) = store.create_session(&fork) {
+            eprintln!("store: ветка не записана: {e}");
+        }
+    }
+    state.sessions.lock().await.push(fork);
+    state.bus.publish(EventKind::Status {
+        message: format!("ветка {id} создана"),
+    });
+    Ok(brief)
+}
+
+#[tauri::command]
+async fn session_fork(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<SessionBrief, String> {
+    let st = state.inner().clone();
+    fork_session_core(&st, session_id).await
+}
 #[tauri::command]
 async fn set_approval_policy(
     state: State<'_, Arc<AppState>>,
@@ -4657,6 +4701,7 @@ pub fn run() {
             clear_protected_key,
             get_diagnostics,
             http_api_status,
+            session_fork,
             metrics_history,
             tokens_by_day,
             bus_seq,
