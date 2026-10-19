@@ -5740,3 +5740,29 @@ RUSTSEC-2026-0370/0371 (zvariant, zbus_names помечены unmaintained): т�
 чисто, svelte-check 0/0, vitest 195, бандл 428383 / 435000). Релизная сборка
 `cargo` в профиле release прошла без ошибок и предупреждений, NSIS-бандл и
 подпись апдейтера получены, `BUILD_EXIT=0`.
+
+**D-264. `beforeBuildCommand` был сломан на CI, и локальная сборка этого не
+показывала.** Первый же прогон `release.yml` на теге v0.2.1 (`39179631815`)
+прошёл ВСЕ ворота — fmt, Rust tests, Clippy, svelte-check, vitest зелёные, то
+есть секреты подписи и `Cargo.lock` сняли прежние два блокера, — и умер на
+`tauri-apps/tauri-action@v1`:
+`beforeBuildCommand \`pnpm --dir ../../apps/desktop build\` failed`,
+`ENOENT: no such file or directory, lstat 'D:\a\SwagCode\apps'`. Причина в том,
+что tauri запускает хук с CWD корня Cargo-workspace, а не каталога
+`crates/app`, где лежит конфиг: `../../apps/desktop` от корня репозитория
+уезжает на уровень ВЫШЕ чекаута. Локально дефект не воспроизводился вовсе,
+потому что `tools/build-release.ps1` подменяет конфиг на
+`tools/tauri-nobuild.json` (хук отключён, vite гоняется отдельно с
+`Push-Location apps\desktop`) — ровно тот обход, который в своё время спас
+локальную сборку от сломанного pnpm, и одновременно спрятал этот баг. Править
+путь на `--dir apps/desktop` нельзя: тогда хук сломается при запуске из
+`crates/app`. Вместо этого хук переведён на `pnpm --filter swagcod-desktop
+build` (и `dev` — то же для `beforeDevCommand`): pnpm ищет корень workspace
+вверх от любого CWD, поэтому команда не зависит от того, откуда её позвали.
+Именно так уже гоняет сборку `ci.yml` (`pnpm --filter swagcod-desktop build`),
+то есть форма проверена на тех же раннерах. `frontendDist` не тронут: пути в
+конфиге tauri резолвит относительно файла конфига, и `../../apps/desktop/dist`
+от `crates/app` корректен — это подтверждает каждая локальная сборка. Релиз при
+падении не создался (`gh release list` пуст), поэтому тег v0.2.1 переставлен на
+коммит с фиксом и запушен заново: тег обязан указывать на тот код, из которого
+собран артефакт.

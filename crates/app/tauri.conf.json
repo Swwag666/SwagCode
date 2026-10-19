@@ -4,9 +4,9 @@
   "version": "0.2.1",
   "identifier": "xyz.swagcod.desktop",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../../apps/desktop dev",
+    "beforeDevCommand": "pnpm --filter swagcod-desktop dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm --dir ../../apps/desktop build",
+    "beforeBuildCommand": "pnpm --filter swagcod-desktop build",
     "frontendDist": "../../apps/desktop/dist"
   },
   "app": {
