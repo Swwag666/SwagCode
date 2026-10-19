@@ -426,7 +426,7 @@ const BG_EXTENSIONS: [&str; 8] = ["gif", "mp4", "webm", "png", "jpg", "jpeg", "w
 
 /// Минимальный base64 без зависимостей: IPC гоняет JSON, поэтому бинарные
 /// файлы фона передаются строкой, а не массивом из миллионов чисел.
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

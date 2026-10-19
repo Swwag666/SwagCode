@@ -103,6 +103,46 @@ pub fn turn_guard_reason(
     None
 }
 
+/// Потолок картинки-вложения (rev70).
+///
+/// Отдельный и выше текстового: фото на 200 КБ не бывает, а текстовый предел
+/// рассчитан на код и логи.
+pub(crate) const IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Картинки вложений, готовые для запроса (rev70).
+///
+/// Отдаются отдельно от текста: `render_attachments` вставляет текстовые файлы в
+/// сообщение, а картинку в текст не вставишь - она уходит блоком. Берутся только
+/// форматы, которые принимает Anthropic (`png`, `jpeg`, `webp`, `gif`): `bmp` и
+/// `ico` остаются текстовому пути, иначе запрос с картинкой получил бы 400.
+pub(crate) fn image_attachments(paths: &[String]) -> Vec<swagcod_provider::types::ImageAttachment> {
+    let mut out = Vec::new();
+    for p in paths {
+        let ext = std::path::Path::new(p)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let media_type = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => continue,
+        };
+        match std::fs::metadata(p) {
+            Ok(m) if m.len() <= IMAGE_MAX_BYTES => {}
+            _ => continue,
+        }
+        let Ok(bytes) = std::fs::read(p) else {
+            continue;
+        };
+        out.push(swagcod_provider::types::ImageAttachment {
+            media_type: media_type.to_string(),
+            data_base64: crate::base64_encode(&bytes),
+        });
+    }
+    out
+}
 pub(crate) fn render_attachments(paths: &[String]) -> String {
     let mut out = String::new();
     for p in paths {
@@ -286,8 +326,11 @@ pub(crate) async fn start_turn_core(
     /* Скрепка: вложения подшиваются к тексту одним сообщением — история
     и контекст видят их как часть реплики пользователя. */
     let mut message = message.trim().to_string();
+    /* rev70: картинки идут отдельно от текста. */
+    let mut turn_images: Vec<swagcod_provider::types::ImageAttachment> = Vec::new();
     if let Some(paths) = attachments.as_ref().filter(|a| !a.is_empty()) {
         message.push_str(&render_attachments(paths));
+        turn_images = image_attachments(paths);
         message = message.trim().to_string();
     }
     if message.is_empty() {
@@ -607,7 +650,7 @@ pub(crate) async fn start_turn_core(
                     };
                     let request = ChatRequest {
                         /* rev69: провайдер умеет картинки, но ядро их пока не прикладывает - это следующий шаг. Список пуст намеренно, а не забыт. */
-                        images: Vec::new(),
+                        images: turn_images.clone(),
                         model: effective_model.clone(),
                         messages,
                         stream: true,
@@ -1089,4 +1132,53 @@ pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Resu
         activity.remove(&turn_id);
     }
     Ok(())
+}
+#[cfg(test)]
+mod image_attachment_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("swagcod-img-{tag}-{}-{ms}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("каталог");
+        dir
+    }
+
+    #[test]
+    fn only_supported_formats_become_image_blocks() {
+        /* bmp и ico Anthropic не принимает: отправить их блоком - получить 400.
+        Поэтому они остаются текстовому пути, а txt - не картинка вовсе. */
+        let dir = tmp("split");
+        std::fs::write(dir.join("a.png"), b"PNGDATA").unwrap();
+        std::fs::write(dir.join("b.bmp"), b"BMPDATA").unwrap();
+        std::fs::write(dir.join("c.txt"), b"text").unwrap();
+        let paths = vec![
+            dir.join("a.png").to_string_lossy().to_string(),
+            dir.join("b.bmp").to_string_lossy().to_string(),
+            dir.join("c.txt").to_string_lossy().to_string(),
+        ];
+        let imgs = image_attachments(&paths);
+        assert_eq!(imgs.len(), 1, "только png");
+        assert_eq!(imgs[0].media_type, "image/png");
+        assert_eq!(imgs[0].data_base64, crate::base64_encode(b"PNGDATA"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversize_image_is_not_sent() {
+        let dir = tmp("oversize");
+        let big = vec![0u8; (IMAGE_MAX_BYTES + 1) as usize];
+        std::fs::write(dir.join("big.png"), &big).unwrap();
+        let paths = vec![dir.join("big.png").to_string_lossy().to_string()];
+        assert!(
+            image_attachments(&paths).is_empty(),
+            "файл сверх предела не уходит в запрос"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
