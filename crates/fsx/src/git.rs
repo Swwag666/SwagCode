@@ -349,6 +349,101 @@ pub async fn restore_checkpoint(cwd: &Path, sha: &str) -> Result<RestoreReport, 
     })
 }
 
+/// Закоммитить текущие изменения worktree (rev75).
+///
+/// Нужно авто-коммиту хода: снимок F-5 показывает, что менялось, но сам коммит
+/// до сих пор делал человек руками. Дерево чисто - `Ok(None)`, а не пустой
+/// коммит: коммитить нечего, и пустая запись в истории хуже её отсутствия.
+///
+/// `git add -A` берёт и новые файлы (кроме gitignore) - то же правило, что у
+/// снимка: агент регулярно создаёт файлы, и коммит без них был бы половиной
+/// работы. Ветку не создаём и ничего не пушим: коммит кладёт работу в текущую
+/// ветку, а решение, куда её отправить, остаётся за владельцем.
+pub async fn commit_all(cwd: &Path, message: &str) -> Result<Option<String>, FsxError> {
+    if !is_repo(cwd).await {
+        return Err(FsxError::Other(
+            "коммит: рабочая директория - не git-репозиторий".into(),
+        ));
+    }
+    /* Сначала спрашиваем, есть ли что коммитить: `git commit` без изменений
+    падает, и разбирать текст ошибки хуже, чем проверить прямо. */
+    let status = git_out(
+        cwd,
+        &["--no-optional-locks", "status", "--porcelain", "--", "."],
+        QUICK_TIMEOUT,
+    )
+    .await?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+    git_out(cwd, &["add", "-A", "--", "."], SNAPSHOT_TIMEOUT).await?;
+    let msg = {
+        let m = message.trim();
+        if m.is_empty() {
+            "swagcod: изменения хода"
+        } else {
+            m
+        }
+    };
+    git_out(cwd, &["commit", "-q", "-m", msg], SNAPSHOT_TIMEOUT).await?;
+    let sha = git_out(cwd, &["rev-parse", "HEAD"], QUICK_TIMEOUT).await?;
+    Ok(Some(sha.trim().to_string()))
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn commit_creates_one_commit_and_skips_a_clean_tree() {
+        let dir = std::env::temp_dir().join(format!("swagcod-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("каталог");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .output()
+        };
+        let ok = run(&["init", "-q"])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("git недоступен - тест коммита пропущен");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = run(&["config", "user.email", "test@swagcod.local"]);
+        let _ = run(&["config", "user.name", "SwagCod Test"]);
+        let _ = run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+
+        let sha = commit_all(&dir, "первый")
+            .await
+            .unwrap()
+            .expect("коммит создан");
+        assert_eq!(sha.len(), 40, "полный sha HEAD: {sha}");
+        assert!(
+            commit_all(&dir, "второй").await.unwrap().is_none(),
+            "чистое дерево - коммита нет, а не пустой коммит"
+        );
+        let count = git_out(&dir, &["rev-list", "--count", "HEAD"], QUICK_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(count.trim(), "1", "ровно один коммит");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_outside_a_repo_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("swagcod-nocommit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("каталог");
+        let e = commit_all(&dir, "x").await;
+        assert!(e.is_err(), "вне репозитория коммита не бывает");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 fn split_paths(raw: &str) -> Vec<String> {
     raw.lines()
         .map(|l| l.trim().trim_matches('"').to_string())
