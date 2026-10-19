@@ -15,6 +15,7 @@ pub mod backup;
 pub mod bus;
 pub mod context;
 pub mod folder_rules;
+pub mod fork;
 pub mod hooks;
 pub mod node_store;
 pub mod pricing;
