@@ -37,16 +37,35 @@
     suppress_when_focused: boolean
   }
 
-  const BUILTIN_SOUNDS = ['done', 'error', 'chime'] as const
-  const TRIGGER_KEYS: NotifyTrigger[] = ['turn_complete', 'turn_error', 'approval_required']
-  const TRIGGER_LABELS: Record<NotifyTrigger, string> = {
-    turn_complete: 'Turn complete',
-    turn_error: 'Turn error',
-    approval_required: 'Approval required',
+  /* rev61: итог теста приходит от ядра, а не подразумевается. Раньше кнопка
+     «Проверить» молчала одинаково в обоих исходах, поэтому «не работает»
+     нельзя было отличить от «сработало тихо». */
+  interface NotifyTestReport {
+    outcome: 'played' | 'no_device' | 'no_sound' | 'toast_only' | 'off' | 'unknown'
+    sound: string | null
+    percent: number
+    toast: boolean
   }
 
+  const BUILTIN_SOUNDS = ['done', 'error', 'chime'] as const
+  const TRIGGER_KEYS: NotifyTrigger[] = ['turn_complete', 'turn_error', 'approval_required']
+  /* rev61: подписи триггеров держат ключи словаря, а не английские литералы -
+     иначе перевод живёт в двух местах и разъезжается. */
+  const TRIGGER_LABELS: Record<NotifyTrigger, StrKey> = {
+    turn_complete: 'triggerTurnComplete',
+    turn_error: 'triggerTurnError',
+    approval_required: 'triggerApproval',
+  }
+
+  /* Громкость в домене ядра - доля 0.0..1.0 (там же лежит clamp), а слайдер
+     живёт в процентах. Конвертация только на границе слайдера: раньше
+     проценты писались прямо в доменное поле, поэтому подпись показывала «1%»
+     вместо «80%», а звук уходил на границу clamp. */
+  const toPercent = (v: number): number => Math.round((v <= 1 ? v : v / 100) * 100)
+  const fromPercent = (p: number): number => p / 100
+
   function defaultAction(): NotifyAction {
-    return { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 80, title: '', body: '' }
+    return { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 0.8, title: '', body: '' }
   }
 
   let notifyCfg = $state<NotificationConfig>({
@@ -61,11 +80,28 @@
 
   async function loadNotifyConfig() {
     try {
-      notifyCfg = await invoke<NotificationConfig>('get_notification_config')
+      notifyCfg = normalizeNotifyConfig(await invoke<NotificationConfig>('get_notification_config'))
       notifyLoaded = true
     } catch (e) {
-      notifyStatus = `Load failed: ${e}`
+      notifyStatus = t('notifLoadFailed').replace('{msg}', String(e))
     }
+  }
+
+  /* rev61: до этой ревизии слайдер писал проценты (0..100) прямо в доменное
+     поле, где ядро ждёт долю 0.0..1.0. У тех, кто двигал слайдер, в prefs уже
+     лежат значения вида 80 - читаем их как проценты, иначе звук уходил на
+     границу clamp, а подпись показывала «1%» вместо «80%». */
+  function normalizeNotifyConfig(cfg: NotificationConfig): NotificationConfig {
+    const fixVol = (v: unknown): number => {
+      const n = typeof v === 'number' && Number.isFinite(v) ? v : 0.8
+      return n <= 1 ? n : n / 100
+    }
+    cfg.master_volume = fixVol(cfg.master_volume)
+    for (const key of Object.keys(cfg.triggers ?? {})) {
+      const a = cfg.triggers[key] as any
+      if (a && 'volume' in a) a.volume = fixVol(a.volume)
+    }
+    return cfg
   }
 
   function scheduleSave() {
@@ -79,24 +115,36 @@
     notifyStatus = null
     try {
       await invoke('set_notification_config', { config: notifyCfg })
-      notifyStatus = 'Saved'
-      setTimeout(() => { if (notifyStatus === 'Saved') notifyStatus = null }, 1500)
+      notifyStatus = t('notifSaved')
+      setTimeout(() => { if (notifyStatus === t('notifSaved')) notifyStatus = null }, 1500)
     } catch (e) {
-      notifyStatus = `Save failed: ${e}`
+      notifyStatus = t('notifSaveFailed').replace('{msg}', String(e))
     }
   }
 
   // Type-safe accessors for NotifyAction union (svelte2tsx can't narrow discriminated unions in templates).
-  function actVolume(act: NotifyAction): number { return 'volume' in act ? (act as any).volume : 80 }
+  function actVolume(act: NotifyAction): number { return 'volume' in act ? (act as any).volume : 0.8 }
   function actSource(act: NotifyAction): SoundSource { return 'source' in act ? (act as any).source : { type: 'builtin', name: 'done' } }
   function actTitle(act: NotifyAction): string { return 'title' in act ? (act as any).title : 'Notification' }
   function actBody(act: NotifyAction): string { return 'body' in act ? (act as any).body : '' }
 
+  /* Тест показывает, что реально произошло: сколько было громкости, открылось
+     ли аудиоустройство. Раньше кнопка молчала в обоих исходах, поэтому
+     «не работает» было невозможно отличить от «сработало тихо». */
   async function testTrigger(trigger: NotifyTrigger) {
     try {
-      await invoke('test_notification', { trigger })
+      const report = await invoke<NotifyTestReport>('test_notification', { trigger })
+      if (report.outcome === 'off') notifyStatus = t('notifTestOff')
+      else if (report.outcome === 'played') {
+        const line = t('notifTestPlayed')
+          .replace('{name}', report.sound ?? '')
+          .replace('{v}', String(Math.round(report.percent)))
+        notifyStatus = report.toast ? `${line} + ${t('notifTestToast')}` : line
+      } else if (report.outcome === 'no_device') notifyStatus = t('notifTestNoDevice')
+      else if (report.outcome === 'no_sound') notifyStatus = t('notifTestNoSound')
+      else notifyStatus = report.toast ? t('notifTestToast') : t('notifTestOff')
     } catch (e) {
-      notifyStatus = `Test failed: ${e}`
+      notifyStatus = t('notifTestFailed').replace('{msg}', String(e))
     }
   }
 
@@ -181,23 +229,27 @@
 
   type CleanupNumKey = 'max_sessions' | 'max_age_days' | 'max_log_size_mb'
   type CleanupBoolKey = 'enabled' | 'honor_folder_rules' | 'cleanup_empty_dirs'
+  /* Списки правил папки: ключ поля = имя поля в rules.json. */
+  type DirListKey = 'allow' | 'deny' | 'disabled_mcp' | 'disabled_plugins' | 'disabled_skills'
 
   /* Три предела устроены одинаково, поэтому ряды собираются из описания:
-     подпись не может разъехаться с полем, а правка текста одна на все три. */
+     подпись не может разъехаться с полем, а правка текста одна на все три.
+     rev61: title/desc - ключи словаря (StrKey), а не текст: подписи этих
+     рядов были единственным английским островом в русских настройках. */
   const CLEANUP_FIELDS = [
-    { key: 'max_sessions', title: 'Keep sessions', desc: 'Newest N sessions stay, older ones are deleted', min: 1 },
-    { key: 'max_age_days', title: 'Max age, days', desc: 'Sessions older than this are deleted', min: 1 },
-    { key: 'max_log_size_mb', title: 'Max log size, MB', desc: 'Bigger session logs are truncated to this size', min: 1 },
-  ] as const
+    { key: 'max_sessions', title: 'cleanupMaxSessions', desc: 'cleanupMaxSessionsDesc', min: 1 },
+    { key: 'max_age_days', title: 'cleanupMaxAge', desc: 'cleanupMaxAgeDesc', min: 1 },
+    { key: 'max_log_size_mb', title: 'cleanupMaxLog', desc: 'cleanupMaxLogDesc', min: 1 },
+  ] as const satisfies readonly { key: CleanupNumKey; title: StrKey; desc: StrKey; min: number }[]
 
-  /* Пять списков правил папки — тоже один each: отличаются только подписи. */
+  /* Пять списков правил папки - тоже один each: отличаются только подписи. */
   const DIR_LIST_FIELDS = [
-    { key: 'allow', title: 'Allow (regex)', desc: 'Matching calls run without an approval dialog' },
-    { key: 'deny', title: 'Deny (regex)', desc: 'Checked first: matching calls are blocked silently' },
-    { key: 'disabled_mcp', title: 'Disabled MCP', desc: 'MCP servers hidden in this folder' },
-    { key: 'disabled_plugins', title: 'Disabled plugins', desc: 'Plugins hidden in this folder' },
-    { key: 'disabled_skills', title: 'Disabled skills', desc: 'Skills hidden in this folder' },
-  ] as const
+    { key: 'allow', title: 'ruleFieldAllow', desc: 'ruleFieldAllowDesc' },
+    { key: 'deny', title: 'ruleFieldDeny', desc: 'ruleFieldDenyDesc' },
+    { key: 'disabled_mcp', title: 'ruleFieldMcp', desc: 'ruleFieldMcpDesc' },
+    { key: 'disabled_plugins', title: 'ruleFieldPlugins', desc: 'ruleFieldPluginsDesc' },
+    { key: 'disabled_skills', title: 'ruleFieldSkills', desc: 'ruleFieldSkillsDesc' },
+  ] as const satisfies readonly { key: DirListKey; title: StrKey; desc: StrKey }[]
 
   let cleanupCfg = $state<CleanupConfig>({
     max_sessions: 100,
@@ -449,7 +501,7 @@
       опечатки, а диалог тот же, что App использует для рабочих областей. */
   async function pickDirCwd() {
     try {
-      const sel = await openDialog({ directory: true, multiple: false, title: 'Rules folder' })
+      const sel = await openDialog({ directory: true, multiple: false, title: t('rulesFolderDialog') })
       const path = typeof sel === 'string' ? sel : ''
       if (!path) return
       dirCwd = path
@@ -509,14 +561,17 @@
   }
 
   /** Непустые списки резолва парами «имя + значения» — вместо пяти копий разметки. */
-  function resolvedLists(r: ResolvedRulesDto): { label: string; items: string[] }[] {
-    return [
-      { label: 'allow', items: r.allow },
-      { label: 'deny', items: r.deny },
-      { label: 'disabled_mcp', items: r.disabled_mcp },
-      { label: 'disabled_plugins', items: r.disabled_plugins },
-      { label: 'disabled_skills', items: r.disabled_skills },
-    ].filter((g) => g.items.length > 0)
+  function resolvedLists(r: ResolvedRulesDto): { label: StrKey; items: string[] }[] {
+    /* Аннотация на самом массиве: `.filter` стирает контекст возврата, и без
+       неё подписи расширяются до string - тогда t(label) не типизируется. */
+    const groups: { label: StrKey; items: string[] }[] = [
+      { label: 'ruleFieldAllow', items: r.allow },
+      { label: 'ruleFieldDeny', items: r.deny },
+      { label: 'ruleFieldMcp', items: r.disabled_mcp },
+      { label: 'ruleFieldPlugins', items: r.disabled_plugins },
+      { label: 'ruleFieldSkills', items: r.disabled_skills },
+    ]
+    return groups.filter((g) => g.items.length > 0)
   }
 
   /* Ленивая загрузка: правила папок нужны только на вкладке security, а путь
@@ -912,8 +967,8 @@
       <div class="settings-header">
         <h2>{t('settings')}</h2>
         <div class="settings-actions">
-          <button class="settings-action-btn" onclick={openConfigFile}>Open configuration file</button>
-          <button class="settings-action-btn" onclick={exportDiagnostics}>Export Diagnostics</button>
+          <button class="settings-action-btn" onclick={openConfigFile}>{t('openConfigFile')}</button>
+          <button class="settings-action-btn" onclick={exportDiagnostics}>{t('exportDiagnosticsBtn')}</button>
           <button class="settings-close" onclick={() => (showSettings = false)} aria-label="закрыть"><Icon name="close" size={14} /></button>
         </div>
       </div>
@@ -1031,8 +1086,8 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Background effects</span>
-                  <span class="label-desc">Wireframe sphere, particles, scan lines</span>
+                  <span class="label-title">{t('bgEffectsTitle')}</span>
+                  <span class="label-desc">{t('bgEffectsDesc')}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" bind:checked={effectsEnabled} />
@@ -1041,11 +1096,11 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Background mode</span>
+                  <span class="label-title">{t('bgModeTitle')}</span>
                 </div>
                 <select bind:value={bgMode} class="settings-select">
-                  <option value="sphere">Wireframe sphere</option>
-                  <option value="matrix">Matrix rain</option>
+                  <option value="sphere">{t('bgSphere')}</option>
+                  <option value="matrix">{t('bgMatrix')}</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -1155,8 +1210,8 @@
               <!-- ── Notifications subsection ── -->
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Notifications</span>
-                  <span class="label-desc">{notifyStatus ?? (notifyLoaded ? 'Configure alerts for turn events' : 'Loading...')}</span>
+                  <span class="label-title">{t('notifTitle')}</span>
+                  <span class="label-desc">{notifyStatus ?? (notifyLoaded ? t('notifDesc') : t('notifLoading'))}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" checked={notifyCfg.enabled} onchange={(e) => onNotifyToggle('enabled', e.currentTarget.checked)} />
@@ -1165,8 +1220,8 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Suppress when focused</span>
-                  <span class="label-desc">Don't notify while the window is active</span>
+                  <span class="label-title">{t('notifSuppressTitle')}</span>
+                  <span class="label-desc">{t('notifSuppressDesc')}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" checked={notifyCfg.suppress_when_focused} onchange={(e) => onNotifyToggle('suppress_when_focused', e.currentTarget.checked)} />
@@ -1175,8 +1230,8 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Master volume</span>
-                  <span class="label-desc">{Math.round(notifyCfg.master_volume)}%</span>
+                  <span class="label-title">{t('notifVolumeTitle')}</span>
+                  <span class="label-desc">{toPercent(notifyCfg.master_volume)}%</span>
                 </div>
                 <div class="font-size-control">
                   <input
@@ -1184,11 +1239,11 @@
                     min="0"
                     max="100"
                     step="1"
-                    value={notifyCfg.master_volume}
-                    oninput={(e) => onMasterVolume(Number((e.target as HTMLInputElement).value))}
+                    value={toPercent(notifyCfg.master_volume)}
+                    oninput={(e) => onMasterVolume(fromPercent(Number((e.target as HTMLInputElement).value)))}
                     class="settings-range"
                   />
-                  <span>{Math.round(notifyCfg.master_volume)}%</span>
+                  <span>{toPercent(notifyCfg.master_volume)}%</span>
                 </div>
               </div>
               {#each TRIGGER_KEYS as key (key)}
@@ -1196,7 +1251,7 @@
                 {@const actionType = (act.action as string) || 'off'}
                 <div class="settings-row notify-trigger-row">
                   <div class="settings-label">
-                    <span class="label-title">{TRIGGER_LABELS[key]}</span>
+                    <span class="label-title">{t(TRIGGER_LABELS[key])}</span>
                   </div>
                   <div class="notify-controls">
                     <select
@@ -1204,16 +1259,16 @@
                       value={actionType}
                       onchange={(e) => {
                         const v = e.currentTarget.value
-                        if (v === 'off') setTriggerAction(key, { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 80, title: '', body: '' })
+                        if (v === 'off') setTriggerAction(key, { action: 'off' as never, source: { type: 'builtin', name: 'done' }, volume: 0.8, title: '', body: '' })
                         else if (v === 'sound') setTriggerAction(key, { action: 'sound', source: { type: 'builtin', name: 'done' }, volume: actVolume(act) })
                         else if (v === 'toast') setTriggerAction(key, { action: 'toast', title: actTitle(act), body: actBody(act) })
                         else if (v === 'both') setTriggerAction(key, { action: 'both', source: actSource(act), volume: actVolume(act), title: actTitle(act), body: actBody(act) })
                       }}
                     >
-                      <option value="off">Off</option>
-                      <option value="sound">Sound</option>
-                      <option value="toast">Toast</option>
-                      <option value="both">Sound + Toast</option>
+                      <option value="off">{t('notifActionOff')}</option>
+                      <option value="sound">{t('notifActionSound')}</option>
+                      <option value="toast">{t('notifActionToast')}</option>
+                      <option value="both">{t('notifActionBoth')}</option>
                     </select>
                     {#if actionType === 'sound' || actionType === 'both'}
                       <select
@@ -1234,17 +1289,17 @@
                         min="0"
                         max="100"
                         step="1"
-                        value={actVolume(act)}
+                        value={toPercent(actVolume(act))}
                         oninput={(e) => {
-                          const vol = Number((e.target as HTMLInputElement).value)
+                          const vol = fromPercent(Number((e.target as HTMLInputElement).value))
                           const cur = getTriggerAction(key)
                           setTriggerAction(key, { ...cur, volume: vol } as NotifyAction)
                         }}
                         class="settings-range notify-vol-range"
-                        title={`Volume: ${actVolume(act)}%`}
+                        title={`${toPercent(actVolume(act))}%`}
                       />
                     {/if}
-                    <button class="step-btn text-btn" onclick={() => void testTrigger(key)}>Test</button>
+                    <button class="step-btn text-btn" data-testid={`notify-test-${key}`} onclick={() => void testTrigger(key)}>{t('notifTest')}</button>
                   </div>
                 </div>
               {/each}
@@ -1252,8 +1307,8 @@
               <!-- ── Maintenance subsection ── -->
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Maintenance</span>
-                  <span class="label-desc">{cleanupStatus ?? (cleanupLoaded ? 'Auto-cleanup of stale sessions and oversized logs' : 'Loading...')}</span>
+                  <span class="label-title">{t('maintTitle')}</span>
+                  <span class="label-desc">{cleanupStatus ?? (cleanupLoaded ? t('maintDesc') : t('notifLoading'))}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" checked={cleanupCfg.enabled} onchange={(e) => onCleanupToggle('enabled', e.currentTarget.checked)} />
@@ -1263,8 +1318,8 @@
               {#each CLEANUP_FIELDS as f (f.key)}
                 <div class="settings-row">
                   <div class="settings-label">
-                    <span class="label-title">{f.title}</span>
-                    <span class="label-desc">{f.desc}</span>
+                    <span class="label-title">{t(f.title)}</span>
+                    <span class="label-desc">{t(f.desc)}</span>
                   </div>
                   <input
                     type="number"
@@ -1272,14 +1327,14 @@
                     min={f.min}
                     value={cleanupCfg[f.key]}
                     onchange={(e) => onCleanupNumber(f.key, Number(e.currentTarget.value))}
-                    aria-label={f.title}
+                    aria-label={t(f.title)}
                   />
                 </div>
               {/each}
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Honor folder rules</span>
-                  <span class="label-desc">A folder's .swagcod/rules.json may set its own session TTL or exempt the folder from cleanup</span>
+                  <span class="label-title">{t('maintHonorTitle')}</span>
+                  <span class="label-desc">{t('maintHonorDesc')}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" checked={cleanupCfg.honor_folder_rules} onchange={(e) => onCleanupToggle('honor_folder_rules', e.currentTarget.checked)} />
@@ -1288,8 +1343,8 @@
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Remove emptied work folders</span>
-                  <span class="label-desc">Only completely empty directories go; a folder survives while .swagcod/ holds foreign files - an owner's MEMORY.md keeps it</span>
+                  <span class="label-title">{t('maintRemoveEmptyTitle')}</span>
+                  <span class="label-desc">{t('maintRemoveEmptyDesc')}</span>
                 </div>
                 <label class="toggle-switch">
                   <input type="checkbox" checked={cleanupCfg.cleanup_empty_dirs} onchange={(e) => onCleanupToggle('cleanup_empty_dirs', e.currentTarget.checked)} />
@@ -1298,25 +1353,25 @@
               </div>
               <div class="settings-row rules-row">
                 <div class="settings-label">
-                  <span class="label-title">Exempt patterns</span>
-                  <span class="label-desc">One glob per line, matched against the session work folder</span>
+                  <span class="label-title">{t('maintExemptTitle')}</span>
+                  <span class="label-desc">{t('maintExemptDesc')}</span>
                 </div>
                 <textarea
                   class="settings-area"
                   rows="3"
                   spellcheck="false"
                   placeholder="D:\work\**"
-                  aria-label="Exempt patterns"
+                  aria-label={t('maintExemptTitle')}
                   bind:value={cleanupExempt}
                   onchange={() => scheduleCleanupSave()}
                 ></textarea>
               </div>
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Run cleanup</span>
+                  <span class="label-title">{t('maintRunTitle')}</span>
                   <span class="label-desc">{cleanupBusy ? 'Running...' : 'Apply these limits now and report what was freed'}</span>
                 </div>
-                <button class="appearance-btn" disabled={cleanupBusy} onclick={() => void runCleanupNow()}>Run now</button>
+                <button class="appearance-btn" disabled={cleanupBusy} onclick={() => void runCleanupNow()}>{t('maintRunNow')}</button>
               </div>
             </div>
           {:else if settingsTab === 'security'}
@@ -1472,50 +1527,50 @@
               <!-- ── Folder rules subsection ── -->
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Global folder rules</span>
+                  <span class="label-title">{t('rulesGlobalTitle')}</span>
                   <span class="label-desc">{rulesStatus ?? (rulesLoaded ? 'Glob patterns from ~/.swagcod/folder_rules.json, matched against the work folder' : 'Loading...')}</span>
                 </div>
-                <button class="step-btn" onclick={addRuleRow} aria-label="add rule">+</button>
+                <button class="step-btn" onclick={addRuleRow} aria-label={t('rulesAddRule')}>+</button>
               </div>
               {#each ruleRows as row (row.id)}
                 <div class="settings-row rules-row">
                   <div class="rules-grid">
                     <label class="settings-label">
-                      <span class="label-desc">Glob pattern</span>
+                      <span class="label-desc">{t('rulesGlobLabel')}</span>
                       <input
                         class="settings-number rules-input"
                         bind:value={row.pattern}
                         onchange={() => scheduleRulesSave()}
                         placeholder="D:\work\**"
-                        aria-label="Glob pattern"
+                        aria-label={t('rulesGlobLabel')}
                       />
                     </label>
                     <label class="settings-label">
-                      <span class="label-desc">Priority (higher is applied on top)</span>
+                      <span class="label-desc">{t('rulesPriorityLabel')}</span>
                       <input
                         type="number"
                         class="settings-number rules-input"
                         min="0"
                         value={row.priority}
                         onchange={(e) => { row.priority = Math.max(0, Math.round(Number(e.currentTarget.value) || 0)); scheduleRulesSave() }}
-                        aria-label="Priority"
+                        aria-label={t('rulesPriorityAria')}
                       />
                     </label>
                   </div>
                   <label class="settings-label">
-                    <span class="label-desc">Rule lines injected into the prompt, one per line</span>
+                    <span class="label-desc">{t('rulesTextLabel')}</span>
                     <textarea
                       class="settings-area"
                       rows="3"
                       spellcheck="false"
                       bind:value={row.text}
                       onchange={() => scheduleRulesSave()}
-                      aria-label="Rule lines"
+                      aria-label={t('rulesLinesAria')}
                     ></textarea>
                   </label>
                   <div class="notify-controls">
-                    <button class="step-btn text-btn" onclick={() => toggleRuleTest(row.id)}>Test</button>
-                    <button class="step-btn" onclick={() => removeRuleRow(row.id)} aria-label="remove rule">x</button>
+                    <button class="step-btn text-btn" onclick={() => toggleRuleTest(row.id)}>{t('notifTest')}</button>
+                    <button class="step-btn" onclick={() => removeRuleRow(row.id)} aria-label={t('rulesRemoveRule')}>x</button>
                   </div>
                   {#if ruleTestId === row.id}
                     <div class="notify-controls">
@@ -1523,10 +1578,10 @@
                         class="settings-number rules-input"
                         style="width:280px"
                         bind:value={ruleTestPath}
-                        placeholder="path to check"
-                        aria-label="Path to test"
+                        placeholder={t('rulesPathToTest')}
+                        aria-label={t('rulesPathToTestAria')}
                       />
-                      <button class="step-btn text-btn" disabled={!ruleTestPath.trim()} onclick={() => void testRuleRow(row)}>Match</button>
+                      <button class="step-btn text-btn" disabled={!ruleTestPath.trim()} onclick={() => void testRuleRow(row)}>{t('rulesMatch')}</button>
                       {#if ruleTestOut}<span class="label-desc">{ruleTestOut}</span>{/if}
                     </div>
                   {/if}
@@ -1534,7 +1589,7 @@
               {/each}
               <div class="settings-row">
                 <div class="settings-label">
-                  <span class="label-title">Folder rules</span>
+                  <span class="label-title">{t('rulesFolderTitle')}</span>
                   <span class="label-desc">{dirStatus ?? 'What this working folder keeps in its own .swagcod/rules.json'}</span>
                 </div>
                 <div class="notify-controls">
@@ -1543,12 +1598,12 @@
                     style="width:300px"
                     bind:value={dirCwd}
                     placeholder={sessionCwd ?? 'folder path'}
-                    aria-label="Folder path"
+                    aria-label={t('rulesFolderPathAria')}
                   />
                   <button class="appearance-btn" data-testid="dir-browse" onclick={() => void pickDirCwd()}>Browse…</button>
-                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void loadDirRules()}>Load</button>
-                  <button class="appearance-btn" disabled={dirBusy || !dirLoaded} onclick={() => void saveDirRules()}>Save</button>
-                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void previewDirRules()}>Preview</button>
+                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void loadDirRules()}>{t('rulesLoad')}</button>
+                  <button class="appearance-btn" disabled={dirBusy || !dirLoaded} onclick={() => void saveDirRules()}>{t('saveBtn')}</button>
+                  <button class="appearance-btn" disabled={dirBusy} onclick={() => void previewDirRules()}>{t('rulesPreview')}</button>
                 </div>
               </div>
               {#if dirLoaded}
@@ -1556,18 +1611,18 @@
                   <div class="rules-grid">
                     {#each DIR_LIST_FIELDS as f (f.key)}
                       <label class="settings-label">
-                        <span class="label-title">{f.title}</span>
-                        <span class="label-desc">{f.desc}</span>
-                        <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirText[f.key]} aria-label={f.title}></textarea>
+                        <span class="label-title">{t(f.title)}</span>
+                        <span class="label-desc">{t(f.desc)}</span>
+                        <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirText[f.key]} aria-label={t(f.title)}></textarea>
                       </label>
                     {/each}
                   </div>
                   <!-- div, а не label: кнопка внутри label ловила бы клики
                        поля и дёргала бы фокус на textarea. -->
                   <div class="settings-label">
-                    <span class="label-title">System prompt append</span>
-                    <span class="label-desc">Added to the system prompt of sessions started in this folder; empty clears it</span>
-                    <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirAppend} aria-label="System prompt append"></textarea>
+                    <span class="label-title">{t('rulesPromptTitle')}</span>
+                    <span class="label-desc">{t('rulesPromptDesc')}</span>
+                    <textarea class="settings-area" rows="4" spellcheck="false" bind:value={dirAppend} aria-label={t('rulesPromptAria')}></textarea>
                     <div class="rules-btns">
                       <button
                         class="text-btn step-btn"
@@ -1588,8 +1643,8 @@
                   </div>
                   <div class="settings-row">
                     <div class="settings-label">
-                      <span class="label-title">Session TTL, seconds</span>
-                      <span class="label-desc">How long cleanup keeps sessions of this folder; empty means the global limit</span>
+                      <span class="label-title">{t('rulesTtlTitle')}</span>
+                      <span class="label-desc">{t('rulesTtlDesc')}</span>
                     </div>
                     <input
                       type="number"
@@ -1598,14 +1653,14 @@
                       style="width:120px"
                       value={dirTtl}
                       onchange={(e) => (dirTtl = e.currentTarget.value)}
-                      placeholder="global"
-                      aria-label="Session TTL in seconds"
+                      placeholder={t('rulesTtlPlaceholder')}
+                      aria-label={t('rulesTtlAria')}
                     />
                   </div>
                   <div class="settings-row">
                     <div class="settings-label">
-                      <span class="label-title">Exempt from cleanup</span>
-                      <span class="label-desc">Sessions of this folder are never deleted</span>
+                      <span class="label-title">{t('rulesExemptTitle')}</span>
+                      <span class="label-desc">{t('rulesExemptDesc')}</span>
                     </div>
                     <label class="toggle-switch">
                       <input type="checkbox" bind:checked={dirExempt} />
@@ -1617,32 +1672,32 @@
               {#if dirView}
                 <div class="settings-row rules-row">
                   <div class="settings-label">
-                    <span class="label-title">Resolved for {dirView.cwd}</span>
-                    <span class="label-desc">{dirView.own_file ?? 'no rules file in this folder'}</span>
+                    <span class="label-title">{t('rulesResolvedTitle').replace('{dir}', dirView.cwd)}</span>
+                    <span class="label-desc">{dirView.own_file ?? t('rulesNoFile')}</span>
                   </div>
                   {#if resolvedEmpty(dirView)}
                     <div class="settings-label">
-                      <span class="label-desc">No rules for this folder: turns run as usual</span>
+                      <span class="label-desc">{t('rulesResolvedNone')}</span>
                     </div>
                   {:else}
                     <div class="settings-label">
                       {#each resolvedLists(dirView.resolved) as g (g.label)}
-                        <span class="label-desc"><span class="chip">{g.label}</span> {g.items.join(', ')}</span>
+                        <span class="label-desc"><span class="chip">{t(g.label)}</span> {g.items.join(', ')}</span>
                       {/each}
                       {#if dirView.resolved.prompt_lines.length > 0}
-                        <span class="label-desc"><span class="chip">prompt_lines</span> {dirView.resolved.prompt_lines.join(' | ')}</span>
+                        <span class="label-desc"><span class="chip">{t('rulesPromptLinesChip')}</span> {dirView.resolved.prompt_lines.join(' | ')}</span>
                       {/if}
                       {#if dirView.resolved.system_prompt_append}
-                        <span class="label-desc"><span class="chip">system_prompt_append</span> {dirView.resolved.system_prompt_append}</span>
+                        <span class="label-desc"><span class="chip">{t('rulesPromptAppendChip')}</span> {dirView.resolved.system_prompt_append}</span>
                       {/if}
                       <span class="label-desc">
-                        <span class="chip">session_ttl_secs</span> {dirView.resolved.session_ttl_secs ?? 'global'}
-                        <span class="chip">exempt_from_cleanup</span> {dirView.resolved.exempt_from_cleanup ? 'yes' : 'no'}
+                        <span class="chip">{t('rulesTtlChip')}</span> {dirView.resolved.session_ttl_secs ?? t('rulesTtlPlaceholder')}
+                        <span class="chip">{t('rulesExemptChip')}</span> {dirView.resolved.exempt_from_cleanup ? t('yesShort') : t('noShort')}
                       </span>
                       {#if dirSkills}
-                        <span class="label-desc"><span class="chip">skills visible</span> {dirSkills.length > 0 ? dirSkills.join(', ') : 'none'}</span>
+                        <span class="label-desc"><span class="chip">{t('skillsVisibleChip')}</span> {dirSkills.length > 0 ? dirSkills.join(', ') : t('noneShort')}</span>
                       {/if}
-                      <span class="label-desc"><span class="chip">sources</span></span>
+                      <span class="label-desc"><span class="chip">{t('sourcesChip')}</span></span>
                       {#each dirView.resolved.sources as s, i (`src-${i}`)}
                         <span class="label-desc">{s}</span>
                       {/each}

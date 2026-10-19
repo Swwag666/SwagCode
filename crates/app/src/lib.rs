@@ -4905,10 +4905,9 @@ async fn set_notification_config(
 async fn test_notification(
     state: tauri::State<'_, AppState>,
     trigger: notifications::NotifyTrigger,
-) -> Result<(), String> {
+) -> Result<notifications::NotifyTestReport, String> {
     let mut mgr = state.notifications.lock().await;
-    mgr.test_trigger(trigger).await;
-    Ok(())
+    Ok(mgr.test_trigger(trigger).await)
 }
 
 #[cfg(test)]
