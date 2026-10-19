@@ -134,6 +134,119 @@ pub fn round_prompt(plan: &NightPlan, state: &NightState) -> String {
     )
 }
 
+impl NightState {
+    /// Состояние после завершённого раунда, стоившего `turn_cost_usd`.
+    ///
+    /// Цена берётся фактическая (`turn_cost_usd` из метрик), а не оценочная:
+    /// бюджет обязан таять по реальным тратам. Цена без цены (None из
+    /// прайсинга даёт 0) и мусорная (NaN, отрицательная) клампится в ноль -
+    /// раунд всё равно засчитан, арифметика не ломается, отчёт остаётся
+    /// честным по раундам.
+    pub fn after_round(&self, turn_cost_usd: f64) -> NightState {
+        let cost = if turn_cost_usd.is_finite() && turn_cost_usd > 0.0 {
+            turn_cost_usd
+        } else {
+            0.0
+        };
+        NightState {
+            rounds_done: self.rounds_done + 1,
+            spent_usd: self.spent_usd + cost,
+        }
+    }
+}
+
+/// Утренний отчёт: что сделано, что потрачено и почему остановились.
+///
+/// Владелец читает его без контекста: цель повторяется, числа с двумя знаками,
+/// причина остановки - словами, а не кодом. Промежуточный вызов (прогон ещё
+/// идёт) честно говорит «идёт», а не выдаёт себя за финал.
+pub fn morning_report(plan: &NightPlan, state: &NightState) -> String {
+    let head = format!(
+        "Ночной прогон «{}»: {} раунд(ов) из {}, потрачено ${:.2} из ${:.2}.",
+        plan.objective, state.rounds_done, plan.max_rounds, state.spent_usd, plan.budget_usd
+    );
+    match verdict(plan, state) {
+        NightVerdict::Continue => format!("{head}\nПрогон ещё идёт - это промежуточный отчёт."),
+        NightVerdict::StopRounds { done } => {
+            format!("{head}\nОстановлен по капу раундов: {done} сделано, больше не разрешено.")
+        }
+        NightVerdict::StopBudget { spent } => format!(
+            "{head}\nОстановлен по бюджету: потрачено ${spent:.2}, лимит ${:.2} достигнут.",
+            plan.budget_usd
+        ),
+    }
+}
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn plan() -> NightPlan {
+        NightPlan::new("закрыть дыры", 10, 5.0).unwrap()
+    }
+
+    #[test]
+    fn after_round_counts_and_spends() {
+        let s = NightState {
+            rounds_done: 2,
+            spent_usd: 1.0,
+        };
+        let n = s.after_round(0.75);
+        assert_eq!(n.rounds_done, 3);
+        assert!((n.spent_usd - 1.75).abs() < 1e-9);
+        /* Исходное состояние не тронуто: переход в новое, а не мутация. */
+        assert_eq!(s.rounds_done, 2);
+    }
+
+    #[test]
+    fn garbage_cost_does_not_break_the_arithmetic() {
+        /* Неизвестная модель даёт цену 0, мусор - NaN или минус: раунд
+        засчитан, деньги не уезжают в бесконечность. */
+        let s = NightState {
+            rounds_done: 0,
+            spent_usd: 0.0,
+        };
+        assert_eq!(s.after_round(0.0).spent_usd, 0.0);
+        assert_eq!(s.after_round(f64::NAN).spent_usd, 0.0);
+        assert_eq!(s.after_round(-5.0).spent_usd, 0.0);
+        assert_eq!(s.after_round(f64::NAN).rounds_done, 1);
+    }
+
+    #[test]
+    fn morning_report_names_the_reason_in_words() {
+        let p = plan();
+        let rounds = NightState {
+            rounds_done: 10,
+            spent_usd: 3.0,
+        };
+        let r = morning_report(&p, &rounds);
+        assert!(r.contains("закрыть дыры"), "{r}");
+        assert!(r.contains("10 раунд(ов) из 10"), "{r}");
+        assert!(r.contains("$3.00"), "{r}");
+        assert!(r.contains("по капу раундов"), "{r}");
+
+        let budget = NightState {
+            rounds_done: 4,
+            spent_usd: 5.0,
+        };
+        let r = morning_report(&p, &budget);
+        assert!(r.contains("по бюджету"), "{r}");
+        assert!(r.contains("$5.00"), "{r}");
+    }
+
+    #[test]
+    fn interim_report_does_not_masquerade_as_final() {
+        let p = plan();
+        let r = morning_report(
+            &p,
+            &NightState {
+                rounds_done: 1,
+                spent_usd: 0.5,
+            },
+        );
+        assert!(r.contains("ещё идёт"), "{r}");
+        assert!(r.contains("$0.50"), "{r}");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
