@@ -941,6 +941,17 @@ pub(crate) async fn start_turn_core(
             ),
         };
         let mut record = report.into_record(tid.clone(), calls, est_in, est_out);
+        /* rev68: цена хода - в ту же метрику, что задержка и прочая телеметрия.
+        Деньги должны быть записаны, а не только посчитаны: иначе через месяц
+        никто не скажет, во что обошлась ночь. Модели нет в таблице цен - точки
+        нет: ноль соврал бы про бесплатный прогон. */
+        if let Some(cost) =
+            swagcod_core::pricing::cost_usd(&effective_model, est_in as u64, est_out as u64)
+        {
+            if let Ok(g) = app_state.store.lock() {
+                let _ = g.metrics_insert(swagcod_core::bus::now_ms(), "turn_cost_usd", cost);
+            }
+        }
         // F-5: снимок принадлежит этому ходу — вместе с ним и хранится.
         record.checkpoint_sha = checkpoint_sha;
         /* F-8: конкретная причина (отказ хука, ошибка провайдера) важнее
