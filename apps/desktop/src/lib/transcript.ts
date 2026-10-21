@@ -253,27 +253,13 @@ export class Transcript {
       case 'turn_ended': {
         this.closeStreaming(k.data.turn)
         if (!k.data.ok && k.data.reason) {
-          this.push({
-            key: this.key('err'),
-            kind: 'error',
-            text: k.data.reason,
-            turn: k.data.turn,
-            done: true,
-            ts: ev.ts_ms,
-          })
+          this.pushError(k.data.reason, k.data.turn, ev.ts_ms)
         }
         return true
       }
 
       case 'error': {
-        this.push({
-          key: this.key('err'),
-          kind: 'error',
-          text: k.data.message,
-          turn: k.data.turn ?? undefined,
-          done: true,
-          ts: ev.ts_ms,
-        })
+        this.pushError(k.data.message, k.data.turn ?? undefined, ev.ts_ms)
         return true
       }
 
@@ -319,6 +305,20 @@ export class Transcript {
         it.done = true
       }
     }
+  }
+
+  /** Строка ошибки дедуплицируется по паре (turn, текст): бэкенд присылает
+      один и тот же отказ и событием `error`, и reason'ом в `turn_ended`,
+      без дедапа чат показывал сообщение об ошибке дважды подряд. */
+  private pushError(text: string, turn: string | undefined, ts: number): void {
+    const dup = this.items.some(
+      (it) =>
+        it.kind === 'error' &&
+        it.text === text &&
+        (it.turn ?? undefined) === (turn ?? undefined)
+    )
+    if (dup) return
+    this.push({ key: this.key('err'), kind: 'error', text, turn, done: true, ts })
   }
 
   /** Закрыть все незакрытые элементы (например, при остановке хода). */

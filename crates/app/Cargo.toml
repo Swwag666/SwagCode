@@ -57,6 +57,7 @@ rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security_Cryptography",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

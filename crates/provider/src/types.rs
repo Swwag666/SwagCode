@@ -25,7 +25,13 @@ pub struct ToolCall {
 
 /// Сообщение диалога. `reasoning` хранится отдельно от `content` (находка 1
 /// в DECISIONS.md §5.6) — это два разных визуальных канала в UI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Serialize написан вручную: наружу уходит wire-формат OpenAI, где
+/// `tool_calls` — конверты `{id, type, function:{name, arguments}}`, а
+/// `arguments` ОБЯЗАН быть строкой (JSON-текстом). Внутренний плоский
+/// формат с распарсенным объектом удобен машине хода, но строгие
+/// OpenAI-совместимые шлюзы отбивают его кодом 400.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -61,6 +67,80 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
+    }
+}
+
+/// Конверт вызова в wire-формате OpenAI: шлюз требует `id`, `function.name`
+/// и `arguments` строкой; пустые id/name подменяются заглушками, иначе
+/// запрос упадёт 400 на валидации истории.
+#[derive(Serialize)]
+struct WireToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireFunction,
+}
+
+#[derive(Serialize)]
+struct WireFunction {
+    name: String,
+    arguments: String,
+}
+
+impl serde::Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        /* content пишем ВСЕГДА и всегда строкой: строгие шлюзы требуют ключ
+        content типа string|array даже у assistant с tool_calls, где текст
+        пустой. Пропуск ключа даёт 400 «message content must be a string
+        or an array». */
+        let mut len = 2;
+        if !self.reasoning.is_empty() {
+            len += 1;
+        }
+        if !self.tool_calls.is_empty() {
+            len += 1;
+        }
+        if self.tool_call_id.is_some() {
+            len += 1;
+        }
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("role", &self.role)?;
+        map.serialize_entry("content", &self.content)?;
+        if !self.reasoning.is_empty() {
+            map.serialize_entry("reasoning", &self.reasoning)?;
+        }
+        if !self.tool_calls.is_empty() {
+            let wire: Vec<WireToolCall> = self
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| WireToolCall {
+                    id: if tc.id.is_empty() {
+                        format!("call_{i}")
+                    } else {
+                        tc.id.clone()
+                    },
+                    kind: "function",
+                    function: WireFunction {
+                        name: if tc.name.is_empty() {
+                            "unknown_tool".to_string()
+                        } else {
+                            tc.name.clone()
+                        },
+                        arguments: serde_json::to_string(&serde_json::Value::Object(
+                            tc.arguments.clone(),
+                        ))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                })
+                .collect();
+            map.serialize_entry("tool_calls", &wire)?;
+        }
+        if let Some(id) = &self.tool_call_id {
+            map.serialize_entry("tool_call_id", id)?;
+        }
+        map.end()
     }
 }
 
@@ -266,5 +346,50 @@ mod tests {
         assert_eq!(m.content, "answer");
         assert_eq!(m.reasoning, "thinking");
         assert_ne!(m.content, m.reasoning);
+    }
+
+    #[test]
+    fn tool_calls_serialize_as_openai_wire_envelope() {
+        let m = ChatMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "a.txt" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            }],
+            tool_call_id: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let tc = &v["tool_calls"][0];
+        assert_eq!(tc["id"], serde_json::json!("c1"));
+        assert_eq!(tc["type"], serde_json::json!("function"));
+        assert_eq!(tc["function"]["name"], serde_json::json!("read"));
+        // arguments — строка (JSON-текст), а не объект: иначе шлюз даёт 400.
+        assert!(tc["function"]["arguments"].is_string());
+        let parsed: serde_json::Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["path"], serde_json::json!("a.txt"));
+        // content присутствует всегда и строкой: шлюз требует ключ даже у
+        // assistant без текста (только tool_calls).
+        assert_eq!(v["content"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn content_key_always_present_as_string() {
+        let m = ChatMessage {
+            role: Role::Tool,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            tool_call_id: Some("c9".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["content"], serde_json::json!(""));
+        assert_eq!(v["tool_call_id"], serde_json::json!("c9"));
     }
 }
