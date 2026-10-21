@@ -33,12 +33,144 @@ use crate::{
 /// сообщению блоками с содержимым. Провайдер текстовый — картинки и
 /// бинарщина честно помечаются неприкреплёнными, а не молча теряются.
 /// Лимит 200 КБ на файл бережёт контекст (B-3) от одного жирного лога.
+/// Флаг авто-коммита, который выставляет ночной прогон (rev79).
+///
+/// Переменная окружения - для владельца, который включает режим насовсем; флаг -
+/// для прогона, который включает его на время и гарантированно снимает на выходе.
+/// Ставится атомарно: прогон и ходы живут в разных задачах.
+pub(crate) static NIGHT_AUTO_COMMIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Включает авто-коммит и снимает при любом выходе - включая ранний по ошибке.
+struct NightAutoCommitGuard;
+
+impl NightAutoCommitGuard {
+    fn new() -> Self {
+        NIGHT_AUTO_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
+        NightAutoCommitGuard
+    }
+}
+
+impl Drop for NightAutoCommitGuard {
+    fn drop(&mut self) {
+        NIGHT_AUTO_COMMIT.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Ночной автономный прогон (rev79): цикл поверх контроллера из ядра.
+///
+/// Каждая итерация: вердикт (продолжать/стоп) → инструкция раунда с честными
+/// числами → ход тем же путём, что и ручной → ожидание конца хода опросом
+/// статуса → фактическая цена хода из метрик → новое состояние. Итог - утренний
+/// отчёт словами, а не кодом.
+///
+/// Прогон останавливается по трём причинам, и все три честные: кап раундов,
+/// бюджет, внешняя помеха (ошибка хода, подтверждение, зависший ход). Жечь
+/// раунды на повтор одного и того же падения - не работа, а счётчик.
+pub(crate) async fn night_run_core(
+    state: std::sync::Arc<crate::AppState>,
+    session_id: String,
+    objective: String,
+    max_rounds: u32,
+    budget_usd: f64,
+) -> Result<String, String> {
+    let plan = swagcod_core::night::NightPlan::new(objective, max_rounds, budget_usd)
+        .map_err(|e| e.to_string())?;
+    let mut ns = swagcod_core::night::NightState {
+        rounds_done: 0,
+        spent_usd: 0.0,
+    };
+    /* Прогон включает авто-коммит на своё время и снимает его на выходе -
+    включая ранний по ошибке: guard живёт до конца функции. */
+    let _commit_on = NightAutoCommitGuard::new();
+    let mut stopped_by = String::new();
+    while let swagcod_core::night::NightVerdict::Continue = swagcod_core::night::verdict(&plan, &ns)
+    {
+        let prompt = swagcod_core::night::round_prompt(&plan, &ns);
+        let before_ms = swagcod_core::bus::now_ms();
+        if let Err(e) =
+            start_turn_core(state.clone(), session_id.clone(), prompt, None, None, None).await
+        {
+            stopped_by = format!("ход не запустился: {e}");
+            break;
+        }
+        if let Some(reason) = wait_turn_end(&state, &session_id).await {
+            stopped_by = reason;
+            break;
+        }
+        let cost = last_turn_cost(&state, before_ms);
+        ns = ns.after_round(cost);
+    }
+    let mut report = swagcod_core::night::morning_report(&plan, &ns);
+    if !stopped_by.is_empty() {
+        report.push_str(&format!("\nОстановлен досрочно: {stopped_by}."));
+    }
+    Ok(report)
+}
+
+/// Сколько раундов ждать конца хода: 5 секунд * 360 = 30 минут.
+const NIGHT_TURN_POLL_MAX: u32 = 360;
+const NIGHT_TURN_POLL_SECS: u64 = 5;
+
+/// Ждать конца хода опросом статуса сессии.
+///
+/// `WaitingApproval` - тоже остановка: ночью подтверждать некому, и молча
+/// крутиться в ожидании значило бы потратить всю ночь впустую. Возврат `None` -
+/// ход закончился; `Some(причина)` - прогон останавливается.
+async fn wait_turn_end(
+    state: &std::sync::Arc<crate::AppState>,
+    session_id: &str,
+) -> Option<String> {
+    for _ in 0..NIGHT_TURN_POLL_MAX {
+        tokio::time::sleep(std::time::Duration::from_secs(NIGHT_TURN_POLL_SECS)).await;
+        let status = state
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .find(|s| s.id.to_string() == session_id)
+            .map(|s| s.status);
+        match status {
+            None => return Some("сессия исчезла".to_string()),
+            Some(swagcod_core::session::SessionStatus::Running) => continue,
+            Some(swagcod_core::session::SessionStatus::WaitingApproval) => {
+                return Some(
+                    "прогон упёрся в подтверждение (ночью подтверждать некому)".to_string(),
+                )
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(format!(
+        "ход не закончился за {} минут",
+        NIGHT_TURN_POLL_MAX as u64 * NIGHT_TURN_POLL_SECS / 60
+    ))
+}
+
+/// Фактическая цена последнего хода: из метрик, не из оценки.
+///
+/// Метрика пишется в конце хода (`turn_cost_usd`), поэтому берётся последняя
+/// точка после `before_ms` - старые ходы не считаются. Нет точки - ноль:
+/// раунд засчитан, деньги не выдумываются.
+fn last_turn_cost(state: &std::sync::Arc<crate::AppState>, before_ms: u64) -> f64 {
+    if let Ok(store) = state.store.lock() {
+        if let Ok(points) = store.metrics_query("turn_cost_usd", before_ms, 1) {
+            if let Some((_, v)) = points.last() {
+                return *v;
+            }
+        }
+    }
+    0.0
+}
 /// Включён ли авто-коммит хода (rev76).
 ///
 /// По умолчанию ВЫКЛЮЧЕН: коммитить без слова владельца значит менять его
 /// репозиторий самостоятельно. Ночной прогон включает переменной окружения,
 /// потому что там это и нужно.
 fn auto_commit_enabled() -> bool {
+    if NIGHT_AUTO_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     matches!(
         std::env::var("SWAGCOD_AUTO_COMMIT").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")

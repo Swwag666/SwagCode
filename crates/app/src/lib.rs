@@ -801,6 +801,21 @@ async fn session_fork(
     let st = state.inner().clone();
     fork_session_core(&st, session_id).await
 }
+/// Ночной автономный прогон (rev79): цель + кап раундов + бюджет.
+///
+/// Возвращает готовый утренний отчёт. Прогон сам коммитит ревизии (на своё
+/// время), сам останавливается по лимитам и сам объясняет причину словами.
+#[tauri::command]
+async fn night_run(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    objective: String,
+    max_rounds: u32,
+    budget_usd: f64,
+) -> Result<String, String> {
+    let st = state.inner().clone();
+    turn_driver::night_run_core(st, session_id, objective, max_rounds, budget_usd).await
+}
 #[tauri::command]
 async fn set_approval_policy(
     state: State<'_, Arc<AppState>>,
@@ -4701,6 +4716,7 @@ pub fn run() {
             clear_protected_key,
             get_diagnostics,
             http_api_status,
+            night_run,
             session_fork,
             metrics_history,
             tokens_by_day,
