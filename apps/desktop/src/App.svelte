@@ -724,18 +724,24 @@
   let telLagE = $state<SeriesPoint[]>([])
   let telLagD = $state<SeriesPoint[]>([])
   let telTasks = $state<TaskRow[]>([])
+  /* Деньги вместо голых токенов: сумма turn_cost_usd за 30 дней. */
+  let telCostText = $state('')
 
   async function refreshTelemetry(): Promise<void> {
     if (!tauriAvailable) return
     const now = Date.now()
     try {
-      const [tokens, metrics, tasks] = await Promise.all([
+      const [tokens, metrics, tasks, costPoints] = await Promise.all([
         invoke<TokenDay[]>('tokens_by_day', { sinceMs: now - 30 * 86400000 }),
         invoke<MetricPoint[]>('metrics_history', {
           names: ['provider_latency_ms', 'lagging_events', 'lagging_dropped'],
           sinceMs: now - 86400000,
         }),
         invoke<TaskRow[]>('tasks_list'),
+        invoke<MetricPoint[]>('metrics_history', {
+          names: ['turn_cost_usd'],
+          sinceMs: now - 30 * 86400000,
+        }),
       ])
       telTokens = tokens
       const g = groupByName(metrics)
@@ -744,6 +750,13 @@
       telLagE = counterDeltas(g.get('lagging_events') ?? [])
       telLagD = counterDeltas(g.get('lagging_dropped') ?? [])
       telTasks = tasks
+      const costSum = costPoints.reduce((s, p) => s + p.value, 0)
+      telCostText =
+        costPoints.length === 0
+          ? t('telemetryEmpty')
+          : costSum < 0.1
+            ? '$' + costSum.toFixed(4)
+            : '$' + costSum.toFixed(2)
     } catch {
       // старое ядро без телеметрии: графики остаются пустыми
     }
@@ -2567,6 +2580,7 @@
 
   /* телеметрия и обновления */
   {telTokens}
+  {telCostText}
   {telLatency}
   {telLagE}
   {telLagD}

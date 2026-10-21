@@ -762,6 +762,7 @@
     /* ── телеметрия и обновления ── */
     telTokens: TokenDay[]
     telLatency: SeriesPoint[]
+    telCostText: string
     telLagE: SeriesPoint[]
     telLagD: SeriesPoint[]
     telTasks: TaskRow[]
@@ -918,6 +919,7 @@
     /* телеметрия и обновления */
     telTokens,
     telLatency,
+    telCostText,
     telLagE,
     telLagD,
     telTasks,
@@ -1903,6 +1905,11 @@
               {:else}
                 <div class="approval-empty">{t('telemetryEmpty')}</div>
               {/if}
+              <div class="settings-row">
+                <div class="settings-label">
+                  <span class="label-title">{t('telemetryCost')}: {telCostText}</span>
+                </div>
+              </div>
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('telemetryLatency')}</span>
