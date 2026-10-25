@@ -462,6 +462,17 @@ fn is_model_not_found(msg: &str) -> bool {
     msg.contains("model_not_found") || (msg.contains("404") && msg.contains("not available"))
 }
 
+/// Транспортный обрыв, а не ответ провайдера: такое стоит повторить.
+/// HTTP-статусы (400/401/404/429) сюда не попадают — они осмысленны.
+fn is_transport_error(msg: &str) -> bool {
+    msg.contains("error sending request")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
+        || msg.contains("timed out")
+        || msg.contains("dns error")
+        || msg.contains("broken pipe")
+}
+
 /// Найти в каталоге ровно один id вида `*/<requested>`: самолечение имён
 /// без префикса (наследие импорта и ручных настроек). Неоднозначность
 /// (два и более совпадения) — не лечим: гадать между маршрутами хуже,
@@ -563,6 +574,10 @@ pub(crate) async fn start_turn_core(
     // провайдера (см. ветку stream_error ниже).
     let mut effective_model = model.unwrap_or(session_model);
     let mut alias_retried = false;
+    /* Шлюз может моргнуть (connection reset, таймаут пула, перегрузка):
+    транспортную ошибку повторяем до двух раз с нарастающей паузой -
+    ход не должен умирать от одного битого коннекта. */
+    let mut transport_retries = 0u32;
 
     /* Фича 2: folder-scoped rules. Резолвятся один раз на ход от рабочей
     папки сессии: дерево `.swagcod/rules.json` вверх до корня ФС плюс
@@ -952,6 +967,23 @@ pub(crate) async fn start_turn_core(
                     if stopped {
                         step = machine.cancel();
                     } else if let Some(msg) = stream_error {
+                        /* Транспортный обрыв (reset/таймаут/«error sending
+                        request») - не ошибка модели: повторяем тот же раунд
+                        до двух раз с паузой 1с/3с. */
+                        if transport_retries < 2 && is_transport_error(&msg) {
+                            transport_retries += 1;
+                            bus.publish(EventKind::Status {
+                                message: format!(
+                                    "шлюз не ответил ({msg}), повтор {transport_retries}/2"
+                                ),
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1000 * transport_retries as u64,
+                            ))
+                            .await;
+                            step = TurnStep::RequestModel { history };
+                            continue;
+                        }
                         /* Самолечение id модели: часть шлюзов отдаёт каталог
                         с префиксом («abyss/gpt-6-astra»), а в настройках и
                         старых сессиях id лежит без него - и провайдер честно
@@ -1506,5 +1538,18 @@ mod image_attachment_tests {
         assert_eq!(find_alias_in_catalog(&dup, "m"), None);
         // Мусорный каталог - None, а не паника.
         assert_eq!(find_alias_in_catalog(&serde_json::json!({}), "x"), None);
+    }
+
+    #[test]
+    fn transport_error_detection_covers_wire_shapes() {
+        assert!(is_transport_error(
+            "http: error sending request for url (https://x/v1/chat/completions)"
+        ));
+        assert!(is_transport_error("stream: connection reset by peer"));
+        assert!(is_transport_error("request timed out"));
+        // Осмысленные ответы провайдера ретраить нельзя.
+        assert!(!is_transport_error("provider 404: model_not_found"));
+        assert!(!is_transport_error("provider 429: rate limit"));
+        assert!(!is_transport_error("provider 400: bad json"));
     }
 }
