@@ -456,6 +456,38 @@ pub(crate) fn plugin_disabled(disabled: &[String], name: &str) -> bool {
     })
 }
 
+/// Текст ошибки провайдера похож на «модель не найдена»: код
+/// model_not_found или 404 с «not available» в теле.
+fn is_model_not_found(msg: &str) -> bool {
+    msg.contains("model_not_found") || (msg.contains("404") && msg.contains("not available"))
+}
+
+/// Найти в каталоге ровно один id вида `*/<requested>`: самолечение имён
+/// без префикса (наследие импорта и ручных настроек). Неоднозначность
+/// (два и более совпадения) — не лечим: гадать между маршрутами хуже,
+/// чем честный 404. Чистая функция: тестируется без сети.
+fn find_alias_in_catalog(catalog: &serde_json::Value, requested: &str) -> Option<String> {
+    let data = catalog.get("data")?.as_array()?;
+    let mut matches = data
+        .iter()
+        .filter_map(|m| m.get("id")?.as_str())
+        .filter(|id| id.rsplit('/').next() == Some(requested) && id.len() > requested.len());
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+/// Спросить каталог у живого провайдера и применить [`find_alias_in_catalog`].
+async fn resolve_model_alias(
+    provider: &swagcod_provider::any::AnyProvider,
+    requested: &str,
+) -> Option<String> {
+    let v = provider.list_models().await.ok()?;
+    find_alias_in_catalog(&v, requested)
+}
+
 /* E-7: ядро старта хода без Tauri-State — один вход для IPC-команды и
 loopback REST API. Поведение идентично: та же машина хода, та же шина. */
 pub(crate) async fn start_turn_core(
@@ -527,7 +559,10 @@ pub(crate) async fn start_turn_core(
     };
 
     // W-6 фикс: используем переданную модель если есть, иначе из сессии.
-    let effective_model = model.unwrap_or(session_model);
+    // mut: при 404 model_not_found ход сам лечит id алиасом из каталога
+    // провайдера (см. ветку stream_error ниже).
+    let mut effective_model = model.unwrap_or(session_model);
+    let mut alias_retried = false;
 
     /* Фича 2: folder-scoped rules. Резолвятся один раз на ход от рабочей
     папки сессии: дерево `.swagcod/rules.json` вверх до корня ФС плюс
@@ -788,7 +823,10 @@ pub(crate) async fn start_turn_core(
                     let messages = {
                         let mut v = Vec::with_capacity(history.len() + 1);
                         v.push(system_msg.clone());
-                        v.extend(history);
+                        /* Клонируем, а не двигаем: при самолечении модели
+                        (404 → алиас) история возвращается в step для повтора
+                        того же раунда без потери контекста. */
+                        v.extend(history.iter().cloned());
                         v
                     };
                     let request = ChatRequest {
@@ -830,7 +868,24 @@ pub(crate) async fn start_turn_core(
                     let mut stopped = false;
                     let mut latency_recorded = false;
                     let mut stream_error: Option<String> = None;
-                    while let Some(event) = rx.recv().await {
+                    loop {
+                        /* Отмена обязана работать и в тишине провайдера:
+                        длинный reasoning может идти без событий стрима, и
+                        ждать следующий чанк, чтобы заметить «стоп», значит
+                        висеть до конца генерации. Таймер 250 мс будит цикл,
+                        флаг читается и без события. */
+                        let event = tokio::select! {
+                            ev = rx.recv() => ev,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                                if cancelled_in_task.load(std::sync::atomic::Ordering::SeqCst) {
+                                    stopped = true;
+                                    handle.abort();
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        let Some(event) = event else { break };
                         // B-8: токен — событие. Долгая генерация reasoning не
                         // должна выглядеть для watchdog как зависание.
                         touch_turn(&app_state, &turn, None);
@@ -897,6 +952,32 @@ pub(crate) async fn start_turn_core(
                     if stopped {
                         step = machine.cancel();
                     } else if let Some(msg) = stream_error {
+                        /* Самолечение id модели: часть шлюзов отдаёт каталог
+                        с префиксом («abyss/gpt-6-astra»), а в настройках и
+                        старых сессиях id лежит без него - и провайдер честно
+                        отвечает 404 model_not_found. Если в каталоге ровно
+                        один «префикс/id», повторяем запрос с ним один раз
+                        за ход. */
+                        if !alias_retried
+                            && is_model_not_found(&msg)
+                            && !effective_model.contains('/')
+                        {
+                            alias_retried = true;
+                            if let Some(fixed) =
+                                resolve_model_alias(&provider, &effective_model).await
+                            {
+                                bus.publish(EventKind::Status {
+                                    message: format!(
+                                        "модель {effective_model} не найдена у провайдера, повторяю как {fixed}"
+                                    ),
+                                });
+                                effective_model = fixed;
+                                /* Повтор того же раунда: машина поток не
+                                видела, история возвращается в step. */
+                                step = TurnStep::RequestModel { history };
+                                continue;
+                            }
+                        }
                         fail_reason = Some(msg.clone());
                         bus.publish(EventKind::Error {
                             turn: Some(tid.clone()),
@@ -1305,6 +1386,31 @@ pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Resu
         if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == session_id) {
             session.status = swagcod_core::session::SessionStatus::Cancelled;
             session.current_turn = None;
+            /* Ход, убитый abort'ом, не должен исчезать из журнала: иначе
+            транскрипт и реплика пользователя теряются без следа, а стоп
+            выглядит как «ничего не было». Пишем заглушку с честной
+            причиной: частичный ответ умер вместе с задачей, его нет. */
+            let now = swagcod_core::bus::now_ms();
+            let record = swagcod_core::session::TurnRecord {
+                id: swagcod_core::TurnId::new(&turn_id),
+                started_ms: now,
+                ended_ms: Some(now),
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                est_input_tokens: 0,
+                est_output_tokens: 0,
+                ok: false,
+                failure: Some("остановлено пользователем (жёсткая остановка)".to_string()),
+                parent_turn_id: None,
+                checkpoint_sha: None,
+            };
+            session.turns.push(record.clone());
+            if let Ok(store) = state.store.lock() {
+                if let Err(e) = store.save_turn(&session_id, &record, &session.history) {
+                    eprintln!("store: остановленный ход не записан: {e}");
+                }
+            }
         }
     }
     if let Ok(mut activity) = state.turn_activity.lock() {
@@ -1359,5 +1465,46 @@ mod image_attachment_tests {
             "файл сверх предела не уходит в запрос"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_not_found_detection_covers_wire_shapes() {
+        assert!(is_model_not_found(
+            "provider 404 Not Found: {\"error\":{\"message\":\"Model 'x' is not available\",\"code\":\"model_not_found\"}}"
+        ));
+        assert!(is_model_not_found(
+            "provider 404 Not Found: model not available"
+        ));
+        assert!(!is_model_not_found("provider 400 Bad Request: bad json"));
+        assert!(!is_model_not_found("stream: connection reset"));
+    }
+
+    #[test]
+    fn alias_found_uniquely_in_catalog() {
+        let catalog = serde_json::json!({
+            "data": [
+                {"id": "abyss/gpt-6-astra"},
+                {"id": "abyss/glm-5.3"},
+                {"id": "other/echo"}
+            ]
+        });
+        assert_eq!(
+            find_alias_in_catalog(&catalog, "gpt-6-astra").as_deref(),
+            Some("abyss/gpt-6-astra")
+        );
+        // Префиксный id лечит беспрефиксный запрос.
+        assert_eq!(
+            find_alias_in_catalog(&catalog, "echo").as_deref(),
+            Some("other/echo")
+        );
+        // Отсутствующая модель - None, лечить нечем.
+        assert_eq!(find_alias_in_catalog(&catalog, "missing-model"), None);
+        // Неоднозначность - не гадаем.
+        let dup = serde_json::json!({
+            "data": [{"id": "a/m"}, {"id": "b/m"}]
+        });
+        assert_eq!(find_alias_in_catalog(&dup, "m"), None);
+        // Мусорный каталог - None, а не паника.
+        assert_eq!(find_alias_in_catalog(&serde_json::json!({}), "x"), None);
     }
 }

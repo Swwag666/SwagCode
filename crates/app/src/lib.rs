@@ -734,6 +734,16 @@ pub(crate) async fn create_session_core(
     let model = model
         .filter(|m| !m.trim().is_empty())
         .or_else(|| std::env::var("SWAGCOD_MODEL").ok())
+        // Дефолт владельца из настроек важнее хардкода: иначе новая сессия
+        // улетает на модель, которой у провайдера может вообще не быть.
+        .or_else(|| {
+            state
+                .store
+                .lock()
+                .ok()
+                .and_then(|s| s.get_pref("model").ok().flatten())
+                .filter(|m| !m.trim().is_empty())
+        })
         .unwrap_or_else(|| "fable-ultra-promax".into());
 
     let id = SessionId::new(format!("s-{}", short_id()));
