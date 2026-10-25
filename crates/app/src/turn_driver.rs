@@ -474,6 +474,28 @@ fn is_transport_error(msg: &str) -> bool {
         || msg.contains("broken pipe")
 }
 
+/// Safety-фильтр апстрима: содержимое запроса отклонено проверкой.
+fn is_content_rejection(msg: &str) -> bool {
+    msg.contains("400")
+        && (msg.contains("безопасн")
+            || msg.contains("safety")
+            || msg.contains("content_filter")
+            || msg.contains("отклонил содержимое"))
+}
+
+/// Есть ли в каталоге провайдера id, совпадающий с запрошенным точно.
+fn catalog_has_id(catalog: &serde_json::Value, id: &str) -> bool {
+    catalog
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id")?.as_str())
+                .any(|x| x == id)
+        })
+        .unwrap_or(false)
+}
+
 /// Найти в каталоге ровно один id вида `*/<requested>`: самолечение имён
 /// без префикса (наследие импорта и ручных настроек). Неоднозначность
 /// (два и более совпадения) — не лечим: гадать между маршрутами хуже,
@@ -575,6 +597,7 @@ pub(crate) async fn start_turn_core(
     // провайдера (см. ветку stream_error ниже).
     let mut effective_model = model.unwrap_or(session_model);
     let mut alias_retried = false;
+    let mut safety_fallback = false;
     /* Шлюз может моргнуть (connection reset, таймаут пула, перегрузка):
     транспортную ошибку повторяем до двух раз с нарастающей паузой -
     ход не должен умирать от одного битого коннекта. */
@@ -1009,6 +1032,34 @@ pub(crate) async fn start_turn_core(
                                 видела, история возвращается в step. */
                                 step = TurnStep::RequestModel { history };
                                 continue;
+                            }
+                        }
+                        /* Префиксный маршрут отклонён safety-фильтром
+                        апстрима: у части шлюзов «abyss/id» режется
+                        проверкой содержимого, а тот же беспрефиксный id
+                        обслуживается чисто. Падаем на него один раз. */
+                        if !safety_fallback
+                            && effective_model.contains('/')
+                            && is_content_rejection(&msg)
+                        {
+                            safety_fallback = true;
+                            let bare = effective_model.rsplit('/').next().unwrap_or("").to_string();
+                            if !bare.is_empty() {
+                                let in_catalog = provider
+                                    .list_models()
+                                    .await
+                                    .map(|v| catalog_has_id(&v, &bare))
+                                    .unwrap_or(false);
+                                if in_catalog {
+                                    bus.publish(EventKind::Status {
+                                        message: format!(
+                                            "маршрут {effective_model} отклонён фильтром, повторяю как {bare}"
+                                        ),
+                                    });
+                                    effective_model = bare;
+                                    step = TurnStep::RequestModel { history };
+                                    continue;
+                                }
                             }
                         }
                         fail_reason = Some(msg.clone());
@@ -1553,5 +1604,20 @@ mod image_attachment_tests {
         assert!(!is_transport_error("provider 404: model_not_found"));
         assert!(!is_transport_error("provider 429: rate limit"));
         assert!(!is_transport_error("provider 400: bad json"));
+    }
+
+    #[test]
+    fn content_rejection_and_catalog_id_detection() {
+        assert!(is_content_rejection(
+            "provider 400 Bad Request: {\"error\":{\"message\":\"Провайдер отклонил содержимое запроса при проверке безопасности\"}}"
+        ));
+        assert!(is_content_rejection("provider 400: content_filter"));
+        // Обычный 400 - не safety.
+        assert!(!is_content_rejection("provider 400: invalid json"));
+        assert!(!is_content_rejection("provider 429: rate limit"));
+        let cat = serde_json::json!({"data": [{"id": "glm-5.3"}, {"id": "abyss/glm-5.3"}]});
+        assert!(catalog_has_id(&cat, "glm-5.3"));
+        assert!(!catalog_has_id(&cat, "gpt-9"));
+        assert!(!catalog_has_id(&serde_json::json!({}), "glm-5.3"));
     }
 }
