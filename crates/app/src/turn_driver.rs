@@ -466,6 +466,7 @@ fn is_model_not_found(msg: &str) -> bool {
 /// HTTP-статусы (400/401/404/429) сюда не попадают — они осмысленны.
 fn is_transport_error(msg: &str) -> bool {
     msg.contains("error sending request")
+        || msg.contains("error decoding response body")
         || msg.contains("connection reset")
         || msg.contains("connection closed")
         || msg.contains("timed out")
@@ -1547,6 +1548,7 @@ mod image_attachment_tests {
         ));
         assert!(is_transport_error("stream: connection reset by peer"));
         assert!(is_transport_error("request timed out"));
+        assert!(is_transport_error("stream: error decoding response body"));
         // Осмысленные ответы провайдера ретраить нельзя.
         assert!(!is_transport_error("provider 404: model_not_found"));
         assert!(!is_transport_error("provider 429: rate limit"));
