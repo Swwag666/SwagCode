@@ -64,6 +64,72 @@ impl FinishReason {
     }
 }
 
+/// Декодировать UTF-8 из куска сети: битые байты заменяются U+FFFD,
+/// неполный символ на конце возвращается байтами — дождётся следующего
+/// чанка. Ревизия 84, из протыкания: раньше единственный битый байт
+/// валидной длины зависал в pending_bytes навсегда и отравлял весь
+/// остаток потока (весь ход умирал тишиной).
+pub(crate) fn decode_lossy_keep_tail(mut bytes: &[u8]) -> (String, Vec<u8>) {
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                out.push_str(text);
+                return (out, Vec::new());
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    if let Ok(text) = std::str::from_utf8(&bytes[..valid]) {
+                        out.push_str(text);
+                    }
+                }
+                match e.error_len() {
+                    // Битый байт — замена и продолжение дальше по куску.
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        bytes = &bytes[valid + bad..];
+                    }
+                    // Неполный символ на конце — ждём следующего чанка.
+                    None => return (out, bytes[valid..].to_vec()),
+                }
+            }
+        }
+    }
+}
+
+/// Гибкое чтение числа: провайдеры кладут usage-поля строккой ("120"),
+/// float или null — кадр не должен умирать на этом.
+fn de_u64_flex<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f as u64)),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }))
+}
+
+/// Гибкое чтение index тулза: null → 0, строка "1" → 1, float → число.
+fn de_usize_flex<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    let n = match v {
+        serde_json::Value::Number(n) => {
+            n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64))
+        }
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::Null => Some(0),
+        _ => None,
+    }
+    .unwrap_or(0);
+    Ok(n as usize)
+}
+
 /// Wire-формат чанка. Все поля опциональны: провайдеры присылают разное,
 /// и падать на неожиданном поле нельзя — это уронило бы весь ход.
 #[derive(Debug, Deserialize)]
@@ -78,11 +144,11 @@ struct Chunk {
 
 #[derive(Debug, Deserialize)]
 struct UsageBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u64_flex")]
     prompt_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u64_flex")]
     completion_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u64_flex")]
     total_tokens: Option<u64>,
 }
 
@@ -122,7 +188,8 @@ struct Delta {
 #[derive(Debug, Deserialize)]
 struct ToolDelta {
     /// Индекс вызова внутри ответа: модель может вызвать несколько тулзов.
-    #[serde(default)]
+    /// Гибкий десериализатор: шлюзы шлют null/строку/float.
+    #[serde(default, deserialize_with = "de_usize_flex")]
     index: usize,
     #[serde(default)]
     id: Option<String>,
@@ -197,34 +264,27 @@ impl SseParser {
     /// потому что один кривой чанк не должен ронять ход длиной в минуту.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
         // Дописываем хвост прошлого чанка, если символ был разорван.
-        let owned;
-        let slice: &[u8] = if self.pending_bytes.is_empty() {
-            bytes
+        let (text, tail) = if self.pending_bytes.is_empty() {
+            decode_lossy_keep_tail(bytes)
         } else {
             self.pending_bytes.extend_from_slice(bytes);
-            owned = std::mem::take(&mut self.pending_bytes);
-            &owned
+            let owned = std::mem::take(&mut self.pending_bytes);
+            decode_lossy_keep_tail(&owned)
         };
-
-        match std::str::from_utf8(slice) {
-            Ok(text) => self.buf.push_str(text),
-            Err(e) => {
-                // Всё до границы символа — валидно, остаток ждёт следующий чанк.
-                let up_to = e.valid_up_to();
-                if up_to > 0 {
-                    if let Ok(text) = std::str::from_utf8(&slice[..up_to]) {
-                        self.buf.push_str(text);
-                    }
-                }
-                self.pending_bytes.extend_from_slice(&slice[up_to..]);
-            }
-        }
+        self.buf.push_str(&text);
+        self.pending_bytes = tail;
 
         let mut out = Vec::new();
         // Обрабатываем только полные строки; неполный хвост остаётся в buf.
-        while let Some(nl) = self.buf.find('\n') {
+        // Терминатор строки: '\n' ИЛИ '\r' (бываёт поток с голым CR —
+        // прокси и старые шлюзы); парный \r\n съедается как один.
+        while let Some(nl) = self.buf.find(['\n', '\r']) {
             let line: String = self.buf.drain(..=nl).collect();
-            out.extend(self.handle_line(line.trim_end_matches(['\n', '\r'])));
+            if line.ends_with('\r') && self.buf.starts_with('\n') {
+                self.buf.drain(..1);
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            out.extend(self.handle_line(line));
         }
         out
     }
@@ -245,6 +305,14 @@ impl SseParser {
     }
 
     fn handle_line(&mut self, line: &str) -> Vec<StreamEvent> {
+        // BOM в начале потока (некоторые шлюзы варят ответ с ним): чистим,
+        // иначе первая строка никогда не сматчится с "data:".
+        let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        // Ведущие U+FFFD — следы битых байтов МЕЖДУ кадрами (замена из
+        // decode_lossy_keep_tail): без снятия мусорный байт от прокси
+        // прилипал к следующей строке и убивал валидный кадр. Внутри
+        // строки замены сохраняются — JSON их допускает.
+        let line = line.trim_start_matches('\u{FFFD}');
         // Поток завершён: контент после [DONE]/finish не принимаем — без этой
         // проверки поздние кадры (дубли, мусор от прокси) породили бы призрачные
         // события и второй ответ в уже закрытом ходе. Исключение — счёт токенов:
@@ -294,7 +362,9 @@ impl SseParser {
             if let Some(delta) = choice.delta {
                 out.extend(self.handle_delta(delta));
             }
-            if let Some(fr) = choice.finish_reason {
+            // Пустой finish_reason (""/null в одном ключе) встречается у
+            // шлюзов-обёрток: это «ещё не закончено», а не Unknown-финал.
+            if let Some(fr) = choice.finish_reason.filter(|fr| !fr.is_empty()) {
                 // Аргументы тулзов парсим только здесь (находка 3).
                 out.extend(self.flush_tools());
                 out.push(StreamEvent::Done {
@@ -332,6 +402,25 @@ impl SseParser {
         if let Some(calls) = d.tool_calls {
             for tc in calls {
                 let idx = tc.index;
+                let tc_id = tc.id.clone().filter(|id| !id.is_empty());
+                // Провайдер переиспользовал index под новый вызов (другой
+                // id): прежний слот закрываем немедленно — его аргументы
+                // уже не дополнятся, а без этого два вызова склеились бы
+                // в один невалидный JSON.
+                if let Some(new_id) = tc_id.as_deref() {
+                    let occupied_by_other = self
+                        .pending_tools
+                        .iter()
+                        .any(|(i, p)| *i == idx && p.id != new_id);
+                    if occupied_by_other {
+                        if let Some(pos) = self.pending_tools.iter().position(|(i, _)| *i == idx) {
+                            let (_, old) = self.pending_tools.remove(pos);
+                            if !old.id.is_empty() {
+                                out.push(complete_slot(old));
+                            }
+                        }
+                    }
+                }
                 let slot = match self.pending_tools.iter_mut().find(|(i, _)| *i == idx) {
                     Some((_, p)) => p,
                     None => {
@@ -339,27 +428,28 @@ impl SseParser {
                         &mut self.pending_tools.last_mut().unwrap().1
                     }
                 };
-                if let Some(id) = tc.id {
-                    if !id.is_empty() {
-                        // Первый чанк вызова: id и имя известны.
+                let fname = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.clone())
+                    .unwrap_or_default();
+                if let Some(id) = tc_id {
+                    if slot.id != id {
                         slot.id = id.clone();
-                        let name = tc
-                            .function
-                            .as_ref()
-                            .and_then(|f| f.name.clone())
-                            .unwrap_or_default();
-                        slot.name = name.clone();
+                        // Пустое имя не затирает накопленное: шлюзы шлют
+                        // id в каждом чанке, а имя — только в первом.
+                        if !fname.is_empty() {
+                            slot.name = fname.clone();
+                        }
                         out.push(StreamEvent::ToolCallStart {
                             index: idx,
                             id,
-                            name,
+                            name: slot.name.clone(),
                         });
                     }
                 }
-                if let Some(name) = tc.function.as_ref().and_then(|f| f.name.clone()) {
-                    if !name.is_empty() && slot.name.is_empty() {
-                        slot.name = name.clone();
-                    }
+                if !fname.is_empty() && slot.name.is_empty() {
+                    slot.name = fname.clone();
                 }
                 // Куски аргументов буферизуем как есть: JSON пока невалиден.
                 if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.clone()) {
@@ -380,29 +470,28 @@ impl SseParser {
         let mut taken = std::mem::take(&mut self.pending_tools);
         // Порядок определяется индексом, а не порядком прихода чанков.
         taken.sort_by_key(|(i, _)| *i);
-        taken
-            .into_iter()
-            .map(|(_, p)| {
-                // Пустая строка аргументов = модель не передала параметров.
-                let raw = if p.args.trim().is_empty() {
-                    "{}"
-                } else {
-                    &p.args
-                };
-                let arguments = serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
-                    // Невалидный JSON от модели не роняет ход: отдаём пустой
-                    // объект, а ошибку видно по отсутствию ожидаемых полей.
-                    .unwrap_or_default();
-                StreamEvent::ToolCallComplete(ToolCall {
-                    id: p.id,
-                    name: p.name,
-                    arguments,
-                })
-            })
-            .collect()
+        taken.into_iter().map(|(_, p)| complete_slot(p)).collect()
     }
+}
+
+/// Собрать один накопленный вызов в событие Complete: пустые аргументы —
+/// «параметров нет», невалидный JSON от модели не роняет ход (ошибка видна
+/// по отсутствию ожидаемых полей).
+fn complete_slot(p: PendingTool) -> StreamEvent {
+    let raw = if p.args.trim().is_empty() {
+        "{}"
+    } else {
+        &p.args
+    };
+    let arguments = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    StreamEvent::ToolCallComplete(ToolCall {
+        id: p.id,
+        name: p.name,
+        arguments,
+    })
 }
 
 #[cfg(test)]

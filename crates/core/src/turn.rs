@@ -1,4 +1,4 @@
-/*! State machine одного хода агента.
+﻿/*! State machine одного хода агента.
 
 Ход — это не «один запрос к модели», а цикл: модель генерирует, вызывает
 тулзы, получает результаты, генерирует снова. Ограничение итераций обязательно:
@@ -112,14 +112,21 @@ const PATH_TOOLS: &[&str] = &["read", "list", "write", "patch", "grep", "glob"];
 
 /// Вызов уводит файловый тулз за воркспейс сессии.
 ///
-/// Относительные пути (`../`) ловит песочница исполнения в fsx — а вот
-/// абсолютный путь (`C:\...` / `/...`) её обходит: резолв вне cwd происходит
-/// без join. Раньше такие пути исполнялись молча при политике OnDangerous,
-/// потому что read/list/grep сами по себе не «опасные имена». Теперь этот
-/// случай видит человек: при OnDangerous вызов с абсолютным путём уходит в
-/// диалог подтверждения, при Never — исполняется сразу (владелец уже снял
+/// Относительные выходы (`../`) ловит песочница исполнения в fsx — а вот
+/// якорные пути её обходят: резолв вне cwd происходит без join. Раньше
+/// такие пути исполнялись молча при политике OnDangerous, потому что
+/// read/list/grep сами по себе не «опасные имена». Теперь этот случай
+/// видит человек: при OnDangerous вызов с якорным путём уходит в диалог
+/// подтверждения, при Never — исполняется сразу (владелец уже снял
 /// все подтверждения осознанным решением), при Always и так подтверждается
 /// всё.
+///
+/// Ловятся не только «абсолютные» по std: формы Windows, которые
+/// `Path::is_absolute()` не признаёт, всё равно уводят за воркспейс —
+/// `C:evil` (относительно ТЕКУЩЕЙ папки диска C), `\evil` (корень
+/// текущего диска), `\\server` (UNC без share). `Path::join` с
+/// префиксным аргументом заменяет базу целиком, поэтому якорь — наличие
+/// префикса (диск/UNC) или корня. На Unix это те же `/...` (has_root).
 pub fn escapes_workspace(call: &ToolCall) -> bool {
     if !PATH_TOOLS.iter().any(|t| call.name.eq_ignore_ascii_case(t)) {
         return false;
@@ -129,7 +136,16 @@ pub fn escapes_workspace(call: &ToolCall) -> bool {
         .and_then(|v| v.as_str())
         .map(|p| {
             let p = p.trim();
-            !p.is_empty() && std::path::Path::new(p).is_absolute()
+            if p.is_empty() {
+                return false;
+            }
+            let path = std::path::Path::new(p);
+            path.is_absolute()
+                || path.has_root()
+                || path
+                    .components()
+                    .next()
+                    .is_some_and(|c| matches!(c, std::path::Component::Prefix(_)))
         })
         .unwrap_or(false)
 }
@@ -339,6 +355,27 @@ pub enum TurnStep {
     ExecuteTool { call: ToolCall },
     /// Ход закончен; отчёт берётся [`TurnMachine::report`].
     Finish { outcome: TurnOutcome },
+    /// Событие поглощено без действия: мусорный колбэк (результат без
+    /// исполнения, подтверждение вне диалога, вторая волна стрима до
+    /// закрытия первой) не двигает ход и не портит историю.
+    ///
+    /// Штатный драйвер сюда дойти не может — каждый `on_*` вызывается
+    /// ровно один раз на своё событие; шаг существует для прямых
+    /// headless-потребителей машины (тесты, плагины).
+    Noop,
+}
+
+/// Фаза вызова, выданного драйверу. Пока вызов в этой фазе, все прочие
+/// колбэки по нему гасятся: повторное подтверждение не исполняет вызов
+/// второй раз, а результат мимо диалога не прорывается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Ждёт решения человека ([`TurnStep::AwaitApproval`]).
+    Awaiting,
+    /// Исполняется: ждёт [`TurnMachine::on_tool_result`].
+    Executing,
+    /// Закрыт правилом/хуком: ждёт [`TurnMachine::on_blocked`].
+    Blocked,
 }
 
 /// State machine одного хода: история + очередь вызовов текущего ответа.
@@ -347,14 +384,27 @@ pub enum TurnStep {
 /// закрыто сообщениями `tool` по каждому вызову — иначе OpenAI-совместимый
 /// сервер отклонит следующий запрос. Отклонённый вызов тоже закрывается
 /// сообщением `tool` с текстом отказа.
+///
+/// Второй инвариант (ревизия 84, из протыкания): один выданный драйверу
+/// вызов закрывается ровно одним колбэком. `in_flight` хранит вызов и его
+/// фазу; всё, что не совпадает с фазой, гасится [`TurnStep::Noop`] —
+/// повторное подтверждение не исполняет вызов дважды, поздний результат
+/// не прорывается мимо диалога, а события после финала не растят историю
+/// умершего хода.
 #[derive(Debug)]
 pub struct TurnMachine {
     config: TurnConfig,
     history: Vec<ChatMessage>,
     iterations: usize,
     executed_calls: usize,
-    /// Вызовы последнего ответа модели, которые ещё не обработаны.
+    /// Вызовы последнего ответа модели, которые ещё не выданы драйверу.
     pending: Vec<ToolCall>,
+    /// Вызов, выданный драйверу, и его фаза.
+    in_flight: Option<(ToolCall, Phase)>,
+    /// Финал уже выдан: ход терминален, поздние колбэки гасятся.
+    finished: bool,
+    /// Владелец нажал «стоп»: после отмены вызовы не выдаются.
+    cancelled: bool,
     content: String,
     reasoning: String,
     started_ms: u64,
@@ -369,6 +419,9 @@ impl TurnMachine {
             iterations: 0,
             executed_calls: 0,
             pending: Vec::new(),
+            in_flight: None,
+            finished: false,
+            cancelled: false,
             content: String::new(),
             reasoning: String::new(),
             started_ms: now_ms(),
@@ -383,8 +436,20 @@ impl TurnMachine {
         }
     }
 
+    /// Финальный шаг ровно один раз: после него машина терминальна.
+    fn finish(&mut self, outcome: TurnOutcome) -> TurnStep {
+        self.finished = true;
+        TurnStep::Finish { outcome }
+    }
+
     /// Стрим текущего запроса закончился, `acc` — накопленный ответ.
     pub fn on_stream(&mut self, acc: StreamAccumulator) -> TurnStep {
+        // Поглощённые волны: вторая волна до закрытия первой затирала
+        // очередь и оставляла в истории tool_calls без ответов (битый
+        // следующий запрос). Гасим, не трогая историю.
+        if self.finished || self.cancelled || self.in_flight.is_some() || !self.pending.is_empty() {
+            return TurnStep::Noop;
+        }
         self.iterations += 1;
         push_joined(&mut self.content, &acc.content);
         push_joined(&mut self.reasoning, &acc.reasoning);
@@ -392,34 +457,46 @@ impl TurnMachine {
 
         // Модель закончила сама: вызовов нет — ход завершён.
         if acc.tool_calls.is_empty() {
-            self.pending.clear();
-            return TurnStep::Finish {
-                outcome: TurnOutcome::Completed,
-            };
+            return self.finish(TurnOutcome::Completed);
         }
+        // Лимит итераций проверяется ДО выдачи вызовов на исполнение:
+        // max_iterations=0 означает «ни одного исполнения», а не «одна
+        // партия, потом стоп». Вызовы закрываются сообщениями — иначе
+        // история осталась бы битой для следующего хода.
         self.pending = acc.tool_calls;
+        if self.iterations > self.config.max_iterations {
+            let reason = "ход остановлен по лимиту итераций";
+            self.close_all_pending(reason);
+            return self.finish(TurnOutcome::IterationLimit);
+        }
         self.next_call_step()
     }
 
     /// Решение человека по вызову, стоящему первым в очереди.
     pub fn on_approval(&mut self, decision: ApprovalDecision) -> TurnStep {
-        let Some(call) = self.pending.first().cloned() else {
-            return TurnStep::Finish {
-                outcome: TurnOutcome::Failed,
-            };
+        if self.finished || self.cancelled {
+            return TurnStep::Noop;
+        }
+        let Some((call, phase)) = self.in_flight.clone() else {
+            // Подтверждение без диалога (гонка UI, мусорный колбэк):
+            // живой ход не флипается в Failed.
+            return TurnStep::Noop;
         };
-        match decision {
-            ApprovalDecision::Approved => TurnStep::ExecuteTool { call },
-            ApprovalDecision::Denied => {
-                self.close_call(
-                    &call,
-                    ToolOutcome {
-                        ok: false,
-                        output: "вызов отклонён пользователем".into(),
-                    },
-                );
+        match (phase, decision) {
+            (Phase::Awaiting, ApprovalDecision::Approved) => {
+                self.in_flight = Some((call.clone(), Phase::Executing));
+                TurnStep::ExecuteTool { call }
+            }
+            (Phase::Awaiting, ApprovalDecision::Denied) => {
+                self.close_in_flight(ToolOutcome {
+                    ok: false,
+                    output: "вызов отклонён пользователем".into(),
+                });
                 self.after_queue()
             }
+            // Повторное решение по уже исполняемому вызову гасится:
+            // повторного исполнения не бывает.
+            _ => TurnStep::Noop,
         }
     }
 
@@ -427,38 +504,54 @@ impl TurnMachine {
     /// с текстом отказа — история остаётся валидной для следующего запроса.
     /// `executed_calls` не растёт: вызов не исполнялся.
     pub fn on_blocked(&mut self, reason: &str) -> TurnStep {
-        let Some(call) = self.pending.first().cloned() else {
-            return TurnStep::Finish {
-                outcome: TurnOutcome::Failed,
-            };
+        if self.finished || self.cancelled {
+            return TurnStep::Noop;
+        }
+        let Some((_, phase)) = self.in_flight.clone() else {
+            return TurnStep::Noop;
         };
-        self.close_call(
-            &call,
-            ToolOutcome {
-                ok: false,
-                output: reason.to_string(),
-            },
-        );
+        if phase != Phase::Blocked {
+            return TurnStep::Noop;
+        }
+        self.close_in_flight(ToolOutcome {
+            ok: false,
+            output: reason.to_string(),
+        });
         self.after_queue()
     }
 
     /// Результат выполнения вызова, стоявшего первым в очереди.
     pub fn on_tool_result(&mut self, outcome: ToolOutcome) -> TurnStep {
-        let Some(call) = self.pending.first().cloned() else {
-            return TurnStep::Finish {
-                outcome: TurnOutcome::Failed,
-            };
+        if self.finished || self.cancelled {
+            return TurnStep::Noop;
+        }
+        let Some((_, phase)) = self.in_flight.clone() else {
+            // Результат без выданного исполнения закрывал чужой вызов и
+            // обходил диалог. Гасим.
+            return TurnStep::Noop;
         };
+        if phase != Phase::Executing {
+            // Диалог ещё открыт: результат мимо подтверждения не принят.
+            return TurnStep::Noop;
+        }
         self.executed_calls += 1;
-        self.close_call(&call, outcome);
+        self.close_in_flight(outcome);
         self.after_queue()
     }
 
-    /// Прервать ход снаружи (кнопка «стоп»): драйвер больше не спрашивает шагов.
-    pub fn cancel(&self) -> TurnStep {
-        TurnStep::Finish {
-            outcome: TurnOutcome::Cancelled,
+    /// Прервать ход снаружи (кнопка «стоп»): драйвер больше не спрашивает
+    /// шагов. Фиксирует отмену: поздние подтверждения не исполнят вызов, а
+    /// незакрытые вызовы получают сообщения `tool`, чтобы история сессии
+    /// осталась валидной для следующего хода.
+    pub fn cancel(&mut self) -> TurnStep {
+        if self.finished {
+            // Повторная отмена в терминальном ходе — тишина, не новый финал.
+            return TurnStep::Noop;
         }
+        self.cancelled = true;
+        let reason = "ход отменён пользователем";
+        self.close_all_pending(reason);
+        self.finish(TurnOutcome::Cancelled)
     }
 
     /// Отчёт о ходе для журнала сессии.
@@ -479,8 +572,14 @@ impl TurnMachine {
         &self.history
     }
 
-    fn close_call(&mut self, call: &ToolCall, outcome: ToolOutcome) {
-        self.pending.remove(0);
+    /// Закрыть выданный вызов сообщением `tool` и освободить слот.
+    fn close_in_flight(&mut self, outcome: ToolOutcome) {
+        if let Some((call, _)) = self.in_flight.take() {
+            self.push_tool_message(&call, outcome);
+        }
+    }
+
+    fn push_tool_message(&mut self, call: &ToolCall, outcome: ToolOutcome) {
         self.history.push(ChatMessage {
             role: Role::Tool,
             // Большой вывод режем здесь, а не в исполнителе: лимит — свойство
@@ -492,6 +591,21 @@ impl TurnMachine {
         });
     }
 
+    /// Закрыть весь невыданный остаток очереди одним и тем же текстом
+    /// отказа: так история переживает лимит/отмену без битых tool_calls.
+    fn close_all_pending(&mut self, reason: &str) {
+        for call in std::mem::take(&mut self.pending) {
+            self.push_tool_message(
+                &call,
+                ToolOutcome {
+                    ok: false,
+                    output: reason.to_string(),
+                },
+            );
+        }
+        self.in_flight = None;
+    }
+
     /// Очередь опустела: либо следующий вызов, либо новый запрос модели.
     fn after_queue(&mut self) -> TurnStep {
         if !self.pending.is_empty() {
@@ -499,44 +613,52 @@ impl TurnMachine {
         }
         if self.iterations >= self.config.max_iterations {
             // Модель зациклилась: останавливаем предсказуемо, не ошибкой.
-            return TurnStep::Finish {
-                outcome: TurnOutcome::IterationLimit,
-            };
+            return self.finish(TurnOutcome::IterationLimit);
         }
         self.request_step()
     }
 
-    fn next_call_step(&self) -> TurnStep {
+    fn next_call_step(&mut self) -> TurnStep {
         let Some(call) = self.pending.first().cloned() else {
             // Очередь пуста: решение примет after_queue/on_stream.
-            return TurnStep::Finish {
-                outcome: TurnOutcome::Completed,
-            };
+            return self.finish(TurnOutcome::Completed);
         };
+        // Вызов покидает очередь в момент выдачи: повторное подтверждение
+        // или поздний результат не найдут его в pending и не исполнят
+        // второй раз.
+        self.pending.remove(0);
         /* F-3: списки команд проверяются РАНЬШЕ политики — deny > allow >
         политика. Запрещённый вызов не доходит до диалога: решение человек
         принял заранее, записав правило. */
         match self.config.rules.verdict_for(&call) {
-            RuleVerdict::Deny { rule } => TurnStep::Blocked {
-                reason: format!(
-                    "вызов отклонён deny-списком (правило {rule}): {}",
-                    rule_subject(&call)
-                ),
-                call,
-            },
-            RuleVerdict::Allow { .. } => TurnStep::ExecuteTool { call },
+            RuleVerdict::Deny { rule } => {
+                self.in_flight = Some((call.clone(), Phase::Blocked));
+                TurnStep::Blocked {
+                    reason: format!(
+                        "вызов отклонён deny-списком (правило {rule}): {}",
+                        rule_subject(&call)
+                    ),
+                    call,
+                }
+            }
+            RuleVerdict::Allow { .. } => {
+                self.in_flight = Some((call.clone(), Phase::Executing));
+                TurnStep::ExecuteTool { call }
+            }
             RuleVerdict::Pass => {
                 /* Путь вне воркспейса — второй триггер подтверждения:
                 OnDangerous по имени не покрывает read/list/grep с
-                абсолютным путём, а такой путь читает уже не проект,
+                якорным путём, а такой путь читает уже не проект,
                 а файловую систему владельца. Решение человек видит
                 в аргументах вызова (describe_call показывает path). */
                 let needs_approval = self.config.approval_policy.requires_approval(&call.name)
                     || (self.config.approval_policy == ApprovalPolicy::OnDangerous
                         && escapes_workspace(&call));
                 if needs_approval {
+                    self.in_flight = Some((call.clone(), Phase::Awaiting));
                     TurnStep::AwaitApproval { call }
                 } else {
+                    self.in_flight = Some((call.clone(), Phase::Executing));
                     TurnStep::ExecuteTool { call }
                 }
             }

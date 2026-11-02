@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use swagcod_core::bus::EventKind;
 use swagcod_core::turn::{
-    builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, TurnMachine, TurnOutcome,
-    TurnStep,
+    builtin_tool_specs, describe_call, truncate_output, ApprovalDecision, ToolOutcome, TurnMachine,
+    TurnOutcome, TurnStep,
 };
 use swagcod_provider::types::{ToolCall, ToolSpec};
 use swagcod_provider::{ChatRequest, StreamEvent};
@@ -1205,7 +1205,13 @@ pub(crate) async fn start_turn_core(
                                 decided_ms: swagcod_core::bus::now_ms(),
                             });
                         }
-                        step = machine.on_blocked(&reason);
+                        /* Ревизия 84: вызов уже выдан на исполнение (Executing),
+                        поэтому отказ хука закрывается результатом — не
+                        on_blocked (тот путь теперь фазовый, для deny-списка). */
+                        step = machine.on_tool_result(ToolOutcome {
+                            ok: false,
+                            output: reason,
+                        });
                         continue;
                     }
                     /* E-2: semantic_search исполняется здесь, а не в
@@ -1260,6 +1266,10 @@ pub(crate) async fn start_turn_core(
                     });
                     step = machine.on_tool_result(tool_outcome);
                 }
+                // Событие поглощено машиной (мусорный колбэк, гонка):
+                // штатный цикл сюда дойти не может, но защиту оставляем —
+                // терять шаг молча хуже, чем остановить ход.
+                TurnStep::Noop => break TurnOutcome::Cancelled,
                 TurnStep::Finish { outcome: o } => break o,
             }
         };

@@ -245,8 +245,17 @@ pub fn patch_text(
     }
     // Уровень 2: whitespace-нормализация. Структура строк сохраняется,
     // поэтому отображение «нормализованная строка ↔ исходная» тривиально.
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let content_lines: Vec<&str> = content.lines().collect();
+    // Ревизия 84, из протыкания: строки держим через split_inclusive —
+    // каждая несёт свой конец строки (\n или \r\n) внутри куска, поэтому
+    // нетронутые строки файла с CRLF сохраняют CRLF; раньше level-2
+    // пересобирал весь файл LF-концами.
+    let norm = |s: &str| {
+        s.trim_end_matches(['\r', '\n'])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let content_lines: Vec<&str> = content.split_inclusive('\n').collect();
     let o_norm: Vec<String> = old.lines().map(&norm).collect();
     let n = o_norm.len();
     if n > 0 && content_lines.len() >= n {
@@ -261,9 +270,17 @@ pub fn patch_text(
             let start = positions[0];
             let mut out: Vec<&str> = Vec::new();
             out.extend_from_slice(&content_lines[..start]);
-            out.push(new);
+            // new занимает место блока из n строк: внутренние концы строк
+            // блока исчезают, но финальный конец (последней строки блока)
+            // сохраняется — иначе «REPL» склеивался бы со следующей строкой
+            // или терял завершение файла.
+            let last = content_lines[start + n - 1];
+            let tail = &last[last.find(['\r', '\n']).unwrap_or(last.len())..];
+            let replacement = format!("{new}{tail}");
+            out.push(&replacement);
             out.extend_from_slice(&content_lines[start + n..]);
-            let mut patched = out.join("\n");
+            // Куски уже с концами строк — склейка без разделителя.
+            let mut patched = out.join("");
             if content.ends_with('\n') && !patched.ends_with('\n') {
                 patched.push('\n');
             }

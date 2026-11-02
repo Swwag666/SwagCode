@@ -162,12 +162,27 @@ function send(obj) {
 
 /* better-sqlite3 считает `?1`-плейсхолдеры именными: позиционные
    аргументы для них — «too many parameters». Биндим массив значений
-   объектом {1: v0, 2: v1, ...}. Весь SQL ядра — в `?N`-стиле. */
-function bindArgs(params) {
-  const list = params || [];
-  if (list.length === 0) return [];
+   объектом {1: v0, 2: v1, ...}. Весь SQL ядра — в `?N`-стиле.
+   Ревизия 84, из протыкания:
+   - SQL с обычными позиционными `?` получает массив как есть (объект
+     не биндится на анонимные плейсхолдеры);
+   - Infinity/NaN в параметрах — честная ошибка: JSON превращает их
+     в null, и в базу молча уезжала тишина (B22);
+   - params не массив — честная ошибка вместо тихого «[]» (B17d). */
+function bindArgs(params, sql) {
+  if (params === undefined || params === null) return [];
+  if (!Array.isArray(params)) {
+    throw new Error(`params должен быть массивом, получено ${typeof params}`);
+  }
+  if (params.some((v) => typeof v === 'number' && !Number.isFinite(v))) {
+    const i = params.findIndex((v) => typeof v === 'number' && !Number.isFinite(v));
+    throw new Error(`params[${i}]: не конечное число (${params[i]}) — JSON уронил бы его в null`);
+  }
+  if (params.length === 0) return [];
+  const named = /\?\d/.test(sql || '');
+  if (!named) return params;
   const obj = {};
-  list.forEach((v, i) => { obj[i + 1] = v; });
+  params.forEach((v, i) => { obj[i + 1] = v; });
   return [obj];
 }
 
@@ -178,11 +193,22 @@ function fail(id, err) {
 function openDb(path) {
   const fs = require('fs');
   const nodePath = require('path');
+  /* Ревизия 84 (B21): второй open закрывает прежнюю базу — иначе на
+  Windows дескриптор жил до shutdown (EBUSY на файле), а тесты открывали
+  по несколько баз за процесс. */
+  if (db) { try { db.close(); } catch { /* уже закрыта */ } db = null; }
   if (path !== ':memory:') {
     const dir = nodePath.dirname(path);
     if (dir && dir !== '.') fs.mkdirSync(dir, { recursive: true });
   }
-  db = new Database(path);
+  try {
+    db = new Database(path);
+  } catch (e) {
+    /* Ревизия 84 (B20): базу не открыли, прежняя уже закрыта — говорим
+    прямо, чтобы родитель не думал, что старая ещё подключена. */
+    db = null;
+    throw new Error(`${e && e.message} (прежняя база закрыта)`);
+  }
   db.exec(SCHEMA);
   // Миграции для баз, созданных до B-3/B-7: «duplicate column» — норма.
   try { db.exec("ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''"); } catch { /* уже есть */ }
@@ -214,10 +240,20 @@ function handle(req) {
     case 'ping':
       send({ id, ok: true, pong: true });
       return;
-    case 'open':
-      openDb(String(req.path));
-      send({ id, ok: true, opened: String(req.path) });
+    case 'open': {
+      /* Ревизия 84 (B07/B08): путь обязан быть непустой строкой — раньше
+      undefined/null/"" молча превращались в файл «undefined», «null»
+      или анонимную temp-базу. Абсолютность: родитель шлёт абсолютный
+      путь; относительный в sidecar создал бы файл от случайного cwd. */
+      const p = typeof req.path === 'string' ? req.path.trim() : '';
+      if (!p) throw new Error('open: путь к базе пуст');
+      if (p !== ':memory:' && !require('path').isAbsolute(p)) {
+        throw new Error(`open: путь должен быть абсолютным: ${p}`);
+      }
+      openDb(p);
+      send({ id, ok: true, opened: p });
       return;
+    }
     case 'integrity': {
       if (!db) throw new Error('база не открыта');
       const row = db.prepare('PRAGMA integrity_check').get();
@@ -226,7 +262,7 @@ function handle(req) {
     }
     case 'query': {
       if (!db) throw new Error('база не открыта');
-      const rows = db.prepare(req.sql).all(...bindArgs(req.params));
+      const rows = db.prepare(req.sql).all(...bindArgs(req.params, req.sql));
       // better-sqlite3 отдаёт объекты; протокол — массивы колонок: компактнее
       // и порядок детерминирован.
       const arrs = rows.map((r) => Object.values(r));
@@ -235,14 +271,14 @@ function handle(req) {
     }
     case 'exec': {
       if (!db) throw new Error('база не открыта');
-      const info = db.prepare(req.sql).run(...bindArgs(req.params));
+      const info = db.prepare(req.sql).run(...bindArgs(req.params, req.sql));
       send({ id, ok: true, changes: info.changes, insertId: Number(info.lastInsertRowid) });
       return;
     }
     case 'batch': {
       if (!db) throw new Error('база не открыта');
       const steps = req.steps || [];
-      const prepared = steps.map((s) => ({ stmt: db.prepare(s.sql), params: bindArgs(s.params) }));
+      const prepared = steps.map((s) => ({ stmt: db.prepare(s.sql), params: bindArgs(s.params, s.sql) }));
       let changes = 0;
       const tx = db.transaction(() => {
         for (const p of prepared) changes += p.stmt.run(...p.params).changes;
@@ -270,6 +306,13 @@ rl.on('line', (line) => {
     req = JSON.parse(trimmed);
   } catch (e) {
     fail(null, e);
+    return;
+  }
+  /* Ревизия 84 (B02): null/число/строка/массив вместо объекта запроса —
+  раньше доступ req.id в catch кидал ВТОРОЕ исключение мимо обработчика:
+  ответа нет, ошибка уезжает в uncaughtException. */
+  if (!req || typeof req !== 'object' || Array.isArray(req)) {
+    fail(null, new Error('запрос должен быть JSON-объектом'));
     return;
   }
   try {

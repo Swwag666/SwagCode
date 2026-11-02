@@ -172,6 +172,10 @@ impl AnthropicProvider {
 
             let mut acc = Acc::default();
             let mut buf = String::new();
+            /* Ревизия 84 (I5): байты недописанного UTF-8 символа копим в
+            хвосте: from_utf8_lossy на каждом чанке превращал разорванный
+            сетью CJK-символ в два U+FFFD и портил текст. */
+            let mut pending_bytes: Vec<u8> = Vec::new();
             let mut stream = resp.bytes_stream();
             while let Some(item) = stream.next().await {
                 let bytes = match item {
@@ -186,7 +190,15 @@ impl AnthropicProvider {
                         return;
                     }
                 };
-                buf.push_str(&String::from_utf8_lossy(&bytes));
+                let (text, tail) = if pending_bytes.is_empty() {
+                    crate::sse::decode_lossy_keep_tail(&bytes)
+                } else {
+                    pending_bytes.extend_from_slice(&bytes);
+                    let owned = std::mem::take(&mut pending_bytes);
+                    crate::sse::decode_lossy_keep_tail(&owned)
+                };
+                buf.push_str(&text);
+                pending_bytes = tail;
                 // Кадры разделены пустой строкой; хвост-огрызок ждёт следующий чанк.
                 while let Some(pos) = buf.find("\n\n") {
                     let frame = buf[..pos].to_string();
@@ -297,6 +309,26 @@ pub fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
             }
         }
     }
+    /* Ревизия 84 (G2): user-сообщения нет, а картинки есть — молча
+    терять нельзя: уходит новое user-сообщение только с image-блоками,
+    иначе модель отвечала бы вслепую. */
+    if last_user.is_none() && !req.images.is_empty() {
+        let blocks: Vec<serde_json::Value> = req
+            .images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.media_type,
+                        "data": img.data_base64,
+                    },
+                })
+            })
+            .collect();
+        seq.push(("user", blocks));
+    }
     // Склейка соседей одной роли (иначе 400): блоки дописываются.
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for (role, blocks) in seq {
@@ -395,6 +427,11 @@ struct Slot {
     started: bool,
 }
 
+/// Потолок числа блоков ответа (ревизия 84, I2): реальный ответ — десятки
+/// блоков; index из враждебного кадра выше потолка игнорируется, а не
+/// аллоцирует память.
+const MAX_BLOCK_INDEX: usize = 4096;
+
 /// Аккумулятор SSE-кадров Anthropic → наши StreamEvent.
 /// `feed_frame` принимает сырой кадр (`event:` + `data:` строки).
 /// Чистая логика без сети — тестируется скриптованными кадрами.
@@ -445,6 +482,14 @@ impl Acc {
             }
             "content_block_start" => {
                 let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                /* Ревизия 84, из протыкания (I2): потолок слотов. Раньше
+                `while slots.len() <= index` не имел предела, и кадр с
+                index=10⁹ требовал ~80 ГБ — кривой эндпоинт клал процесс
+                одной строкой. Реальные ответы укладываются в десятки
+                блоков; 4096 — потолок с запасом. */
+                if index >= MAX_BLOCK_INDEX {
+                    return Vec::new();
+                }
                 let block = v.get("content_block");
                 let btype = block
                     .and_then(|b| b.get("type"))
@@ -468,6 +513,16 @@ impl Acc {
                     .to_string();
                 while self.slots.len() <= index {
                     self.slots.push(Slot::default());
+                }
+                /* Ревизия 84 (I4): прокси повторяет content_block_start для
+                ЖИВОГО блока (тот же id, started) — это дубль, а не новый
+                блок: накопленные куски input_json_delta не сбрасываем,
+                иначе аргументы вызова деградируют в пустой объект. */
+                {
+                    let existing = &self.slots[index];
+                    if existing.started && !id.is_empty() && existing.id == id {
+                        return Vec::new();
+                    }
                 }
                 self.slots[index] = Slot {
                     kind: SlotKind::Ignore,
@@ -563,15 +618,29 @@ impl Acc {
                     "refusal" => FinishReason::ContentFilter,
                     _ => FinishReason::Unknown,
                 };
+                /* Ревизия 84 (I3): usage в кадре отсутствует — события Usage
+                нет. Раньше каждый message_delta без usage эмитил ложный
+                «точный счёт: 0 токенов», и ядро переставало считать
+                оценкой. Нули — тоже не событие (семантика sse.rs). */
                 let output = v
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0) as u32;
-                vec![StreamEvent::Usage {
-                    input_tokens: self.input_tokens,
-                    output_tokens: output,
-                }]
+                    .and_then(|n| n.as_u64());
+                match output {
+                    Some(n) => {
+                        let output = n.min(u32::MAX as u64) as u32;
+                        let input = self.input_tokens;
+                        if input == 0 && output == 0 {
+                            Vec::new()
+                        } else {
+                            vec![StreamEvent::Usage {
+                                input_tokens: input,
+                                output_tokens: output,
+                            }]
+                        }
+                    }
+                    None => Vec::new(),
+                }
             }
             "message_stop" => {
                 self.done = true;

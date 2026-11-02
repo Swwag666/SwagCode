@@ -26,23 +26,24 @@ pub struct ToolCall {
 /// Сообщение диалога. `reasoning` хранится отдельно от `content` (находка 1
 /// в DECISIONS.md §5.6) — это два разных визуальных канала в UI.
 ///
-/// Serialize написан вручную: наружу уходит wire-формат OpenAI, где
-/// `tool_calls` — конверты `{id, type, function:{name, arguments}}`, а
-/// `arguments` ОБЯЗАН быть строкой (JSON-текстом). Внутренний плоский
-/// формат с распарсенным объектом удобен машине хода, но строгие
-/// OpenAI-совместимые шлюзы отбивают его кодом 400.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// Serialize и Deserialize написаны вручную: наружу уходит wire-формат
+/// OpenAI, где `tool_calls` — конверты `{id, type, function:{name,
+/// arguments}}`, а `arguments` ОБЯЗАН быть строкой (JSON-текстом).
+/// Внутренний плоский формат с распарсенным объектом удобен машине хода,
+/// но строгие OpenAI-совместимые шлюзы отбивают его кодом 400.
+///
+/// Deserialize читает ОБА формата (ревизия 84, из протыкания): wire-конверт
+/// и плоский `{id, name, arguments-объект}` — раньше round-trip
+/// to_string→from_str падал на первом же сообщении с tool_calls, и любой
+/// слой персистентности через serde терял бы историю.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     /// Поток рассуждений модели. Отдельное поле, не склеивается с `content`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Заполняется у роли `tool`: id вызова, на который отвечаем.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -144,6 +145,82 @@ impl serde::Serialize for ChatMessage {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ChatMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            role: Role,
+            #[serde(default)]
+            content: String,
+            #[serde(default)]
+            reasoning: String,
+            #[serde(default)]
+            tool_calls: Option<serde_json::Value>,
+            #[serde(default)]
+            tool_call_id: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let tool_calls = match raw.tool_calls {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => parse_tool_calls(&v).map_err(serde::de::Error::custom)?,
+        };
+        Ok(Self {
+            role: raw.role,
+            content: raw.content,
+            reasoning: raw.reasoning,
+            tool_calls,
+            tool_call_id: raw.tool_call_id,
+        })
+    }
+}
+
+/// Прочитать `tool_calls` в обоих форматах: wire-конверт OpenAI
+/// (`function.arguments` строкой) и плоский внутренний (`arguments`
+/// объектом). Аргументы-строка парсится; битый JSON от модели не роняет
+/// чтение — остаётся пустой объект, как в стрим-парсере.
+fn parse_tool_calls(v: &serde_json::Value) -> Result<Vec<ToolCall>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "tool_calls должен быть массивом".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for tc in arr {
+        let id = tc
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|x| x.as_str())
+            .or_else(|| tc.get("name").and_then(|x| x.as_str()))
+            .unwrap_or_default()
+            .to_string();
+        let arguments = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .cloned()
+            .or_else(|| tc.get("arguments").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let arguments = match arguments {
+            serde_json::Value::String(s) if !s.trim().is_empty() => {
+                serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default()
+            }
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        out.push(ToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    Ok(out)
+}
+
 /// Объявление инструмента, которое отправляем модели.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -201,12 +278,6 @@ pub fn openai_body(req: &ChatRequest) -> serde_json::Value {
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return v;
     };
-    let Some(idx) = msgs
-        .iter()
-        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-    else {
-        return v;
-    };
     let mut parts: Vec<serde_json::Value> = Vec::new();
     for img in &req.images {
         parts.push(serde_json::json!({
@@ -216,6 +287,17 @@ pub fn openai_body(req: &ChatRequest) -> serde_json::Value {
             },
         }));
     }
+    // Ревизия 84, из протыкания: user-сообщения может не быть (только
+    // system, или пустая история) — картинки не выбрасываются молча:
+    // уходит новое user-сообщение с ними, иначе модель отвечала бы
+    // вслепую и никто не узнавал бы об этом.
+    let Some(idx) = msgs
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        msgs.push(serde_json::json!({"role": "user", "content": parts}));
+        return v;
+    };
     let text = msgs[idx]
         .get("content")
         .and_then(|c| c.as_str())

@@ -30,6 +30,14 @@ pub const PORT_PREF: &str = "http_api_port";
 /// Пределы запроса: заголовки и тело. Превышение — честный 400, не OOM.
 const HEAD_LIMIT: usize = 64 * 1024;
 const BODY_LIMIT: usize = 1024 * 1024;
+/// Дедлайн чтения головы и тела (ревизия 84, из протыкания F4/F5):
+/// незавершённый head или недотянутое тело раньше держали задачу сервера
+/// в read() бесконечно. 408 — клиенту, задаче — свобода.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Дренаж хвоста после ответа: клиент, дописывающий тело сверх
+/// Content-Length, ловил RST и терял ответ (os error 10053). Вычитываем
+/// остаток с коротким таймаутом — данные в буферах приезжают мгновенно.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Порт API: env → prefs → None (выключено). 0 не считается портом.
 pub fn configured_port(state: &AppState) -> Option<u16> {
@@ -153,6 +161,24 @@ fn json_error(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
 }
 
+/// Вычитать заявленное тело запроса (до DRAIN_TIMEOUT): вызывается перед
+/// ответом на перелимит, чтобы клиент успел дописать и увидеть 400,
+/// а не RST без ответа.
+async fn drain_declared_body(sock: &mut TcpStream, mut remaining: usize) {
+    let mut tmp = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    while remaining > 0 {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(left, sock.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(n)) => remaining = remaining.saturating_sub(n),
+        }
+    }
+}
+
 /* F-9: разбор тела и полей для маршрутов, добавленных под Phone. Маршруты
 E-7/F-5 написаны раньше и оставлены как есть — их тексты ошибок уже покрыты
 тестами и журналом, переписывать их ради единого стиля значило бы мешать
@@ -212,16 +238,39 @@ pub async fn serve_on(listener: TcpListener, state: Arc<AppState>, token: String
             let mut sock = sock;
             if let Some(resp) = serve_conn(&mut sock, &st, &tk).await {
                 let _ = sock.write_all(&resp).await;
+                /* Ревизия 84, из протыкания (F1/F2): клиент может писать
+                тело сверх заявленного Content-Length — закрытие с данными
+                в буфере отдаёт RST, и ответ теряется (клиент видит os
+                error 10053 и ни одного байта). Досасываем хвост. */
+                drain_after_response(&mut sock).await;
             }
             let _ = sock.shutdown().await;
         });
     }
 }
 
+/// Вычитать из сокета всё, что уже приехало (или приедет в ближайшие
+/// полсекунды): пустой recv-буфер → чистый FIN вместо RST.
+async fn drain_after_response(sock: &mut TcpStream) {
+    let mut tmp = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(left, sock.read(&mut tmp)).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => return,
+        }
+    }
+}
+
 /// Одно соединение: прочитать запрос, смаршрутизировать, ответить.
 /// None — соединение закрыто клиентом или SSE уже отдал всё сам.
 async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) -> Option<Vec<u8>> {
-    // 1. Заголовки — до \r\n\r\n, с пределом.
+    // 1. Заголовки — до \r\n\r\n, с пределом и дедлайном.
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     let head_end = loop {
@@ -235,11 +284,30 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
                 &json_error("заголовки слишком большие"),
             ));
         }
-        let n = sock.read(&mut tmp).await.ok()?;
-        if n == 0 {
-            return None; // клиент ушёл без запроса
+        match tokio::time::timeout(READ_TIMEOUT, sock.read(&mut tmp)).await {
+            // Дедлайн чтения (F4): незавершённый head больше не висит вечно.
+            Err(_) => {
+                return Some(response(
+                    408,
+                    "Request Timeout",
+                    &json_error("заголовки не дочитаны вовремя"),
+                ))
+            }
+            Ok(Ok(0)) => {
+                // Клиент оборвал запрос до терминатора (F6): если хоть
+                // что-то пришло — честный 400, а не молчаливый обрыв.
+                if buf.is_empty() {
+                    return None; // подключился и ушёл: никто не ждёт ответа
+                }
+                return Some(response(
+                    400,
+                    "Bad Request",
+                    &json_error("запрос оборван до конца заголовков"),
+                ));
+            }
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => return None,
         }
-        buf.extend_from_slice(&tmp[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let (method, path, content_length, auth) = match parse_head(&head) {
@@ -251,6 +319,9 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
     let mut body = buf[head_end + 4..].to_vec();
     if let Some(cl) = content_length {
         if cl > BODY_LIMIT {
+            /* Ответ на перелимит уходит после дренажа заявленного тела
+            (F1): RST на недочитанных байтах стоил клиенту самого ответа. */
+            drain_declared_body(sock, cl.saturating_sub(body.len())).await;
             return Some(response(
                 400,
                 "Bad Request",
@@ -258,15 +329,25 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             ));
         }
         while body.len() < cl {
-            let n = sock.read(&mut tmp).await.ok()?;
-            if n == 0 {
-                return Some(response(
-                    400,
-                    "Bad Request",
-                    &json_error("тело не дочитано"),
-                ));
+            match tokio::time::timeout(READ_TIMEOUT, sock.read(&mut tmp)).await {
+                // Дедлайн чтения тела (F5): недотянутое тело не висит вечно.
+                Err(_) => {
+                    return Some(response(
+                        408,
+                        "Request Timeout",
+                        &json_error("тело не дочитано вовремя"),
+                    ))
+                }
+                Ok(Ok(0)) => {
+                    return Some(response(
+                        400,
+                        "Bad Request",
+                        &json_error("тело не дочитано"),
+                    ));
+                }
+                Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+                Ok(Err(_)) => return None,
             }
-            body.extend_from_slice(&tmp[..n]);
         }
         body.truncate(cl);
     }
@@ -303,13 +384,23 @@ async fn serve_conn(sock: &mut TcpStream, state: &Arc<AppState>, token: &str) ->
             Err(e) => Some(bad_request(&e)),
         },
         /* F-9: создание сессии — тот же core, что у IPC-команды, поэтому
-        Phone получает ту же валидацию cwd и тот же дефолт модели. */
+        Phone получает ту же валидацию cwd и тот же дефолт модели.
+        Ревизия 84 (F3 из протыкания): тело обязано быть объектом с
+        непустым cwd — раньше "[]"/null/число/{"cwd":5} давали 200 и
+        сессию в USERPROFILE (create_session_core трактует пустой cwd
+        как «домой»). IPC-путь остаётся с дефолтом, HTTP — явный cwd. */
         ("POST", "/v1/sessions") => {
             let v = match json_body(&body) {
                 Ok(v) => v,
                 Err(e) => return Some(bad_request(&e)),
             };
+            if !v.is_object() {
+                return Some(bad_request("тело должно быть JSON-объектом"));
+            }
             let cwd = str_field(&v, "cwd");
+            if cwd.trim().is_empty() {
+                return Some(bad_request("нужен cwd (абсолютный путь рабочей папки)"));
+            }
             let model = v.get("model").and_then(|x| x.as_str()).map(String::from);
             match crate::create_session_core(state, cwd, model).await {
                 Ok(brief) => Some(response(
