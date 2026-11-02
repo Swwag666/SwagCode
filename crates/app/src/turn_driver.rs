@@ -35,25 +35,37 @@ use crate::{
 /// Лимит 200 КБ на файл бережёт контекст (B-3) от одного жирного лога.
 /// Флаг авто-коммита, который выставляет ночной прогон (rev79).
 ///
-/// Переменная окружения - для владельца, который включает режим насовсем; флаг -
-/// для прогона, который включает его на время и гарантированно снимает на выходе.
-/// Ставится атомарно: прогон и ходы живут в разных задачах.
-pub(crate) static NIGHT_AUTO_COMMIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Счётчик активных ночных прогонов (rev76). Счётчик, а не флаг: два
+/// параллельных прогона в разных сессиях раньше сбивали друг другу
+/// AUTO_COMMIT - первый завершившийся снимал общий флажок и второй
+/// доигрывал без авто-коммита. Теперь флаг активен, пока жив хоть один
+/// guard.
+pub(crate) static NIGHT_ACTIVE: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// Пауза перед повтором транспортного обрыва: 1с на первый, 3с на второй
+/// (нарастающая, не линейная — вторая пауза нарочно длиннее, чтобы дать
+/// шлюзу время подняться после всплеска). Чистая функция для теста.
+fn transport_retry_delay_ms(attempt: u32) -> u64 {
+    match attempt {
+        1 => 1000,
+        _ => 3000,
+    }
+}
 
 /// Включает авто-коммит и снимает при любом выходе - включая ранний по ошибке.
 struct NightAutoCommitGuard;
 
 impl NightAutoCommitGuard {
     fn new() -> Self {
-        NIGHT_AUTO_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
+        NIGHT_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         NightAutoCommitGuard
     }
 }
 
 impl Drop for NightAutoCommitGuard {
     fn drop(&mut self) {
-        NIGHT_AUTO_COMMIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        NIGHT_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -168,7 +180,7 @@ fn last_turn_cost(state: &std::sync::Arc<crate::AppState>, before_ms: u64) -> f6
 /// репозиторий самостоятельно. Ночной прогон включает переменной окружения,
 /// потому что там это и нужно.
 fn auto_commit_enabled() -> bool {
-    if NIGHT_AUTO_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
+    if NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         return true;
     }
     matches!(
@@ -1002,7 +1014,7 @@ pub(crate) async fn start_turn_core(
                                 ),
                             });
                             tokio::time::sleep(std::time::Duration::from_millis(
-                                1000 * transport_retries as u64,
+                                transport_retry_delay_ms(transport_retries),
                             ))
                             .await;
                             step = TurnStep::RequestModel { history };
@@ -1619,5 +1631,31 @@ mod image_attachment_tests {
         assert!(catalog_has_id(&cat, "glm-5.3"));
         assert!(!catalog_has_id(&cat, "gpt-9"));
         assert!(!catalog_has_id(&serde_json::json!({}), "glm-5.3"));
+    }
+
+    #[test]
+    fn transport_retry_delays_match_documented_1s_3s() {
+        // Комментарий у ретрая обещает «1с/3с» — код обязан держать слово.
+        assert_eq!(transport_retry_delay_ms(1), 1000);
+        assert_eq!(transport_retry_delay_ms(2), 3000);
+    }
+
+    #[test]
+    fn night_active_counts_concurrent_guards() {
+        // Гонка rev-ревью: два параллельных прогона, первый завершился —
+        // флаг обязан остаться поднятым для второго, а не сброситься в ноль.
+        assert_eq!(NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let g1 = NightAutoCommitGuard::new();
+        assert_eq!(NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let g2 = NightAutoCommitGuard::new();
+        assert_eq!(NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(g1);
+        assert_eq!(
+            NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "второй прогон не должен терять авто-коммит от выхода первого"
+        );
+        drop(g2);
+        assert_eq!(NIGHT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

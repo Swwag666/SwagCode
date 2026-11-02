@@ -105,6 +105,35 @@ impl ApprovalPolicy {
     }
 }
 
+/// Тулзы файловой группы: цель вызова — путь в аргументе `path`.
+/// Для остальных инструментов путь может быть лишь деталью (например,
+/// `bash` уже целиком опасен по имени), поэтому проверять их смысла нет.
+const PATH_TOOLS: &[&str] = &["read", "list", "write", "patch", "grep", "glob"];
+
+/// Вызов уводит файловый тулз за воркспейс сессии.
+///
+/// Относительные пути (`../`) ловит песочница исполнения в fsx — а вот
+/// абсолютный путь (`C:\...` / `/...`) её обходит: резолв вне cwd происходит
+/// без join. Раньше такие пути исполнялись молча при политике OnDangerous,
+/// потому что read/list/grep сами по себе не «опасные имена». Теперь этот
+/// случай видит человек: при OnDangerous вызов с абсолютным путём уходит в
+/// диалог подтверждения, при Never — исполняется сразу (владелец уже снял
+/// все подтверждения осознанным решением), при Always и так подтверждается
+/// всё.
+pub fn escapes_workspace(call: &ToolCall) -> bool {
+    if !PATH_TOOLS.iter().any(|t| call.name.eq_ignore_ascii_case(t)) {
+        return false;
+    }
+    call.arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|p| {
+            let p = p.trim();
+            !p.is_empty() && std::path::Path::new(p).is_absolute()
+        })
+        .unwrap_or(false)
+}
+
 /// Ответ ядра на запрос подтверждения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -497,7 +526,15 @@ impl TurnMachine {
             },
             RuleVerdict::Allow { .. } => TurnStep::ExecuteTool { call },
             RuleVerdict::Pass => {
-                if self.config.approval_policy.requires_approval(&call.name) {
+                /* Путь вне воркспейса — второй триггер подтверждения:
+                OnDangerous по имени не покрывает read/list/grep с
+                абсолютным путём, а такой путь читает уже не проект,
+                а файловую систему владельца. Решение человек видит
+                в аргументах вызова (describe_call показывает path). */
+                let needs_approval = self.config.approval_policy.requires_approval(&call.name)
+                    || (self.config.approval_policy == ApprovalPolicy::OnDangerous
+                        && escapes_workspace(&call));
+                if needs_approval {
                     TurnStep::AwaitApproval { call }
                 } else {
                     TurnStep::ExecuteTool { call }
@@ -1161,6 +1198,123 @@ mod tests {
         let _ = m.on_stream(acc_tool("c1", "read"));
         let step = m.on_approval(ApprovalDecision::Approved);
         assert!(matches!(step, TurnStep::ExecuteTool { .. }));
+    }
+
+    /* ── пути вне воркспейса: абсолютный путь файлового тулза ────────── */
+
+    fn acc_tool_with_path(id: &str, name: &str, path: &str) -> StreamAccumulator {
+        StreamAccumulator {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::json!({ "path": path })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[cfg(windows)]
+    const OUTSIDE_PATH: &str = "C:\\Windows\\win.ini";
+    #[cfg(not(windows))]
+    const OUTSIDE_PATH: &str = "/etc/passwd";
+
+    #[test]
+    fn machine_gates_absolute_path_behind_approval_under_on_dangerous() {
+        // Дефолтная политика OnDangerous: read не «опасное имя», но абсолютный
+        // путь уводит за воркспейс — диалог обязателен, молча читать нельзя.
+        let (mut m, _) = TurnMachine::new(TurnConfig::default(), vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool_with_path("c1", "read", OUTSIDE_PATH));
+        assert!(
+            matches!(step, TurnStep::AwaitApproval { ref call } if call.name == "read"),
+            "абсолютный путь вне cwd обязан уйти на подтверждение: {step:?}"
+        );
+        // Подтвердил — исполняется как обычный read.
+        let step = m.on_approval(ApprovalDecision::Approved);
+        assert!(matches!(step, TurnStep::ExecuteTool { .. }));
+    }
+
+    #[test]
+    fn machine_gates_absolute_grep_and_patch_too() {
+        let (mut m, _) = TurnMachine::new(TurnConfig::default(), vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool_with_path("c1", "grep", OUTSIDE_PATH));
+        assert!(matches!(step, TurnStep::AwaitApproval { .. }), "{step:?}");
+        let step = m.on_approval(ApprovalDecision::Denied);
+        assert!(matches!(step, TurnStep::RequestModel { .. }));
+        let step = m.on_stream(acc_tool_with_path("c2", "patch", OUTSIDE_PATH));
+        assert!(matches!(step, TurnStep::AwaitApproval { .. }), "{step:?}");
+    }
+
+    #[test]
+    fn machine_runs_relative_path_without_dialog() {
+        // Относительный путь внутри воркспейса — обычная работа read,
+        // OnDangerous его не трогает (песочницу исполняет fsx::is_within).
+        let (mut m, _) = TurnMachine::new(TurnConfig::default(), vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool_with_path("c1", "read", "src/lib.rs"));
+        assert!(
+            matches!(step, TurnStep::ExecuteTool { .. }),
+            "относительный путь не требует диалога: {step:?}"
+        );
+    }
+
+    #[test]
+    fn machine_never_policy_skips_path_dialog() {
+        // Never — осознанное решение владельца: все подтверждения сняты,
+        // в том числе про пути. Молча исполняется, как и bash при Never.
+        let (mut m, _) = TurnMachine::new(never_cfg(), vec![ChatMessage::user("go")]);
+        let step = m.on_stream(acc_tool_with_path("c1", "read", OUTSIDE_PATH));
+        assert!(
+            matches!(step, TurnStep::ExecuteTool { .. }),
+            "Never снимает и path-подтверждение: {step:?}"
+        );
+    }
+
+    #[test]
+    fn escapes_workspace_detection_units() {
+        // Не-файловый тулз: путь — деталь аргументов, не триггер.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "fetch_url".into(),
+            arguments: serde_json::json!({ "url": "https://x" })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+        assert!(!escapes_workspace(&call));
+        // Пустой/пробельный path — не выход за воркспейс.
+        for empty in ["", "   "] {
+            let call = ToolCall {
+                id: "c".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": empty })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            assert!(!escapes_workspace(&call), "path={empty:?}");
+        }
+        // Отсутствующий path (grep без path) — не выход.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({ "pattern": "x" })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+        assert!(!escapes_workspace(&call));
+        // Абсолютный — выход.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": OUTSIDE_PATH })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+        assert!(escapes_workspace(&call));
     }
 
     #[test]
