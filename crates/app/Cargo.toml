@@ -47,7 +47,7 @@ notify = "8"
 tauri-plugin-dialog = "2.0.0-rc.8"
 # E-9: сессии DSH лежат в многокадровом zstd (session.v3.jsonl.zstd).
 # Статическая libzstd из zstd-sys — внешних зависимостей не добавляет.
-zstd = "0.13"
+zstd = "0.14.3"
 
 # Звуковые уведомления: rodio декодирует WAV/MP3/OGG и играет через WASAPI.
 rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
