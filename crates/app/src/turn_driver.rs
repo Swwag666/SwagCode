@@ -188,6 +188,60 @@ fn auto_commit_enabled() -> bool {
         Ok("1") | Ok("true") | Ok("yes")
     )
 }
+
+/* ── F-081 (ревизия 85): FIFO-писатель ходов ────────────────────────────────
+ * Персистенция хода обязана удовлетворять трём требованиям сразу, и на
+ * мьютексах всех трёх не добиться:
+ *   1) turn_ended не ждёт store (занятый мьютекс не задерживает финал);
+ *   2) старт следующего хода не ждёт ни sessions, ни turns (ответ 200
+ *      уходит мгновенно после turn_ended);
+ *   3) порядок записи = порядок финализации (поздний писатель со старым
+ *      срезом не откатывает историю в базе).
+ * Выделенный поток-писатель с каналом закрывает все три: enqueue под
+ * коротким sessions-локом (срез актуален), запись — в своём потоке,
+ * FIFO mpsc хранит порядок. Поток поднимается один на процесс. */
+
+struct TurnWriteJob {
+    app: std::sync::Arc<crate::AppState>,
+    sid: String,
+    record: swagcod_core::session::TurnRecord,
+    history: Vec<swagcod_provider::types::ChatMessage>,
+    cost: Option<f64>,
+}
+
+static TURN_WRITE_TX: std::sync::OnceLock<std::sync::mpsc::Sender<TurnWriteJob>> =
+    std::sync::OnceLock::new();
+
+fn enqueue_turn_write(job: TurnWriteJob) {
+    let tx = TURN_WRITE_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<TurnWriteJob>();
+        std::thread::Builder::new()
+            .name("swagcod-turn-writer".into())
+            .spawn(move || turn_write_loop(rx))
+            .expect("поток записи ходов");
+        tx
+    });
+    if tx.send(job).is_err() {
+        // Писатель умер (паника внутри): запись теряется громко, а не тихо.
+        eprintln!("turn-writer: очередь записи ходов мертва");
+    }
+}
+
+fn turn_write_loop(rx: std::sync::mpsc::Receiver<TurnWriteJob>) {
+    while let Ok(job) = rx.recv() {
+        if let Ok(store) = job.app.store.lock() {
+            if let Err(e) = store.save_turn(&job.sid, &job.record, &job.history) {
+                eprintln!("store: ход не записан: {e}");
+            }
+        }
+        if let Some(cost) = job.cost {
+            if let Ok(g) = job.app.store.lock() {
+                let _ = g.metrics_insert(swagcod_core::bus::now_ms(), "turn_cost_usd", cost);
+            }
+        }
+    }
+}
+
 pub(crate) const ATTACH_MAX_BYTES: u64 = 200 * 1024;
 
 /* ── rev62: предел автономии главного хода ──────────────────────────────────
@@ -562,7 +616,7 @@ pub(crate) async fn start_turn_core(
     // Активный провайдер из настроек (default = .env/DPAPI как раньше).
     let provider = providers::build_chat_provider(&state).map_err(|e| format!("провайдер: {e}"))?;
 
-    let (turn_id, history, session_summary, session_model, cwd, mut cfg) = {
+    let (turn_id, history, session_summary, session_model, cwd, cfg) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .iter_mut()
@@ -621,18 +675,13 @@ pub(crate) async fn start_turn_core(
     подхватывается со следующего хода без перезапуска приложения. */
     let folder = resolve_folder_rules(&state, std::path::Path::new(&cwd));
 
-    /* F-3: allow/deny из prefs читаются на каждый ход (правка в настройках
-    действует сразу), и folder-rules папки их дополняют. Deny остаётся
-    сильнее allow — порядок проверки внутри CommandRules, а не здесь. */
-    let (mut allow_lines, mut deny_lines) = state
-        .store
-        .lock()
-        .map(|s| crate::command_rule_lines(s.as_ref()))
-        // Отравленный мьютекс не должен снимать запреты: дефолты F-3.
-        .unwrap_or_else(|_| crate::default_rule_lines());
-    allow_lines.extend(folder.allow.iter().cloned());
-    deny_lines.extend(folder.deny.iter().cloned());
-    cfg.rules = swagcod_core::rules::CommandRules::from_lines(allow_lines, deny_lines);
+    /* F-3: allow/deny из prefs + folder-rules. Ревизия 85 (F-081): чтение
+    prefs уехало из HTTP-пути в ходовую задачу — блокирующий store-мьютекс
+    не имеет права задерживать ответ «ход принят» (зондаж поймал зависание
+    POST /v1/turns при занятом store). Правки правил видны каждому новому
+    ходу как раньше: задача читает их в момент старта. */
+    let folder_allow = folder.allow.clone();
+    let folder_deny = folder.deny.clone();
     if !folder.is_noop() {
         eprintln!(
             "folder-rules для {cwd}: allow+{} deny+{} mcp-{} plugins-{} skills-{} источников {}",
@@ -823,6 +872,20 @@ pub(crate) async fn start_turn_core(
         прежнему: правил нет — ход идёт как до Фичи 2. */
         let system_msg =
             context::system_prompt_with(&summary, &memory_md, &memory_facts, &folder_prompt);
+
+        /* F-3 (перенесено в задачу ревизией 85, F-081): allow/deny из prefs
+        читаются в момент старта ходовой задачи. Deny сильнее allow — порядок
+        проверки внутри CommandRules. Отравленный мьютекс не должен снимать
+        запреты: дефолты F-3. */
+        let (mut allow_lines, mut deny_lines) = app_state
+            .store
+            .lock()
+            .map(|s| crate::command_rule_lines(s.as_ref()))
+            .unwrap_or_else(|_| crate::default_rule_lines());
+        allow_lines.extend(folder_allow.iter().cloned());
+        deny_lines.extend(folder_deny.iter().cloned());
+        let mut cfg = cfg;
+        cfg.rules = swagcod_core::rules::CommandRules::from_lines(allow_lines, deny_lines);
 
         let (mut machine, mut step) = TurnMachine::new(cfg, history);
         let mut fail_reason: Option<String> = None;
@@ -1290,13 +1353,8 @@ pub(crate) async fn start_turn_core(
                     .unwrap_or_else(|| "ошибка хода".to_string()),
             ),
         };
-        bus.publish(EventKind::TurnEnded {
-            turn: tid.clone(),
-            session: swagcod_core::SessionId::new(&sid),
-            ok: outcome == TurnOutcome::Completed,
-            reason,
-        });
-
+        /* F-081: публикация финала перенесена ниже — после сброса статуса
+        сессии; комментарий с контрактом у самого publish. */
         let ended_ms = swagcod_core::bus::now_ms();
         let report = machine.report(outcome, ended_ms);
         let calls: Vec<ToolCall> = machine
@@ -1319,14 +1377,12 @@ pub(crate) async fn start_turn_core(
         /* rev68: цена хода - в ту же метрику, что задержка и прочая телеметрия.
         Деньги должны быть записаны, а не только посчитаны: иначе через месяц
         никто не скажет, во что обошлась ночь. Модели нет в таблице цен - точки
-        нет: ноль соврал бы про бесплатный прогон. */
-        if let Some(cost) =
-            swagcod_core::pricing::cost_usd(&effective_model, est_in as u64, est_out as u64)
-        {
-            if let Ok(g) = app_state.store.lock() {
-                let _ = g.metrics_insert(swagcod_core::bus::now_ms(), "turn_cost_usd", cost);
-            }
-        }
+        нет: ноль соврал бы про бесплатный прогон.
+        F-081: запись метрики ушла ниже, вслед за публикацией финала —
+        metrics_insert делит store-мьютекс со всем приложением и не имеет
+        права задерживать ни turn_ended, ни ввод пользователя. */
+        let turn_cost =
+            swagcod_core::pricing::cost_usd(&effective_model, est_in as u64, est_out as u64);
         // F-5: снимок принадлежит этому ходу — вместе с ним и хранится.
         record.checkpoint_sha = checkpoint_sha;
         /* rev76: авто-коммит хода - только по явному включению. Ошибка коммита
@@ -1384,26 +1440,65 @@ pub(crate) async fn start_turn_core(
                     _ => swagcod_core::session::SessionStatus::Idle,
                 };
                 session.current_turn = None;
-                /* B-1: ход и снимок истории уходят в store одной транзакцией
-                прямо здесь, в конце хода. */
-                if let Ok(store) = app_state.store.lock() {
-                    if let Err(e) = store.save_turn(&sid, &record, &session.history) {
-                        eprintln!("store: ход не записан: {e}");
-                    }
-                }
                 // D-121: сайдбар видит свежие счётчики без полной сессии.
                 if let Ok(mut m) = app_state.session_meta.lock() {
                     m.insert(sid.clone(), meta_of(session));
                 }
+                /* B-1: ход и снимок истории уходят в store одной транзакцией —
+                теперь ниже, после публикации финала (F-081): персистенция не
+                имеет права задерживать turn_ended и ввод. */
             }
         }
 
         // Ход закончился — убираем ручку, чтобы «стоп» не бил по прошлому.
-        let mut turns = app_state.turns.lock().await;
-        turns.remove(&turn);
+        // F-081 (ревизия 85): скоупы лока ужаты — guard пережидал всю
+        // финализацию, включая ожидание store-мьютекса, и следующий ход
+        // ждал turns.lock, пока занят store. Лок — на одно действие.
+        {
+            let mut turns = app_state.turns.lock().await;
+            turns.remove(&turn);
+        }
         // B-8: watchdog больше не следит за мёртвым ходом.
         if let Ok(mut activity) = app_state.turn_activity.lock() {
             activity.remove(&turn);
+        }
+
+        /* F-081 (ревизия 85, из зондажа «пацаны»): TurnEnded публикуется
+        только после сброса статуса сессии. Раньше финал уходил в шину,
+        пока статус ещё Running (сброс жил ниже и делил мьютекс store с
+        metrics_insert и save_turn): UI, разблокирующий ввод по
+        turn_ended, мгновенно отправлял ход и получал 400 «сессия
+        занята: Running», сообщение терялось. Контракт: turn_ended =
+        ход завершён = ввод принимает. Финал публикуется ровно один
+        раз и только из исхода цикла: UI закрывает строки хода по нему
+        и не дедуплицирует несколько финалов. */
+        bus.publish(EventKind::TurnEnded {
+            turn: tid.clone(),
+            session: swagcod_core::SessionId::new(&sid),
+            ok: outcome == TurnOutcome::Completed,
+            reason,
+        });
+
+        /* Персистенция хода (B-1: ход + снимок истории одной транзакцией)
+        идёт после финала и не задерживает ни turn_ended, ни ввод. Запись
+        уходит в FIFO-очередь выделенного писателя: порядок записи равен
+        порядку финализации (enqueue под коротким sessions-локом), поэтому
+        поздний финализатор, ждавший store-мьютекс, не перезапишет более
+        свежую историю своим старым срезом — база остаётся монотонной. */
+        {
+            let sessions = app_state.sessions.lock().await;
+            let snapshot = sessions
+                .iter()
+                .find(|s| s.id.to_string() == sid)
+                .map(|s| s.history.clone())
+                .unwrap_or_default();
+            enqueue_turn_write(TurnWriteJob {
+                app: app_state.clone(),
+                sid: sid.clone(),
+                record: record.clone(),
+                history: snapshot,
+                cost: turn_cost,
+            });
         }
         /* F-8: post_turn — после записи хода, поэтому хук видит полный
         журнал. Код возврата ни на что не влияет (ход уже случился): отказ

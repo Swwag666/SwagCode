@@ -28,3 +28,6 @@ scraper = "0.20"
 # поэтому net/time/io-util явно (reqwest их и так тянет, но тест не должен
 # зависеть от чужих фич).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+# probe_flow_files: временные каталоги с авто-уборкой (тот же tempfile,
+# что уже в dev-deps swagcod-app — новая версия в lock не приезжает).
+tempfile = "3"

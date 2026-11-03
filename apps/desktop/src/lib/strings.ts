@@ -1,4 +1,4 @@
-/** Строки интерфейса ru/en: единственный словарь подписей.
+﻿/** Строки интерфейса ru/en: единственный словарь подписей.
  *  Ключи типизированы, en падает в ru при пропуске — дырок в UI не бывает. */
 export const STR = {
     ru: {
@@ -371,8 +371,8 @@ export const STR = {
       notifVolumeTitle: 'Общая громкость',
       notifActionOff: 'Выключено',
       notifActionSound: 'Звук',
-      notifActionToast: 'Всплывашка',
-      notifActionBoth: 'Звук и всплывашка',
+      notifActionToast: 'Уведомление Windows',
+      notifActionBoth: 'Звук и уведомление Windows',
       notifTest: 'Проверить',
       notifSaved: 'Сохранено',
       notifLoadFailed: 'Загрузка не удалась: {msg}',
@@ -382,7 +382,7 @@ export const STR = {
       notifTestPlayed: 'Звук «{name}» проигран, громкость {v}%',
       notifTestNoDevice: 'Звук не проигран: аудиоустройство недоступно',
       notifTestNoSound: 'Звук не проигран: не удалось декодировать',
-      notifTestToast: 'Всплывашка показана',
+      notifTestToast: 'Уведомление показано в центре Windows',
       triggerTurnComplete: 'Ход завершён',
       triggerTurnError: 'Ошибка хода',
       triggerApproval: 'Нужно подтверждение',
@@ -815,8 +815,8 @@ export const STR = {
       notifVolumeTitle: 'Master volume',
       notifActionOff: 'Off',
       notifActionSound: 'Sound',
-      notifActionToast: 'Toast',
-      notifActionBoth: 'Sound + Toast',
+      notifActionToast: 'Windows notification',
+      notifActionBoth: 'Sound + Windows notification',
       notifTest: 'Test',
       notifSaved: 'Saved',
       notifLoadFailed: 'Load failed: {msg}',
@@ -826,7 +826,7 @@ export const STR = {
       notifTestPlayed: 'Played "{name}" at {v}%',
       notifTestNoDevice: 'Not played: no audio device',
       notifTestNoSound: 'Not played: sound failed to decode',
-      notifTestToast: 'Toast shown',
+      notifTestToast: 'Notification shown',
       triggerTurnComplete: 'Turn complete',
       triggerTurnError: 'Turn error',
       triggerApproval: 'Approval required',

@@ -177,7 +177,12 @@ function doLoad(params) {
   return { plugins: list, errors: lastErrors, dir };
 }
 
-function doCall(params) {
+/* Ревизия 85, из зондажа «пацаны»: handler в JS по умолчанию пишут async —
+прежде Promise от runInContext проходил как «объект» и сериализовался
+в "{}": плагин «работал», результат молча проглывался. Теперь thenable
+дожидается с тем же дедлайном; таймаут async-части — честная ошибка.
+Вызов стал асинхронным: ответ уходит по завершении, родитель ждёт по id. */
+async function doCall(params) {
   const name = String((params && params.name) || '');
   const p = plugins.get(name);
   if (!p) return { ok: false, output: 'нет плагина: ' + name };
@@ -192,20 +197,35 @@ function doCall(params) {
   p.ctx.__swagcod_args = params && params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
   p.ctx.__swagcod_prefs = prefsApi();
   const withLogs = (text) => (logs.length ? text + '\n[log]\n' + logs.join('\n') : text);
-  try {
-    const out = vm.runInContext('globalThis.__swagcod_handler(__swagcod_args, { prefs: __swagcod_prefs })', p.ctx, {
-      timeout: timeoutMs,
-      filename: p.name,
-    });
+  const finalize = (out) => {
     if (out && typeof out === 'object') {
       const ok = out.ok !== false;
       const text = out.output != null ? String(out.output) : JSON.stringify(out);
       return { ok, output: withLogs(text) };
     }
     return { ok: true, output: withLogs(out == null ? '' : String(out)) };
+  };
+  try {
+    const out = vm.runInContext('globalThis.__swagcod_handler(__swagcod_args, { prefs: __swagcod_prefs })', p.ctx, {
+      timeout: timeoutMs,
+      filename: p.name,
+    });
+    if (out && typeof out.then === 'function') {
+      const timed = { timed: true };
+      const timeoutPromise = new Promise((resolve) => {
+        const t = setTimeout(() => resolve(timed), timeoutMs);
+        if (typeof t.unref === 'function') t.unref();
+      });
+      const raced = await Promise.race([out, timeoutPromise]);
+      if (raced === timed) {
+        throw new Error('async-плагин не ответил в дедлайн (' + timeoutMs + ' мс)');
+      }
+      return finalize(raced);
+    }
+    return finalize(out);
   } catch (e) {
     const msg = String((e && e.message) || e);
-    const friendly = msg.includes('timed out')
+    const friendly = msg.includes('timed out') || msg.includes('дедлайн')
       ? 'плагин не ответил в дедлайн (' + timeoutMs + ' мс)'
       : 'плагин: ' + msg;
     return { ok: false, output: withLogs(friendly) };
@@ -238,8 +258,15 @@ rl.on('line', (line) => {
         };
         break;
       case 'call':
-        result = doCall(m.params || {});
-        break;
+        /* Ревизия 85: call — единственный асинхронный метод (async-хендлеры
+        плагинов дожидаются микротасками). Ответ уходит по завершении;
+        общий send в хвосте switch для call пропускается. */
+        doCall(m.params || {})
+          .then((r) => send({ jsonrpc: '2.0', id: m.id, result: r }))
+          .catch((e) =>
+            send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: String((e && e.message) || e) } })
+          );
+        return;
       case 'shutdown':
         result = { bye: true };
         send({ jsonrpc: '2.0', id: m.id, result });

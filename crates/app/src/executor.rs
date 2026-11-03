@@ -348,15 +348,38 @@ pub(crate) async fn execute_tool(
                 .get("context")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(2) as usize;
-            match swagcod_fsx::tools::grep_files(cwd, sub.as_deref(), &pattern, context) {
-                Ok(hits) if hits.is_empty() => ToolOutcome {
-                    ok: true,
-                    output: "совпадений нет".into(),
-                },
-                Ok(hits) => ToolOutcome {
-                    ok: true,
-                    output: swagcod_fsx::tools::format_hits(&hits),
-                },
+            /* Ревизия 85, из зондажа «пацаны»: молчаливый пропуск больших
+            файлов и тихая обрезка на 300 хитах — та же ложь, что потерянный
+            результат. Пометки честные: что пропущено, где обрезано. */
+            match swagcod_fsx::tools::grep_files_detailed(cwd, sub.as_deref(), &pattern, context) {
+                Ok(report) if report.hits.is_empty() => {
+                    let mut output = String::from("совпадений нет");
+                    if !report.skipped_large.is_empty() {
+                        let names = report.skipped_large.join(", ");
+                        output.push_str(&format!(
+                            "; не прочитаны файлы больше 4 МБ (совпадения в них \
+                             могли быть пропущены): {names}"
+                        ));
+                    }
+                    ToolOutcome { ok: true, output }
+                }
+                Ok(report) => {
+                    let mut output = swagcod_fsx::tools::format_hits(&report.hits);
+                    if report.truncated {
+                        output.push_str(&format!(
+                            "\n(показаны первые {} совпадений — в дереве есть ещё, \
+                             уточните путь или паттерн)",
+                            swagcod_fsx::tools::MAX_GREP_HITS
+                        ));
+                    }
+                    if !report.skipped_large.is_empty() {
+                        output.push_str(&format!(
+                            "\n(не прочитаны файлы больше 4 МБ: {})",
+                            report.skipped_large.join(", ")
+                        ));
+                    }
+                    ToolOutcome { ok: true, output }
+                }
                 Err(e) => fail(format!("grep: {e}")),
             }
         }
@@ -374,10 +397,16 @@ pub(crate) async fn execute_tool(
                     ok: true,
                     output: "совпадений нет".into(),
                 },
-                Ok(files) => ToolOutcome {
-                    ok: true,
-                    output: files.join("\n"),
-                },
+                Ok(files) => {
+                    let mut output = files.join("\n");
+                    if files.len() >= swagcod_fsx::tools::MAX_GLOB_RESULTS {
+                        output.push_str(&format!(
+                            "\n(показаны первые {} путей — в дереве есть ещё)",
+                            swagcod_fsx::tools::MAX_GLOB_RESULTS
+                        ));
+                    }
+                    ToolOutcome { ok: true, output }
+                }
                 Err(e) => fail(format!("glob: {e}")),
             }
         }

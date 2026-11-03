@@ -54,6 +54,9 @@ rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis
 
 # B-7: DPAPI (CryptProtectData) — ключ провайдера опционально хранится
 # зашифрованным под учётной записью Windows. Только на Windows.
+# Ревизия 85: windows (WinRT-проекции) — тосты Action Center через
+# ToastNotificationManager; windows-sys остаётся для Win32 (DPAPI, реестр
+# AUMID). Обе зависимости нужны одновременно: у них разные области.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -62,6 +65,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
+    "Win32_System_Registry",
+] }
+windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_System_WinRT",
 ] }
 
 [dev-dependencies]

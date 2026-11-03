@@ -70,6 +70,10 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         let mut triggers = HashMap::new();
+        // Ревизия 85: дефолты — тосты Action Center со живыми текстами
+        // (прежде TurnComplete был только звук, тост вылезал модальным
+        // окном MessageBox — см. show_toast). Звук тоста отключён
+        // системный: rodio-звук действия остаётся единственным звуком.
         triggers.insert(
             NotifyTrigger::ApprovalRequired,
             NotifyAction::Both {
@@ -77,17 +81,19 @@ impl Default for NotificationConfig {
                     name: "chime".into(),
                 },
                 volume: 0.8,
-                title: "SwagCod".into(),
-                body: "Требуется подтверждение".into(),
+                title: "SwagCod — вопрос".into(),
+                body: "Нейронка ждёт подтверждения".into(),
             },
         );
         triggers.insert(
             NotifyTrigger::TurnComplete,
-            NotifyAction::Sound {
+            NotifyAction::Both {
                 source: SoundSource::Builtin {
                     name: "done".into(),
                 },
                 volume: 0.5,
+                title: "SwagCod — готово".into(),
+                body: "Нейронка сделала: ход завершён".into(),
             },
         );
         triggers.insert(
@@ -97,7 +103,7 @@ impl Default for NotificationConfig {
                     name: "error".into(),
                 },
                 volume: 0.7,
-                title: "SwagCod".into(),
+                title: "SwagCod — ошибка".into(),
                 body: "Ход завершился с ошибкой".into(),
             },
         );
@@ -477,45 +483,129 @@ fn decode_file(path: &std::path::Path) -> Option<DecodedSound> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows Toast
+// Windows Toast (Action Center, ревизия 85)
 // ---------------------------------------------------------------------------
 
-/// Показать системное уведомление.
-///
-/// На Windows: balloon notification через Shell_NotifyIconW (tray icon).
-/// Если tray не инициализирован — fallback на MessageBoxW в отдельном потоке.
-/// На других платформах: no-op (можно добавить libnotify позже).
+/// AppUserModelId приложения — под ним тосты живут в Action Center.
+/// Регистрируется в HKCU с DisplayName, чтобы центр показывал «SwagCod»
+/// вместо голого идентификатора.
 #[cfg(windows)]
-fn show_toast(title: &str, body: &str) {
+const AUMID: &str = "SwagCod.App";
+
+/// XML тоста для Action Center: ToastGeneric (крупный заголовок + текст),
+/// звук виндов отключён — звуком управляет действие конфига (rodio), тост
+/// не должен дублировать его системным диньгом.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn build_toast_xml(title: &str, body: &str) -> String {
+    format!(
+        "<toast duration=\"short\"><visual><binding template=\"ToastGeneric\">\
+<text>{}</text><text>{}</text>\
+</binding></visual><audio silent=\"true\"/></toast>",
+        escape_xml(title),
+        escape_xml(body)
+    )
+}
+
+/// Зарегистрировать AUMID в HKCU (один раз за процесс): без записи
+/// DisplayName тост на Win10/11 может не показаться или выйти безымянным.
+#[cfg(windows)]
+fn register_aumid() {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
 
-    fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(Some(0)).collect()
-    }
-
-    let title_w = to_wide(title);
-    let body_w = to_wide(body);
-
-    // MessageBoxW в отдельном потоке: не блокирует async runtime.
-    // MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL.
-    std::thread::spawn(move || unsafe {
-        MessageBoxW(
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        fn to_wide(s: &str) -> Vec<u16> {
+            OsStr::new(s).encode_wide().chain(Some(0)).collect()
+        }
+        let subkey = to_wide("Software\\Classes\\AppUserModelId\\SwagCod.App");
+        let mut hkey = std::ptr::null_mut();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
             std::ptr::null_mut(),
-            body_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut hkey,
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return; // без регистрации тост всё равно пробуем показать
+        }
+        let display = to_wide("SwagCod");
+        let _ = RegSetValueExW(
+            hkey,
+            to_wide("DisplayName").as_ptr(),
+            0,
+            REG_SZ,
+            display.as_ptr().cast(),
+            (display.len() * 2) as u32,
         );
+        RegCloseKey(hkey);
+    });
+}
+
+/// Показать системное уведомление в Action Center (тост сбоку экрана).
+///
+/// Ревизия 85: прежний путь — MessageBoxW с MB_SYSTEMMODAL — вылезал
+/// модальным окном поверх всего и блокировал внимание; теперь нативный
+/// WinRT-тост: тихий, сворачивается в центр, не крадёт фокус.
+/// Ошибки (headless-сессия, отсутствие shell) — в stderr, процесс жив.
+#[cfg(windows)]
+fn show_toast(title: &str, body: &str) {
+    let xml = build_toast_xml(title, body);
+    std::thread::spawn(move || unsafe {
+        // WinRT из этого потока: тост можно отправлять из MTA.
+        let _ = windows::Win32::System::WinRT::RoInitialize(
+            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+        );
+        register_aumid();
+        use windows::core::HSTRING;
+        use windows::Data::Xml::Dom::XmlDocument;
+        use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+        let doc = match XmlDocument::new().and_then(|d| {
+            d.LoadXml(&HSTRING::from(&xml))?;
+            Ok(d)
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("swagcod: toast XML не собрался: {e}");
+                return;
+            }
+        };
+        let toast = match ToastNotification::CreateToastNotification(&doc) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("swagcod: тост не создан: {e}");
+                return;
+            }
+        };
+        let notifier =
+            match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("swagcod: notifer недоступен (headless?): {e}");
+                    return;
+                }
+            };
+        if let Err(e) = notifier.Show(&toast) {
+            eprintln!("swagcod: тост не показан: {e}");
+        }
     });
 }
 
 #[cfg(not(windows))]
 fn show_toast(_title: &str, _body: &str) {
-    // На не-Windows платформах toast недоступен.
+    // На не-Windows платформах тост недоступен.
 }
 
-#[allow(dead_code)]
+#[cfg_attr(windows, allow(dead_code))]
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -588,6 +678,41 @@ mod tests {
     #[test]
     fn escape_xml_handles_special_chars() {
         assert_eq!(escape_xml("a<b>c&d\"e"), "a&lt;b&gt;c&amp;d&quot;e");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn toast_xml_is_valid_and_silent() {
+        let xml = build_toast_xml("SwagCod — готово", "Нейронка сделала: ход <завершён>");
+        assert!(xml.contains("ToastGeneric"), "шаблон ToastGeneric: {xml}");
+        assert!(
+            xml.contains("<audio silent=\"true\"/>"),
+            "звук тоста отключён — звуком управляет rodio: {xml}"
+        );
+        assert!(xml.contains("&lt;завершён&gt;"), "экранирование XML: {xml}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn default_triggers_are_toasts_with_live_texts() {
+        // Ревизия 85: все три триггера — Both (звук + тост Action Center),
+        // тексты живые, а не «SwagCod / Требуется подтверждение».
+        let cfg = NotificationConfig::default();
+        for (trigger, want) in [
+            (NotifyTrigger::TurnComplete, "Нейронка сделала"),
+            (NotifyTrigger::TurnError, "Ход завершился с ошибкой"),
+            (
+                NotifyTrigger::ApprovalRequired,
+                "Нейронка ждёт подтверждения",
+            ),
+        ] {
+            match cfg.triggers.get(&trigger) {
+                Some(NotifyAction::Both { body, .. }) => {
+                    assert!(body.contains(want), "{trigger:?}: body={body}");
+                }
+                other => panic!("{trigger:?} должен быть Both (звук+тост), а не {other:?}"),
+            }
+        }
     }
 
     use swagcod_core::session::{SessionId, TurnId};
@@ -726,7 +851,8 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_reports_sound_and_effective_percent() {
         /* Громкость отчёта не зависит от машины: она посчитана из конфига,
-        а не измерена после проигрывания. */
+        а не измерена после проигрывания. Ревизия 85: TurnComplete — Both
+        (звук + тост Action Center), дефолт вырос из «только звук». */
         let cfg = NotificationConfig {
             master_volume: 0.8,
             ..Default::default()
@@ -735,7 +861,7 @@ mod tests {
         let report = mgr.test_trigger(NotifyTrigger::TurnComplete).await;
         assert_eq!(report.sound.as_deref(), Some("done"));
         assert_eq!(report.percent, 40.0, "0.5 * 0.8 = 40%");
-        assert!(!report.toast, "у TurnComplete действие - только звук");
+        assert!(report.toast, "ревизия 85: TurnComplete — звук + тост");
     }
 
     #[tokio::test]

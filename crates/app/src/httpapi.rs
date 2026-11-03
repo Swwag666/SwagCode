@@ -38,6 +38,10 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// Content-Length, ловил RST и терял ответ (os error 10053). Вычитываем
 /// остаток с коротким таймаутом — данные в буферах приезжают мгновенно.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Короткий probe дренажа: хвоста не видели, но клиент мог писать
+/// одновременно с телом — вежливо проверяем десятки миллисекунд, не
+/// полсекунды (зондаж «пацаны»: 500 мс EOF-лага на каждый ответ).
+const DRAIN_PROBE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Порт API: env → prefs → None (выключено). 0 не считается портом.
 pub fn configured_port(state: &AppState) -> Option<u16> {
@@ -238,10 +242,15 @@ pub async fn serve_on(listener: TcpListener, state: Arc<AppState>, token: String
             let mut sock = sock;
             if let Some(resp) = serve_conn(&mut sock, &st, &tk).await {
                 let _ = sock.write_all(&resp).await;
-                /* Ревизия 84, из протыкания (F1/F2): клиент может писать
-                тело сверх заявленного Content-Length — закрытие с данными
-                в буфере отдаёт RST, и ответ теряется (клиент видит os
-                error 10053 и ни одного байта). Досасываем хвост. */
+                /* Ревизия 84 (F1/F2): клиент может писать тело сверх
+                заявленного Content-Length — закрытие с данными в буфере
+                отдаёт RST, и ответ теряется (клиент видит os error 10053).
+                Досасываем хвост. Ревизия 85, из зондажа: слепые 500 мс на
+                КАЖДОМ ответе — налог +500 мс на EOF для клиента,
+                дочитывающего до конца. Probe: хвост в полёте (данные
+                в буфере/приедут за десятки мс) — ждём до потолка; пусто —
+                закрываем сразу. Хвост пишется до прочтения ответа, так
+                что probe видит его; позднее 50 мс пишет не HTTP-клиент. */
                 drain_after_response(&mut sock).await;
             }
             let _ = sock.shutdown().await;
@@ -249,10 +258,14 @@ pub async fn serve_on(listener: TcpListener, state: Arc<AppState>, token: String
     }
 }
 
-/// Вычитать из сокета всё, что уже приехало (или приедет в ближайшие
-/// полсекунды): пустой recv-буфер → чистый FIN вместо RST.
+/// Вычистить хвост запроса: пустой recv-буфер → чистый FIN вместо RST.
 async fn drain_after_response(sock: &mut TcpStream) {
     let mut tmp = [0u8; 8192];
+    match tokio::time::timeout(DRAIN_PROBE, sock.read(&mut tmp)).await {
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return, // хвоста нет — закрываем
+        Ok(Ok(_)) => { /* хвост начался — дожидаемся до потолка */
+        }
+    }
     let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());

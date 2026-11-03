@@ -36,6 +36,19 @@ pub struct GrepHit {
     pub context_after: Vec<String>,
 }
 
+/// Полный отчёт grep (ревизия 85, из зондажа «пацаны»): молчаливые
+/// пропуски и обрезки — та же ложь, что и потерянный результат.
+#[derive(Debug, Clone, Default)]
+pub struct GrepReport {
+    pub hits: Vec<GrepHit>,
+    /// Файлы больше [`MAX_GREP_FILE_BYTES`], не прочитанные вовсе: раньше
+    /// «совпадений нет» выглядело как исчерпанный поиск, хотя файл с
+    /// совпадением молча пропускался.
+    pub skipped_large: Vec<String>,
+    /// Поиск прерван на [`MAX_GREP_HITS`] — в дереве есть ещё совпадения.
+    pub truncated: bool,
+}
+
 /// Regex-поиск по файлам root (опционально в поддереве `sub`).
 ///
 /// Обход уважает .gitignore; бинарные файлы (NUL-байт в первых 8 КБ)
@@ -46,6 +59,16 @@ pub fn grep_files(
     pattern: &str,
     context_lines: usize,
 ) -> Result<Vec<GrepHit>, FsxError> {
+    Ok(grep_files_detailed(root, sub, pattern, context_lines)?.hits)
+}
+
+/// Тот же поиск, но с честной метой: что пропущено и где обрезано.
+pub fn grep_files_detailed(
+    root: &Path,
+    sub: Option<&str>,
+    pattern: &str,
+    context_lines: usize,
+) -> Result<GrepReport, FsxError> {
     let re = regex::Regex::new(pattern)
         .map_err(|e| FsxError::Other(format!("некорректный regex: {e}")))?;
     let scan_root = match sub {
@@ -57,6 +80,7 @@ pub fn grep_files(
     }
     let context_lines = context_lines.min(10);
     let mut hits = Vec::new();
+    let mut skipped_large = Vec::new();
     let walker = ignore::WalkBuilder::new(&scan_root)
         .hidden(false)
         .git_ignore(true)
@@ -79,11 +103,17 @@ pub fn grep_files(
         }) {
             continue;
         }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
         if entry
             .metadata()
             .map(|m| m.len() > MAX_GREP_FILE_BYTES)
             .unwrap_or(true)
         {
+            skipped_large.push(rel);
             continue;
         }
         let bytes = match std::fs::read(path) {
@@ -93,12 +123,11 @@ pub fn grep_files(
         if bytes.iter().take(8192).any(|&b| b == 0) {
             continue; // бинарник
         }
-        let content = String::from_utf8_lossy(&bytes);
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // Ревизия 85: BOM съедается до разбора строк — иначе \u{FEFF}
+        // прилипает к первой строке и ломает ^-анкоры: read-тулз BOM
+        // убирает, и модель не видела причину пропажи строки.
+        let cow = String::from_utf8_lossy(&bytes);
+        let content: &str = cow.strip_prefix('\u{feff}').unwrap_or(&cow);
         let lines: Vec<&str> = content.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             if !re.is_match(line) {
@@ -118,7 +147,12 @@ pub fn grep_files(
             }
         }
     }
-    Ok(hits)
+    let truncated = hits.len() >= MAX_GREP_HITS;
+    Ok(GrepReport {
+        hits,
+        skipped_large,
+        truncated,
+    })
 }
 
 /// Человекочитаемый (и моделечитаемый) вывод grep: `путь:строка:текст`
@@ -190,17 +224,22 @@ pub fn glob_files(root: &Path, sub: Option<&str>, pattern: &str) -> Result<Vec<S
         .filter(|s| !s.is_empty());
     let mut out = Vec::new();
     for f in &idx.files {
+        // Ревизия 85, из зондажа: якорный паттерн матчится и против пути
+        // от root ("src/main.rs" — как в выдаче), и против пути от
+        // scan-root ("main.rs"): раньше glob(path="src", pattern="src/*.rs")
+        // возвращал пустоту при живых файлах — модель копировала паттерн
+        // из своей же выдачи и ломалась об смену базы.
+        let full = match &prefix {
+            Some(p) => format!("{p}/{f}"),
+            None => f.clone(),
+        };
         let hit = if bare {
             let base = f.rsplit('/').next().unwrap_or(f);
             matcher.is_match(f.as_str()) || matcher.is_match(base)
         } else {
-            matcher.is_match(f.as_str())
+            matcher.is_match(f.as_str()) || matcher.is_match(full.as_str())
         };
         if hit {
-            let full = match &prefix {
-                Some(p) => format!("{p}/{f}"),
-                None => f.clone(),
-            };
             out.push(full);
             if out.len() >= MAX_GLOB_RESULTS {
                 break;
@@ -276,7 +315,22 @@ pub fn patch_text(
             // или терял завершение файла.
             let last = content_lines[start + n - 1];
             let tail = &last[last.find(['\r', '\n']).unwrap_or(last.len())..];
-            let replacement = format!("{new}{tail}");
+            // Ревизия 85, из зондажа: вставка наследует конец строк файла.
+            // Прежде new с LF-концами вставлялся в CRLF-файл как есть —
+            // внутри одного файла появлялись смешанные концы строк, и
+            // git diff шумел ^M на нетронутых строках.
+            let eol = if tail.starts_with("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let new_canon = new.replace("\r\n", "\n");
+            let new_inherit = if eol == "\r\n" {
+                new_canon.replace('\n', "\r\n")
+            } else {
+                new_canon
+            };
+            let replacement = format!("{new_inherit}{tail}");
             out.push(&replacement);
             out.extend_from_slice(&content_lines[start + n..]);
             // Куски уже с концами строк — склейка без разделителя.

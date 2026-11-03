@@ -172,11 +172,30 @@ impl PtyManager {
         let (tx, rx): (SyncSender<PtyMsg>, Receiver<PtyMsg>) = sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_thread = dropped.clone();
+        /* Ревизия 85, из зондажа «пацаны»: Exit раньше ждал EOF мастера, а
+        ConPTY после естественного выхода shell EOF не отдаёт — код выхода
+        некому было отправлять, и UI не узнавало о завершении терминала
+        (поток-читатель жил вечно). Теперь ребёнка ждёт отдельный поток:
+        смерть процесса → пауза на дренаж хвоста → Exit. Читатель занят
+        только выводом и молчит про выход. */
+        let dropped_waiter = dropped.clone();
+        let tx_waiter = tx.clone();
+        std::thread::Builder::new()
+            .name(format!("pty-wait-{id}"))
+            .spawn(move || {
+                let mut child = child;
+                let code = child.wait().map(|s| s.exit_code()).unwrap_or(1);
+                // Дать читателю допечать хвост: финальные байты ConPTY
+                // приезжают после смерти клиента, но до нашего Exit.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if tx_waiter.try_send(PtyMsg::Exit(code)).is_err() {
+                    dropped_waiter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| PtyError::Other(e.to_string()))?;
         std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
             .spawn(move || {
-                // Ребёнок живёт здесь же: поток читает вывод и сам ждёт выход.
-                let mut child = child;
                 let mut buf = vec![0u8; READ_CHUNK];
                 let mut batch: Vec<u8> = Vec::with_capacity(BATCH_BYTES);
                 let send = |msg: PtyMsg,
@@ -213,8 +232,7 @@ impl PtyManager {
                 if !batch.is_empty() {
                     send(PtyMsg::Output(batch), &tx, &dropped_thread);
                 }
-                let code = child.wait().map(|s| s.exit_code()).unwrap_or(1);
-                let _ = tx.send(PtyMsg::Exit(code));
+                // Exit шлёт pty-wait-поток: код выхода известен только ему.
             })
             .map_err(|e| PtyError::Other(e.to_string()))?;
 

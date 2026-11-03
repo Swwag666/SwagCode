@@ -275,6 +275,28 @@ pub fn restore_in(root: &Path, cwd: &Path, id: &str) -> Result<RestoreReport, Fs
             cwd.display()
         )));
     }
+    /* Ревизия 85, из зондажа «пацаны»: meta.json снимка честно писал
+    truncated=true, но restore его не читал. Снимок, урезанный при
+    создании (файлы > 2 МБ, потолок объёма/числа файлов), НЕ содержит
+    всего дерева — тихий откат по нему оставлял крупные файлы
+    патченными, а отчёт называл их «новыми». Неполный откат — не
+    откат: отказ с точным перечнем, решение за вызывающим. */
+    if let Ok(bytes) = std::fs::read(root.join(body).join("meta.json")) {
+        if let Ok(meta) = serde_json::from_slice::<ShadowMeta>(&bytes) {
+            if meta.truncated {
+                return Err(FsxError::Other(format!(
+                    "откат: снимок {id} урезан при создании ({} файлов, {} байт): \
+                     крупные файлы не попали в снимок — их текущее состояние \
+                     НЕ вернётся; лимиты: файл {} МБ, всего {} МБ, {} файлов",
+                    meta.files,
+                    meta.bytes,
+                    SHADOW_MAX_FILE_BYTES / (1024 * 1024),
+                    SHADOW_MAX_TOTAL_BYTES / (1024 * 1024),
+                    SHADOW_MAX_FILES
+                )));
+            }
+        }
+    }
 
     let mut restored: Vec<String> = Vec::new();
     for entry in walkdir::WalkDir::new(&tree)
