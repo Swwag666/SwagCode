@@ -19,6 +19,7 @@
   import ApprovalDialog from './components/ApprovalDialog.svelte'
   import RevertDialog from './components/RevertDialog.svelte'
   import Palette from './components/Palette.svelte'
+  import NightRun from './components/NightRun.svelte'
   /* F-10: окно настроек — компонент; общие с ним типы объявлены там и
      импортируются сюда (приём MemoryTab/Icon), чтобы не дублировать их. */
   import SettingsTabs, {
@@ -40,6 +41,7 @@
   /* F-10: полнотекстовый поиск по истории. Панель — components/HistorySearch.svelte,
      разбор сниппета — lib/search.ts; здесь только состояние и вызов команды. */
   import HistorySearch, { type MessageHitDto } from './components/HistorySearch.svelte'
+  import { hitAnchor } from './lib/search'
   /* Анимированный глаз логотипа: пользовательский gif, чёрный фон вырезается
      blend-mode screen (см. .eye img). */
   import { Transcript as TranscriptModel, type TranscriptItem } from './lib/transcript'
@@ -129,6 +131,20 @@
   function t(key: StrKey): string {
     return translate(uiLang, key)
   }
+
+  /* UX-04-014 (ревизия 86): метки строк транскрипта локализуются тем же
+     словарём: раньше Transcript держал русский остров в английском
+     интерфейсе. */
+  const transcriptLabels = $derived<Record<string, string>>({
+    user: t('labelUser'),
+    assistant: t('labelAgent'),
+    reasoning: t('labelThinking'),
+    tool_call: t('labelCall'),
+    tool_result: t('labelResult'),
+    approval: t('labelApproval'),
+    error: t('labelError'),
+    status: t('labelStatus'),
+  })
 
 
   function describeModel(id: string): ModelSpec {
@@ -313,11 +329,72 @@
   let eventsTotal = $state(0)
   let batchesTotal = $state(0)
   let turnsCount = $state(0)
+
+  /** UX-01-008 (ревизия 86): счётчик ходов шапки пересчитывается из
+      session_meta ядра (истина), а не копится с момента старта приложения:
+      раньше после переключения на живую сессию шапка продолжала считать
+      ходы прошлого чата. */
+  async function refreshTurnsCount(id: string): Promise<void> {
+    if (!id) return
+    try {
+      const list = await invoke<{ id: string; turns?: number }[]>('list_sessions')
+      const found = list.find((s) => s.id === id)
+      turnsCount = found?.turns ?? 0
+    } catch {
+      /* список недоступен: счётчик остаётся прежним, не нулём */
+    }
+  }
+
+  /* UX-02-002 (ревизия 86): запуск и стоп ночного прогона — тонкие обёртки
+     над IPC; вся логика лимитов и отчёта в ядре. Отчёт дублируется строкой
+     в чат сессии (Status-событие уже это делает из ядра) и тостом. */
+  async function runNight(objective: string, maxRounds: number, budgetUsd: number): Promise<string> {
+    if (!currentSession) throw new Error('нет активной сессии')
+    return await invoke<string>('night_run', {
+      sessionId: currentSession,
+      objective,
+      maxRounds,
+      budgetUsd,
+    })
+  }
+
+  async function stopNight(): Promise<void> {
+    if (!currentSession) return
+    try {
+      await invoke('stop_turn', { sessionId: currentSession })
+    } catch (err) {
+      console.warn('stop_turn failed', err)
+    }
+  }
+
   /** turn -> session: события стрима не несут session, несёт только turn_started. */
   const turnSession = new Map<string, string>()
   /** E-6: дочерние ходы суб-агентов — их turn_ended не трогает статус сессии. */
   const subTurns = new Set<string>()
   let sessionRefreshTick = $state(0)
+  /* UX-01-009 (ревизия 86): человекочитаемые названия сессий для шапки.
+     Раньше заголовок всегда был «сессия s-a1b2c3» — идентификатор вместо
+     имени, при чём обрезанный. Обновляется при рестарте, переименовании,
+     авто-заголовке первого хода и удалении (все через sessionRefreshTick). */
+  let sessionTitles = $state<Record<string, string>>({})
+  $effect(() => {
+    sessionRefreshTick
+    void (async () => {
+      try {
+        const list = await invoke<{ id: string; title: string }[]>('list_sessions')
+        const next: Record<string, string> = {}
+        for (const s of list) next[s.id] = s.title
+        sessionTitles = next
+      } catch { /* ядро недоступно: остаётся прежняя карта */ }
+    })()
+  })
+
+  /** Название для шапки: до 48 символов, с cwd-фолбэком. */
+  function sessionTitleOf(id: string): string {
+    const raw = sessionTitles[id] || sessionCwds[id] || `сессия ${id.slice(0, 8)}`
+    const flat = raw.replace(/\s+/g, ' ').trim()
+    return flat.length > 48 ? flat.slice(0, 48) + '…' : flat
+  }
 
   function transcriptFor(sessionId: string): TranscriptModel {
     let tr = transcriptsBySession.get(sessionId)
@@ -338,6 +415,12 @@
     const turn = k.data?.turn
     if (turn && turnSession.has(turn)) return turnSession.get(turn) ?? null
     if (k.kind === 'error') return currentSession
+    /* UX-04-003 (ревизия 86): статусы ядра (ретрай шлюза «повтор 1/2»,
+       смена модели алиасом, авто-коммит, утренний отчёт ночи) — события
+       без turn/session. Раньше они выкидывались здесь молча: при обрыве
+       шлюза пользователь минуту смотрел на «думает», не зная про ретраи.
+       Статус — диагностический канал, его место — активный чат. */
+    if (k.kind === 'status') return currentSession
     return null
   }
 
@@ -350,11 +433,18 @@
     items = transcript.items
     revision++
     scrollNonce++
-    /* Последняя область следует за пользователем: переключился в сессию
-       проекта — «+» и авто-создание пойдут в ту же папку. */
-    const cwd = sessionCwds[id]
-    if (cwd) rememberCwd(cwd)
+    /* UX-02-005: у этой сессии мог висеть фоновый вопрос подтверждения —
+       переключение к ней открывает его диалог. */
+    approvalReq = pendingApprovals.get(id) ?? null
     void loadSessionHistory(id)
+    /* UX-01-008 (ревизия 86): счётчик ходов в шапке пересчитывается при
+       каждом переключении, а не живёт с момента старта. */
+    void refreshTurnsCount(id)
+    /* UX-01-004 (ревизия 86): рестарт возвращает пользователя туда, где он
+       был: последняя открытая сессия пишется в localStorage. */
+    try {
+      localStorage.setItem('swagcod-last-session', id)
+    } catch { /* приватный режим — переживём */ }
   }
 
   async function loadSessionHistory(id: string): Promise<void> {
@@ -445,8 +535,14 @@
       if (models.length > 0 && !models.includes(modelName)) {
         modelName = models[0]
       }
-    } catch {
-      // Не критично
+    } catch (err) {
+      /* UX-04-011 (ревизия 86): провал загрузки моделей больше не молчит.
+         Пока список пуст — предупреждение уходит в панель провайдеров
+         (рядом та же кнопка, что и в пиках моделей); при уже живом
+         списке тихо — не сбивать работу из-за неответа на /models. */
+      if (models.length === 0) {
+        provNote = `${t('noModels')}: ${err}`
+      }
     }
   }
 
@@ -529,6 +625,24 @@
       await loadProviders()
       await reloadModels()
       provNote = t('provDeleted')
+    } catch (err) {
+      provNote = `${t('provFailed')}: ${err}`
+    } finally {
+      provBusy = false
+    }
+  }
+
+  /** UX-05-002 (ревизия 86): ключ забывается из DPAPI-карты, провайдер
+      остаётся в списке с «нужен ключ». Замена — то же поле, но с новым
+      значением и кнопкой fetch/save. */
+  async function forgetProviderKey(id: string): Promise<void> {
+    provBusy = true
+    try {
+      const existed = await invoke<boolean>('forget_provider_key', { id })
+      provNote = existed ? 'ключ забыт — провайдер остался, ход будет просить новый ключ' : 'у этого провайдера и так нет ключа'
+      delete provKeys[id]
+      await loadProviders()
+      await reloadModels()
     } catch (err) {
       provNote = `${t('provFailed')}: ${err}`
     } finally {
@@ -655,10 +769,16 @@
      Решение принимает человек здесь, но исполняет его ядро — не UI. */
   let approvalReq = $state<{ call_id: string; tool: string; summary: string; preview?: string } | null>(null)
 
+  /* UX-02-005 (ревизия 86): висячие подтверждения фоновых сессий: каждая
+     сессия держит свой запрос, диалог открывается только при переключении
+     в неё — чужой ход больше не замораживает активный чат. */
+  const pendingApprovals = new Map<string, { call_id: string; tool: string; summary: string; preview?: string }>()
+
   async function respondApproval(decision: 'approved' | 'denied'): Promise<void> {
     if (!approvalReq) return
     const callId = approvalReq.call_id
     approvalReq = null
+    if (currentSession) pendingApprovals.delete(currentSession)
     try {
       await invoke('respond_approval', { callId, decision })
     } catch {
@@ -1013,6 +1133,14 @@
         turnId: target.turnId,
       })
       flashStatus(t('revertDone').replace('{msg}', msg))
+      /* UX-03-002 (ревизия 86): откат виден в самом чате, не только в
+         всплывающей строке: строка-статус объясняет расхождение «журнал
+         помнит ходы, диск их больше не содержит». */
+      transcriptFor(currentSession).addStatus(
+        `откат к ходу ${target.turnId.slice(0, 8)}: ${msg}. Ходы после точки отката остались в журнале как история, но их правок на диске больше нет.`
+      )
+      items = transcriptFor(currentSession).items
+      revision++
       revertTarget = null
     } catch (e) {
       // Отказ ядра (ход идёт, снимка нет, git сломался) — человеку текстом.
@@ -1053,6 +1181,28 @@
   const memoryDir = $derived(memoryDirId ?? (memoryCwd || null))
 
   const memorySession = $derived(memorySessionId ?? currentSession)
+
+  /* UX-03-006 (ревизия 86): блокнот проекта .swagcod/MEMORY.md — то, что
+     агент подкладывает в промпт каждого хода. Читается из песочницы
+     активной сессии, обновляется по file_changed (memory_add пишет его).
+     Тика нет — обновление лениво, только пока вкладка открыта. */
+  let memoryProject = $state<string | null>(null)
+  let memoryProjectTick = $state(0)
+  $effect(() => {
+    void memoryProjectTick
+    const sid = currentSession
+    const tab = settingsTab
+    const open = showSettings
+    if (!sid || !open || tab !== 'memory') return
+    void (async () => {
+      try {
+        memoryProject = await invoke<string>('read_file', { sessionId: sid, path: '.swagcod/MEMORY.md' })
+      } catch {
+        /* файла нет — честная пустота, не ошибка */
+        memoryProject = null
+      }
+    })()
+  })
 
   /* Владелец строки обязан соответствовать области, и проверяет это ядро
      (`memory_check_owner`), а не фронтенд: global с подставленным sessionId
@@ -1295,7 +1445,6 @@
       const sel = await openDialog({ directory: true, multiple: false, title: t('browse') })
       const path = typeof sel === 'string' ? sel : ''
       if (!path) return
-      rememberCwd(path)
       await createNewSession(path)
       showWorkspaces = false
     } catch (err) {
@@ -1330,6 +1479,7 @@
     if (!q) {
       historyHits = []
       historyError = ''
+      historySuggest = null
       historyBusy = false
       return
     }
@@ -1342,20 +1492,39 @@
       if (gen !== historyGen) return
       historyHits = hits
       historyError = ''
+      updateHistorySuggest(q, hits.length)
     } catch (err) {
       if (gen !== historyGen) return
       historyHits = []
       historyError = String(err)
+      historySuggest = null
     } finally {
       if (gen === historyGen) historyBusy = false
     }
   }
 
-  /* Находка открывает свою сессию. К самому сообщению не перематываем: в транскрипции
-     нет якоря по ord, а id из F-9 — на ход, а не на строку базы. */
+  /* Находка открывает свою сессию и перематывает чат к сообщению.
+     UX-01-006 (ревизия 86): раньше находка открывала только сессию —
+     «где-то там внутри» нужное сообщение приходилось искать глазами. */
+  let hitScrollTarget = $state<string | null>(null)
   function openHistoryHit(hit: MessageHitDto): void {
     historyError = ''
+    const anchor = hitAnchor(hit.snippet)
     if (hit.session_id !== currentSession) switchSession(hit.session_id)
+    if (anchor) hitScrollTarget = anchor
+  }
+
+  /* UX-01-012 (ревизия 86): пустая выдача по запросу, похожему на id
+     сессии — не тупик: подсказываем сам чат. FTS ищет по словам и
+     идентификатор не матчит, а человек явно хотел «эту сессию». */
+  let historySuggest = $state<{ id: string; title: string } | null>(null)
+  function updateHistorySuggest(query: string, hitCount: number): void {
+    historySuggest = null
+    const q = query.trim().toLowerCase()
+    if (hitCount > 0 || !/^s-[0-9a-z-]{4,}$/.test(q)) return
+    const ids = Object.keys(sessionTitles)
+    const found = ids.find((id) => id === q) ?? ids.find((id) => id.startsWith(q))
+    if (found) historySuggest = { id: found, title: sessionTitles[found] || found }
   }
 
   let showPalette = $state(false)
@@ -1426,6 +1595,15 @@
 
   $effect(() => {
     localStorage.setItem('swagcod-bookmarks', JSON.stringify([...bookmarks]))
+  })
+
+  /* UX-04-012 (ревизия 86): строки с закладками текущего чата — для меню
+     переходов; пустой список кнопку и не рисует. */
+  let bmMenuOpen = $state(false)
+  const bookmarkedItems = $derived.by(() => {
+    void revision
+    if (bookmarks.size === 0) return []
+    return items.filter((it) => bookmarks.has(it.key) && it.text)
   })
 
   let effectsEnabled = $state(localStorage.getItem('swagcod-fx') !== 'off')
@@ -1565,24 +1743,30 @@
   }
 
   let glitchActive = $state(false)
-  let lastNotifiedTurn = $state<string | null>(null)
-
-  $effect(() => {
-    const lastItem = items[items.length - 1]
-    if (
-      lastItem &&
-      lastItem.kind === 'status' &&
-      lastItem.done &&
-      lastItem.turn &&
-      lastItem.turn !== lastNotifiedTurn &&
-      !document.hasFocus()
-    ) {
-      lastNotifiedTurn = lastItem.turn
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification('SwagCod', { body: 'ход завершён' })
-      }
+  /* UX-05-009 (ревизия 86, решение владельца «только первый запуск»):
+     полноценный сплэш 2.5 с живёт один раз — при первом знакомстве;
+     дальше быстрый 400 мс, чтобы окно не держало человека на заставке
+     при каждом старте. */
+  const firstRun = (() => {
+    try {
+      if (localStorage.getItem('swagcod-seen')) return false
+      localStorage.setItem('swagcod-seen', '1')
+      return true
+    } catch {
+      return false
     }
-  })
+  })()
+  /* UX-04-004: окно подтверждения для Ctrl+L (время первой нажатой). */
+  let clearChatArmedAt = 0
+  /* UX-02-002 (ревизия 86): ночной прогон — экран запуска по кнопке луны.
+     Прогон пишет ходы в активную сессию: счётчик раундов = turnsCount. */
+  let nightOpen = $state(false)
+
+  /* UX-02-007 (ревизия 86): дубль Web Notification убран. Системный канал
+     уведомлений — тосты Action Center из ядра (notifications.rs): они
+     уважают suppress_when_focused, конфиг триггеров и громкость. Вебовое
+     Notification дублировало «ход завершён» поверх системного тоста и не
+     знало ни про фокус-настройку, ни про ночной режим. */
 
   /* Занятость — ПО СЕССИЯМ, а не глобально: раньше один идущий ход держал
      «думает» на весь интерфейс, и реплика из второго чата уезжала в очередь
@@ -1756,6 +1940,30 @@
     }
   }
 
+  /** UX-03-005 (ревизия 86): перечитать открытые вкладки, чьи файлы
+      изменились в ходе. Тихие ошибки — ок: файл могли удалить. */
+  async function refreshOpenFileTabs(changed: string[]): Promise<void> {
+    if (!currentSession || filesTabs.length === 0 || changed.length === 0) return
+    const set = new Set(changed.map((p) => p.replace(/\\/g, '/')))
+    const next: FileTab[] = []
+    let touched = false
+    for (const tb of filesTabs) {
+      const norm = tb.path.replace(/\\/g, '/')
+      if (set.has(norm)) {
+        try {
+          const text = await invoke<string>('read_file', { sessionId: currentSession, path: tb.path })
+          next.push({ ...tb, text })
+          touched = true
+        } catch {
+          next.push(tb)
+        }
+      } else {
+        next.push(tb)
+      }
+    }
+    if (touched) filesTabs = next
+  }
+
   /** Плюс на таб-баре: добавить файл вкладкой через нативный диалог. */
   async function addFileTab(): Promise<void> {
     if (!currentSession) return
@@ -1861,18 +2069,45 @@
   let streamStartTime = $state<number | null>(null)
   let tokensPerSec = $state<number | null>(null)
   let turnTokens = $state(0)
+  /* UX-02-006 (ревизия 86): цена последнего завершённого хода активного
+     чата: null — хода не было или модели нет в таблице цен. */
+  let lastTurnCost = $state<number | null>(null)
+  /** Деньги как в ядре (pricing::format_usd): мелкие — 4 знака. */
+  function usdOf(v: number): string {
+    return v > 0 && v < 0.1 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`
+  }
 
   /* Живые статусы сессий прямо из событий шины: список сессий не ждёт
      опроса ядра, мозг/галочка/треугольник появляются в тот же кадр. */
-  let liveStates = $state<Record<string, 'running' | 'ok' | 'fail'>>({})
+  /* Ревизия 86: 'neutral' — ход остановлен пользователем: ни мозг, ни
+     галочка, ни красный треугольник. Штатный стоп — не ошибка. */
+  let liveStates = $state<Record<string, 'running' | 'ok' | 'fail' | 'neutral'>>({})
 
   /** Нейронка думает именно в открытом сейчас чате. */
   let thinking = $derived(liveStates[currentSession ?? ''] === 'running')
   /* B-8: «подозрительно тихо» — производная от thinking и метки жизни:
      ход идёт, но событий нет дольше порога. quietTick лишь тикает, чтобы
      derived пересчитывался без внешних событий. */
+  /* UX-04-010 (ревизия 86): тишина не объявляется, пока крутится
+     инструмент — долгий npm install это не «тихо», а работа; плашка
+     врала, что ход завис. Смотрим с конца: последний содержательный
+     элемент — вызов без результата, значит инструмент работает
+     (status-строки tool_call_start не в счёт). */
+  const activeToolCall = $derived.by(() => {
+    void revision
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]
+      if (it.kind === 'tool_result' || it.kind === 'user' || it.kind === 'assistant') return false
+      if (it.kind === 'tool_call') return true
+    }
+    return false
+  })
   const turnQuiet = $derived(
-    thinking && lastLiveEventMs > 0 && quietTick >= 0 && Date.now() - lastLiveEventMs > QUIET_MS
+    thinking &&
+      lastLiveEventMs > 0 &&
+      quietTick >= 0 &&
+      Date.now() - lastLiveEventMs > QUIET_MS &&
+      !activeToolCall
   )
   /** Отправка идёт именно в открытый сейчас чат. */
   let sending = $derived(sendingSession !== null && sendingSession === currentSession)
@@ -1921,8 +2156,9 @@
     }
     /* Состояние сбрасываем ВСЕГДА, даже если бэк не нашёл handle: иначе
        liveStates остаётся 'running' навсегда и красный квадрат выглядит
-       мёртвым — клик есть, реакции нет. */
-    liveStates[sid] = 'fail'
+       мёртвым — клик есть, реакции нет. UX-04-002: 'neutral', не 'fail' —
+       пользователь остановил ход сам, ошибка тут ложная. */
+    liveStates[sid] = 'neutral'
     transcriptFor(sid).closeAll()
     items = transcriptFor(sid).items
     revision++
@@ -1954,25 +2190,6 @@
     batchesTotal++
     if (batch.length > 0) seq = batch[batch.length - 1].seq || seq
 
-    const hasContent = batch.some(
-      (e) => e.kind.kind === 'content' || e.kind.kind === 'reasoning'
-    )
-    if (hasContent && streamStartTime === null) {
-      streamStartTime = performance.now()
-      turnTokens = 0
-    }
-    for (const e of batch) {
-      if (e.kind.kind === 'content' || e.kind.kind === 'reasoning') {
-        turnTokens += Math.ceil((e.kind.data.text || '').length / 4)
-      }
-    }
-    const hasEnd = batch.some((e) => e.kind.kind === 'turn_ended')
-    if (hasEnd && streamStartTime !== null) {
-      const elapsed = (performance.now() - streamStartTime) / 1000
-      tokensPerSec = elapsed > 0 ? Math.round(turnTokens / elapsed) : null
-      streamStartTime = null
-    }
-
     // Раскладываем события по сессиям: чужой ход не попадает в активный чат,
     // а дописывается в свою транскрипцию молча.
     let touchedActive = 0
@@ -1986,26 +2203,43 @@
         const d = e.kind.data as { turn: string; session: string; parent?: string }
         turnSession.set(d.turn, d.session)
         /* E-6: ветка суб-агента стартует ВНУТРИ родительского хода:
-           статус сессии не переключаем (иначе «ok» мигнуло бы посреди хода),
+           статус сессии не переключаем (иначе «ok» мигнуло бы посередине хода),
            но карту turn→session регистрируем — стрим ветки routится в чат. */
         if (d.parent) subTurns.add(d.turn)
         else liveStates[d.session] = 'running'
+        /* UX-04-001 (ревизия 86): turn_started = ядро приняло реплику и
+        ход пошёл — держать поле ввода замороженным дальше нет причины.
+        Раньше sendingSession снимался только на turn_ended: всё время
+        хода textarea была disabled, и очередь реплик (чипы ниже поля,
+        README-фича) из своего же чата была недостижима. Комментарий
+        над объявлением обещал «живёт между invoke и turn_started» —
+        теперь это правда: печатать можно сразу, Enter в занятый чат
+        кладёт реплику в очередь этой же сессии. */
+        if (!d.parent && sendingSession === d.session) sendingSession = null
         // B-8: новый ход — часы тишины обнуляются.
         lastLiveEventMs = Date.now()
       }
       if (e.kind.kind === 'turn_ended') {
-        const d = e.kind.data as { turn: string; session: string; ok: boolean }
+        const d = e.kind.data as { turn: string; session: string; ok: boolean; reason?: string | null; cost_usd?: number | null }
         if (subTurns.has(d.turn)) {
           /* E-6: финиш ветки — закрываем только её строки; статус сессии,
              счётчик ходов и очередь принадлежат родительскому ходу. */
           subTurns.delete(d.turn)
           transcriptFor(d.session).closeTurn(d.turn)
         } else {
-          liveStates[d.session] = d.ok ? 'ok' : 'fail'
+          /* UX-04-002 (ревизия 86): штатная остановка — не 'fail': красный
+             мигающий треугольник на своём же нажатии «стоп» читался как
+             поломка. */
+          const stopped = !d.ok && d.reason === 'остановлено пользователем'
+          liveStates[d.session] = d.ok ? 'ok' : stopped ? 'neutral' : 'fail'
+          /* UX-02-006 (ревизия 86): цена завершённого хода — в шапку
+             активного чата: деньги видны сразу, не в телеметрии. */
+          if (d.session === currentSession) lastTurnCost = d.cost_usd ?? null
           /* Строки хода переводим в готовый вид: волна «думает» гаснет. */
           transcriptFor(d.session).closeTurn(d.turn)
           /* Ход кончился — висячий запрос подтверждения не имеет смысла. */
           approvalReq = null
+          pendingApprovals.delete(d.session)
           if (sendingSession === d.session) sendingSession = null
           if (d.session === currentSession) turnsCount++
           /* F-5: ход записан — его снимок стал доступен для отката. */
@@ -2017,6 +2251,7 @@
       if (e.kind.kind === 'approval_required') {
         const d = e.kind.data as {
           turn: string
+          session: string
           call_id: string
           tool: string
           summary: string
@@ -2024,18 +2259,64 @@
         }
         /* F-6: preview (unified-diff будущей правки) показываем вместе со
            сводкой — решение по тексту «write {"path":…}» принимается вслепую. */
-        approvalReq = {
+        /* UX-02-005 (ревизия 86): модальный вопрос подтверждения открывает
+           только своя сессия. Раньше approval ЛЮБОГО фонового хода
+           перекрывал активный чат: работа в одном диалоге замораживалась
+           чужим вопросом. Чужой ход ждёт в своей очереди (строка
+           «ждёт подтверждения» уже есть в его транскрипте, тост его
+           разбудит), диалог выйдет, когда владелец переключится к нему. */
+        const req = {
           call_id: d.call_id,
           tool: d.tool,
           summary: d.summary,
           preview: d.preview,
         }
+        pendingApprovals.set(d.session, req)
+        if (d.session === currentSession) approvalReq = req
       }
       if (e.kind.kind === 'file_changed') {
         /* B-4: файлы сессии изменились — дерево перерисовывается само,
            без опроса. Чужие сессии не трогаем. */
         const d = e.kind.data as { session: string; paths: string[] }
-        if (d.session === currentSession) treeRefresh++
+        if (d.session === currentSession) {
+          treeRefresh++
+          /* UX-03-006: агент дописал блокнот проекта — вкладка памяти
+             перечитает его при следующем открытии/тике. */
+          if (d.paths.some((p) => p.replace(/\\/g, '/').endsWith('.swagcod/MEMORY.md'))) {
+            memoryProjectTick++
+          }
+          /* UX-03-005 (ревизия 86): открытые вкладки файлов перечитывают
+             текст: правка из хода видна сразу, а не после ручного
+             переоткрытия вкладки (старый текст читался как актуальный). */
+          void refreshOpenFileTabs(d.paths)
+        }
+      }
+      /* UX-01-005 (ревизия 86): ядро удалило сессию — активный чат обязан
+         сброситься сразу, а не падать ошибкой на следующей отправке в
+         призрака. Расчищаем транскрипт, cwd-карту, per-session модель и
+         очередь этой сессии. */
+      if (e.kind.kind === 'session_deleted') {
+        const d = e.kind.data as { session: string }
+        transcriptsBySession.delete(d.session)
+        delete sessionCwds[d.session]
+        delete sessionModels[d.session]
+        delete queues[d.session]
+        turnSession.forEach((s, t) => { if (s === d.session) turnSession.delete(t) })
+        if (d.session === currentSession) {
+          currentSession = null
+          chatBirth = false
+          transcript = transcriptFor('')
+          items = transcript.items
+          revision++
+          scrollNonce++
+        }
+        sessionRefreshTick++
+        continue
+      }
+      /* UX-01-007 (ревизия 86): переименование из другого окна/сессии —
+         сайдбар и заголовок обновляются без полного reload. */
+      if (e.kind.kind === 'session_renamed') {
+        sessionRefreshTick++
       }
       const sid = sessionOfEvent(e)
       if (!sid) continue
@@ -2044,6 +2325,38 @@
       const arr = bySession.get(sid)
       if (arr) arr.push(e)
       else bySession.set(sid, [e])
+    }
+
+    /* UX-04-009 (ревизия 86): скорость видна во время стрима, а не только
+       после хода: длинный ход не показывает пустоту до своего конца.
+       Здесь, а не в начале: раскладка выше регистрирует turn→session
+       (turn_started), поэтому content того же батча уже правильно
+       привязывается; считаем только события активного чата — фоновая
+       сессия индикатор не сбивает. */
+    {
+      let hasEnd = false
+      for (const e of batch) {
+        const k = e.kind.kind
+        if (k !== 'content' && k !== 'reasoning' && k !== 'turn_ended') continue
+        if (sessionOfEvent(e) !== currentSession) continue
+        if (k === 'turn_ended') hasEnd = true
+        if (k === 'content' || k === 'reasoning') {
+          if (streamStartTime === null) {
+            streamStartTime = performance.now()
+            turnTokens = 0
+          }
+          turnTokens += Math.ceil((e.kind.data.text || '').length / 4)
+        }
+      }
+      if (streamStartTime !== null) {
+        const live = (performance.now() - streamStartTime) / 1000
+        tokensPerSec = live > 0.3 ? Math.round(turnTokens / live) : null
+      }
+      if (hasEnd && streamStartTime !== null) {
+        const elapsed = (performance.now() - streamStartTime) / 1000
+        tokensPerSec = elapsed > 0 ? Math.round(turnTokens / elapsed) : null
+        streamStartTime = null
+      }
     }
     for (const [sid, evs] of bySession) {
       const touched = transcriptFor(sid).applyBatch(evs)
@@ -2093,15 +2406,17 @@
     URL.revokeObjectURL(url)
   }
 
-  /** Открывает рабочую директорию текущей сессии в проводнике. */
+  /** Открывает папку конфигурации SwagCod (~/.swagcod) в проводнике.
+      UX-05-008 (ревизия 86): раньше «конфиг» открывал cwd рабочей сессии —
+      подпись обещала одно, кнопка делала другое. */
   async function openConfigFile(): Promise<void> {
-    if (workspaces.length === 0) await loadWorkspaces()
-    const ws = workspaces.find((w) => w.id === currentSession) ?? workspaces[0]
-    if (!ws) return
     try {
-      await invoke('open_in_explorer', { sessionId: ws.id, path: ws.cwd })
+      await invoke('open_config_dir')
     } catch (err) {
-      console.error('open_in_explorer failed:', err)
+      console.error('open_config_dir failed:', err)
+      transcript.addStatus(`папка конфигурации не открылась: ${err}`)
+      items = transcript.items
+      revision++
     }
   }
 
@@ -2155,14 +2470,6 @@
     return cur ?? ''
   }
 
-  function rememberCwd(cwd: string): void {
-    try {
-      localStorage.setItem('swagcod-cwd', cwd)
-    } catch {
-      // localStorage недоступен — не критично
-    }
-  }
-
   async function createNewSession(cwdOverride?: string): Promise<void> {
     creatingSession = true
     /* Защита от событийного аргумента: onclick={onCreate} передаёт клик
@@ -2176,7 +2483,6 @@
       })
       currentSession = brief.id
       sessionCwds[brief.id] = brief.cwd
-      rememberCwd(brief.cwd)
       transcript = transcriptFor(brief.id)
       items = transcript.items
       revision++
@@ -2186,7 +2492,13 @@
       chatBirth = true
       void loadWorkspaces()
     } catch (err) {
+      /* UX-01-010 (ревизия 86): провал создания сессии раньше уходил в
+         консоль: кнопка крутилась, чат не открывался, причина — тишина.
+         Теперь ошибка видна в чате как строка (как у start_turn). */
       console.error('create_session failed:', err)
+      transcript.addStatus(`сессия не создалась: ${err}`)
+      items = transcript.items
+      revision++
     } finally {
       creatingSession = false
     }
@@ -2207,9 +2519,22 @@
       sessionRefreshTick++
       void loadWorkspaces()
     } catch (err) {
+      /* UX-01-010: как у create — провал виден в чате, не в консоли. */
       console.error('session_fork failed:', err)
+      transcript.addStatus(`ответвление не создалось: ${err}`)
+      items = transcript.items
+      revision++
     }
   }
+  /** UX-04-013 (ревизия 86): поле ввода растёт с текстом — длинные
+      многострочные реплики видны целиком при редактировании, а не через
+      крошечное окно прокрутки. Потолок ~9 строк: дальше скролл. */
+  function autoGrowInput(el: HTMLTextAreaElement): void {
+    el.style.height = 'auto'
+    const max = 200
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`
+  }
+
   /** Отправка одной реплики в конкретную сессию. Очередь вызывает её же
       после конца хода — и всегда в ту сессию, где реплику написали. */
   async function sendText(text: string, targetSession?: string, attach?: string[]): Promise<void> {
@@ -2229,13 +2554,19 @@
         sid = brief.id
         currentSession = brief.id
         sessionCwds[brief.id] = brief.cwd
-        rememberCwd(brief.cwd)
         transcript = transcriptFor(brief.id)
       }
       sendingSession = sid
       /* Своё сообщение пишем в транскрипт сразу: до ответа модели чат уже
          показывает ход пользователя. */
       transcriptFor(sid).addUser(text)
+      /* UX-04-005 (ревизия 86): судьба вложений видна в момент отправки —
+         что ушло с репликой, а не тихий дроп, который раньше обнаруживался
+         только перечитыванием журнала. */
+      if (attach && attach.length > 0) {
+        const names = attach.map((p) => p.split(/[/\\]/).pop() ?? p)
+        transcriptFor(sid).addStatus(`вложения: ${names.join(', ')}`)
+      }
       if (sid === currentSession) {
         items = transcriptFor(sid).items
         revision++
@@ -2270,6 +2601,11 @@
     const text = inputText.trim()
     if (!text) return
     inputText = ''
+    /* UX-04-013: реплика ушла — поле возвращается к двухстрочной высоте. */
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLTextAreaElement>('.chat-input')
+      if (el) autoGrowInput(el)
+    })
     /* Вложения уходят с этой репликой и список очищается — даже если она
        встанет в очередь: attach travels вместе с QueueItem. */
     const attach = attachments.length > 0 ? [...attachments] : undefined
@@ -2289,11 +2625,26 @@
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'l') {
         e.preventDefault()
-        transcript.clear()
-        items = transcript.items
-        revision++
-        eventsTotal = 0
-        batchesTotal = 0
+        /* UX-04-004 (ревизия 86): очистка чата — разрушительное действие,
+           раньше один Ctrl+L стирал историю мгновенно и без вопросов
+           (случайное нажатие рядом с Ctrl+K = потеря видимого диалога).
+           Подтверждение — второе Ctrl+L в течение 3 секунд, со служебной
+           строкой в чате. Журнал на диске не трогается: это только
+           видимый транскрипт. */
+        const now = Date.now()
+        if (now - clearChatArmedAt < 3000) {
+          clearChatArmedAt = 0
+          transcript.clear()
+          items = transcript.items
+          revision++
+          eventsTotal = 0
+          batchesTotal = 0
+        } else {
+          clearChatArmedAt = now
+          transcript.addStatus('Ctrl+L ещё раз в течение 3 секунд — очистить этот чат (журнал на диске не трогается)')
+          items = transcript.items
+          revision++
+        }
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
@@ -2388,6 +2739,18 @@
         } catch (err) {
           console.warn('set_approval_policy at startup failed', err)
         }
+        /* UX-01-004 (ревизия 86): рестарт возвращает в последнюю открытую
+           сессию, а не в пустой ствол. Сессия обязана существовать (могла
+           быть удалена из другого окна): проверяем по списку ядра. */
+        try {
+          const lastId = localStorage.getItem('swagcod-last-session')
+          if (lastId) {
+            const list = await invoke<{ id: string }[]>('list_sessions')
+            if (list.some((s) => s.id === lastId)) switchSession(lastId)
+          }
+        } catch {
+          /* приватный режим/нет ядра — стартуем как раньше */
+        }
       })
       .catch((err) => {
         tauriAvailable = false
@@ -2402,23 +2765,43 @@
     }
   })
 
-  if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission()
-  }
+  /* Разрешение на вебовые уведомления не запрашивается: канал один —
+     системные тосты из ядра (UX-02-007, ревизия 86). */
 
   const onDrop = (e: DragEvent) => {
     e.preventDefault()
     const files = e.dataTransfer?.files
     if (files) {
       for (const f of files) {
-        inputText += (inputText ? '\n' : '') + ((f as File & { path?: string }).path || f.name)
+        const path = (f as File & { path?: string }).path
+        /* UX-04-006 (ревизия 86): перетащенный файл ложится в чипы
+           вложений, а не текстом в поле: путь в inputText отправлялся
+           как слова реплики и модель честно принималась искать «файл по
+           имени D:\…». Реальный путь есть только в Tauri (WebView2 его
+           отдаёт); без пути вставляем имя как упоминание. */
+        if (path) {
+          if (!attachments.includes(path)) attachments.push(path)
+        } else {
+          inputText += (inputText ? '\n' : '') + f.name
+        }
       }
     }
   }
   const onDragOver = (e: DragEvent) => e.preventDefault()
 </script>
 
-<Splash duration={2000} />
+<Splash duration={firstRun ? 2500 : 400} />
+{#if nightOpen}
+  <NightRun
+    sessionId={currentSession}
+    sessionLabel={currentSession ? sessionTitleOf(currentSession) : 'нет активной сессии'}
+    roundsRunning={turnsCount}
+    busy={sessionBusy(currentSession)}
+    {runNight}
+    {stopNight}
+    onclose={() => (nightOpen = false)}
+  />
+{/if}
 <BackgroundFX enabled={effectsEnabled} intensity={thinking ? 3 : 1} mode={bgMode} theme={resolvedAppearance} />
 
 <!-- Пользовательский медиафон (gif / mp4 / картинка) лежит под контентом,
@@ -2453,6 +2836,7 @@
     denyLabel={t('deny')}
     preview={approvalReq.preview}
     diffHiddenLabel={t('diffHidden')}
+    diffExpandLabel={t('diffExpand')}
     onRespond={respondApproval}
   />
 {/if}
@@ -2550,6 +2934,9 @@
   {modelSpecs}
   {currentSpec}
   {reloadModels}
+  /* UX-05-001: модель активного чата и признак per-session переопределения. */
+  activeChatModel={currentSession ? effectiveModel : null}
+  activeChatOverride={perSessionModels && currentSession != null && Boolean(sessionModels[currentSession])}
 
   /* провайдеры */
   {provState}
@@ -2567,6 +2954,7 @@
   {deleteProvider}
   {fetchModels}
   {savePreview}
+  {forgetProviderKey}
 
   /* MCP-серверы */
   {mcpServers}
@@ -2616,6 +3004,8 @@
   {pickMemoryDir}
   {exportMemoryFile}
   {memoryExporting}
+  /* UX-03-006 (ревизия 86): блокнот проекта для вкладки памяти. */
+  {memoryProject}
 
   /* js-плагины */
   {jsPlugTools}
@@ -2641,6 +3031,11 @@
   {t}
   onquery={(q) => void runHistorySearch(q)}
   onpick={openHistoryHit}
+  suggestSession={historySuggest}
+  onOpenSession={(id) => {
+    showHistorySearch = false
+    switchSession(id)
+  }}
 />
 
 <main
@@ -2693,6 +3088,8 @@
     {tauriAvailable}
     {logNote}
     bind:showSettings={showSettings}
+    lang={uiLang}
+    onOpenSearch={() => { showHistorySearch = true }}
   />
 
   <!-- Ручка ресайза сайдбара: тянем мышью, двойной клик сбрасывает ширину.
@@ -2730,9 +3127,10 @@
             aria-label={t('restore')}
           ><Icon name="panel" size={14} /></button>
         {/if}
-        <span class="title-text">{currentSession ? `сессия ${currentSession.slice(0, 8)}` : 'новая сессия'}</span>
+        <span class="title-text" title={currentSession ? sessionTitles[currentSession] || sessionCwds[currentSession] : ''}>{currentSession ? sessionTitleOf(currentSession) : 'новая сессия'}</span>
         <span class="meta">{turnsCount} {t('turns')}</span>
         {#if tokensPerSec !== null}<span class="meta speed">{tokensPerSec} tok/s</span>{/if}
+        {#if lastTurnCost !== null}<span class="meta cost">≈{usdOf(lastTurnCost)}</span>{/if}
         {#if thinking}
           {#if turnQuiet}
             <span class="meta thinking-badge quiet">● {t('quietTurn')}</span>
@@ -2761,6 +3159,32 @@
               activeTab = 'chat'
             }}
           ><Icon name="search" size={13} /></button>
+          <!-- UX-04-012 (ревизия 86): закладки не просто накапливаются —
+               по ним можно прыгнуть: меню перечисляет помеченные строки,
+               клик мотает чат к строке (тот же механизм, что у поиска). -->
+          {#if bookmarkedItems.length > 0}
+            <div class="hmenu-wrap">
+              <button
+                class="header-icon-btn"
+                title={t('bookmarksTitle')}
+                aria-label={t('bookmarksTitle')}
+                aria-expanded={bmMenuOpen}
+                onclick={() => { bmMenuOpen = !bmMenuOpen; folderMenu = false; dotsMenu = false }}
+              ><Icon name="star" size={13} /></button>
+              {#if bmMenuOpen}
+                <div class="hmenu bm-menu" role="menu">
+                  {#each bookmarkedItems as bm (bm.key)}
+                    <button
+                      role="menuitem"
+                      class="bm-item"
+                      title={bm.text}
+                      onclick={() => { bmMenuOpen = false; hitScrollTarget = bm.text.replace(/\s+/g, ' ').slice(0, 60) }}
+                    >{bm.kind === 'user' ? '» ' : ''}{bm.text.replace(/\s+/g, ' ').slice(0, 60)}</button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
           <div class="hmenu-wrap">
             <button
               class="header-icon-btn"
@@ -2805,6 +3229,16 @@
               </div>
             {/if}
           </div>
+          <!-- UX-02-002 (ревизия 86): ночной прогон — форма из решения
+               владельца: цель, раунды, бюджет. -->
+          <button
+            class="header-icon-btn"
+            class:on={nightOpen}
+            title="ночной прогон"
+            aria-label="ночной прогон"
+            aria-pressed={nightOpen}
+            onclick={() => (nightOpen = !nightOpen)}
+          ><Icon name="moon" size={13} /></button>
           <button
             class="header-icon-btn"
             class:on={filesOpen}
@@ -2863,7 +3297,7 @@
               <span class="birth-label">{t('chatCreating')}</span>
             </div>
           {/if}
-          <Transcript items={filteredItems} {revision} {bookmarks} showThoughts={showThoughts} scrollNonce={scrollNonce} onToggleBookmark={toggleBookmark} />
+          <Transcript items={filteredItems} {revision} {bookmarks} showThoughts={showThoughts} scrollNonce={scrollNonce} onToggleBookmark={toggleBookmark} bind:scrollToText={hitScrollTarget} labels={transcriptLabels} />
         </div>
       {:else if activeTab === 'trajectory'}
         {@const trajectoryItems = items.filter(i => i.kind === 'tool_call' || i.kind === 'status')}
@@ -2881,10 +3315,21 @@
           <div class="trajectory-list">
             {#each Object.entries(groupedByTurn) as [turn, turnItems] (turn)}
               {@const isSub = turn.includes('-sub-')}
+              {@const firstTs = turnItems[0]?.ts}
+              {@const userMsg = items.find((i) => i.turn === turn && i.kind === 'user')}
               <div class="turn-group" class:turn-sub={isSub}>
                 <div class="turn-header">
                   <span class="turn-icon">{isSub ? '↳' : '▶'}</span>
                   <span class="turn-name">{isSub ? `${t('subagentTurn')} ${turn.slice(-6)}` : `${t('turn')} ${turn.slice(0, 8)}`}</span>
+                  <!-- UX-03-003 (ревизия 86): шапка хода несёт время и первую
+                       реплику: «ход 4a31f0c0, 6 событий» без слов и времени
+                       не отвечал на главный вопрос — что это был за ход. -->
+                  {#if firstTs}
+                    <span class="turn-time">{new Date(firstTs).toLocaleTimeString()}</span>
+                  {/if}
+                  {#if userMsg}
+                    <span class="turn-prompt" title={userMsg.text}>{userMsg.text.replace(/\s+/g, ' ').slice(0, 60)}</span>
+                  {/if}
                   <span class="turn-count">{turnItems.length} {t('events')}</span>
                   {#if !isSub && checkpoints[turn]}
                     <!-- F-5: снимок есть — значит ход можно откатить. -->
@@ -3018,7 +3463,14 @@
               {/if}
               <button
                 class="popover-link"
-                onclick={() => { showModelPicker = false; showSettings = true; settingsTab = 'models' }}
+                /* UX-05-001: пустой список моделей — это «нет ключа», а не
+                «проблема с моделями»: ведём на Провайдеры (там ключ),
+                непустой — на Модели, как раньше. */
+                onclick={() => {
+                  showModelPicker = false
+                  showSettings = true
+                  settingsTab = models.length === 0 ? 'providers' : 'models'
+                }}
               >{t('openModelSettings')} →</button>
             </div>
             {#if perSessionModels && currentSession && sessionModels[currentSession]}
@@ -3067,6 +3519,7 @@
           class="chat-input"
           placeholder={t('placeholder')}
           bind:value={inputText}
+          oninput={(e) => autoGrowInput(e.currentTarget)}
           onkeydown={(e) => {
             // F-2: «/» в пустом вводе открывает палитру команд, как в DSH.
             // F-10: фокус и сброс запроса — внутри Palette.svelte.
@@ -3075,7 +3528,11 @@
               showPalette = true
               return
             }
-            if (e.key === 'Enter' && !e.shiftKey) {
+            // UX-04-008 (ревизия 86): isComposing — ввод ещё собирается
+            // IME-редактором (китайский/японский/корейский): Enter там
+            // подтверждает слог, а не отправляет сообщение. Раньше реплика
+            // улетала в чат на середине набора иероглифа.
+            if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
               e.preventDefault()
               sendMessage()
             }
@@ -3220,13 +3677,16 @@
                   {/each}
                 </div>
               {:else}
-                {#key treeRefresh}
-                  <FileTree
-                    root={filesRoot}
-                    sessionId={currentSession}
-                    onFileSelect={(p, n) => void openFileFromTree(p, n)}
-                  />
-                {/key}
+                <!-- UX-03-004 (ревизия 86): без {#key}-перемонтирования —
+                     FileTree сам мягко перечитывает изменившиеся ветки
+                     (prop refreshTick), раскрытые папки живут. -->
+                <FileTree
+                  root={filesRoot}
+                  sessionId={currentSession}
+                  refreshTick={treeRefresh}
+                  title={t('filesTitle')}
+                  onFileSelect={(p, n) => void openFileFromTree(p, n)}
+                />
               {/if}
             {:else}
               <div class="files-empty">{t('noSession')}</div>
@@ -3475,6 +3935,13 @@
   .meta.speed {
     color: var(--ok);
     transition: all 0.15s;
+  }
+
+  /* UX-02-006: цена хода — тусклее скорости, деньги не главная метрика. */
+  .meta.cost {
+    color: var(--text-faint);
+    font-family: var(--mono);
+    font-size: 10.5px;
   }
 
   .speed:nth-child(odd):hover {
@@ -4136,6 +4603,22 @@
     color: var(--text-faint);
     font-size: 11px;
     transition: color 0.15s;
+  }
+
+  /* UX-03-003 (ревизия 86): время и первая реплика хода в шапке группы. */
+  .turn-time {
+    color: var(--text-faint);
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+
+  .turn-prompt {
+    color: var(--text-dim);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 40%;
   }
 
   .turn-count:nth-child(odd):hover {
@@ -5169,6 +5652,20 @@
     z-index: 60;
     display: flex;
     flex-direction: column;
+  }
+
+  /* UX-04-012: меню закладок шире обычного — строки длинные, до 60 симв. */
+  .bm-menu {
+    min-width: 340px;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  .bm-menu .bm-item {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .hmenu button {

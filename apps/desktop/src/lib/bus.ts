@@ -28,7 +28,9 @@ export type EventKind =
   | { kind: 'turn_started'; data: { turn: string; session: string; parent?: string } }
   | {
       kind: 'turn_ended'
-      data: { turn: string; session: string; ok: boolean; reason: string | null }
+      /* UX-02-006 (ревизия 86): cost_usd — цена хода, когда модель есть в
+         таблице цен (null/отсутствует = не посчитана, не «бесплатно»). */
+      data: { turn: string; session: string; ok: boolean; reason: string | null; cost_usd?: number | null }
     }
   | {
       kind: 'approval_required'
@@ -42,6 +44,12 @@ export type EventKind =
   | { kind: 'pty_output'; data: { pty: string; ops: PtyOp[] } }
   | { kind: 'pty_exit'; data: { pty: string; code: number } }
   | { kind: 'file_changed'; data: { session: string; paths: string[] } }
+  /* UX-01-005 (ревизия 86): сессию удалили в ядре — UI сбрасывает активный
+     чат, пока не наступила отправка в призрака. */
+  | { kind: 'session_deleted'; data: { session: string } }
+  /* Ревизия 86: переименование — сайдбар и заголовок обновляются без
+     полного перечитывания списка. */
+  | { kind: 'session_renamed'; data: { session: string; title: string } }
 
 /** Операция ANSI-парсера из Rust (crates/pty/src/ansi.rs, serde tag "t"). */
 export type PtyOp =

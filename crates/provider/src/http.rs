@@ -17,10 +17,53 @@ use crate::types::ChatRequest;
 pub enum ProviderError {
     #[error("http: {0}")]
     Http(String),
-    #[error("provider returned {status}: {body}")]
+    /* UX-05-004 (ревизия 86): код статуса переводится в человеческую причину.
+    Раньше пользователь читал «provider returned 401: {json-мусор}» и сам
+    догадывался, что дело в ключе. Тело ответа остаётся хвостом — там
+    бывают детали, но причина называется словами. */
+    #[error("{}", status_hint(*status, body))]
     Status { status: u16, body: String },
     #[error("config: {0}")]
     Config(String),
+}
+
+/// Человекочитаемая причина HTTP-кода + хвост тела ответа провайдера.
+fn status_hint(status: u16, body: &str) -> String {
+    let head = match status {
+        401 => "провайдер не принял API-ключ (401) — проверь ключ в «Настройки → Провайдеры»"
+            .to_string(),
+        403 => "доступ к модели закрыт (403) — у ключа нет прав или модель недоступна".to_string(),
+        404 => "эндпоинт не найден (404) — проверь адрес провайдера (base_url)".to_string(),
+        408 => "провайдер не ответил вовремя (408)".to_string(),
+        429 => "провайдер лимитирует запросы (429) — подожди минуту или снизь темп".to_string(),
+        500..=599 => format!("провайдер недоступен ({status}) — сбой на стороне сервиса"),
+        _ => format!("провайдер отклонил запрос ({status})"),
+    };
+    let tail: String = body
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if tail.is_empty() {
+        head
+    } else {
+        format!("{head}; ответ: {tail}")
+    }
+}
+
+/// Тот же перевод кода для transportов вне `ProviderError`
+/// (например, стрим Anthropic): причина словами, без тела ответа.
+pub fn status_hint_public(status: u16, flavor: &str) -> String {
+    match status {
+        401 => format!("{flavor}: ключ не принят (401) — проверь ключ в «Настройки → Провайдеры»"),
+        403 => format!("{flavor}: доступ к модели закрыт (403)"),
+        404 => format!("{flavor}: эндпоинт не найден (404) — проверь адрес"),
+        408 => format!("{flavor}: нет ответа вовремя (408)"),
+        429 => format!("{flavor}: лимит запросов (429)"),
+        500..=599 => format!("{flavor}: сервис недоступен ({status})"),
+        _ => format!("{flavor}: запрос отклонён ({status})"),
+    }
 }
 
 /// Клиент OpenAI-совместимого эндпоинта (B-6: конкретная реализация
@@ -194,10 +237,7 @@ impl OpenAiProvider {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 let _ = tx
-                    .send(StreamEvent::Error(format!(
-                        "provider {status}: {}",
-                        text.chars().take(300).collect::<String>()
-                    )))
+                    .send(StreamEvent::Error(status_hint(status.as_u16(), &text)))
                     .await;
                 return;
             }

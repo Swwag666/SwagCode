@@ -59,3 +59,25 @@ export function hitTitle(title: string, sessionId: string): string {
   const t = title.trim()
   return t ? t : sessionId
 }
+
+/**
+ * UX-01-006 (ревизия 86): якорь для перемотки транскрипта к найденному
+ * сообщению. Из подсвеченного сниппета берётся первая пара «текст до
+ * совпадения + совпадение» — такого куска почти всегда хватает, чтобы
+ * найти строку в транскрипте включением, и он не зависит от подсветки.
+ */
+export function hitAnchor(snippet: string): string | null {
+  const parts = parseSnippet(snippet)
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].hit) {
+      const before = parts[i - 1]?.text ?? ''
+      const anchor = `${before.slice(-24)}${parts[i].text}`.trim()
+      if (anchor.length >= 8) return anchor
+      const after = parts[i + 1]?.text ?? ''
+      const joined = (parts[i].text + after.slice(0, 16)).trim()
+      if (joined.length >= 8) return joined
+    }
+  }
+  const flat = snippet.replace(/[[\]]/g, '').trim()
+  return flat.length >= 8 ? flat.slice(0, 48) : null
+}

@@ -865,6 +865,14 @@ fn db_path() -> Result<std::path::PathBuf, String> {
 /// Занятую сессию не удаляем: ход пишет историю прямо сейчас.
 #[tauri::command]
 async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    let st = state.inner().clone();
+    delete_session_core(&st, session_id).await
+}
+
+pub(crate) async fn delete_session_core(
+    state: &AppState,
+    session_id: String,
+) -> Result<(), String> {
     {
         let sessions = state.sessions.lock().await;
         match sessions.iter().find(|s| s.id.to_string() == session_id) {
@@ -887,7 +895,71 @@ async fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) -> 
         m.remove(&session_id);
     }
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.delete_session(&session_id).map_err(|e| e.to_string())
+    let res = store.delete_session(&session_id).map_err(|e| e.to_string());
+    if res.is_ok() {
+        /* UX-01-005 (ревизия 86): удаление обязано дойти до UI событием,
+        иначе активный чат остаётся призраком с мёртвой историей, а ошибка
+        приходит только на следующей отправке. */
+        state.bus.publish(EventKind::SessionDeleted {
+            session: id2sid(&session_id),
+        });
+    }
+    res
+}
+
+/// Ревизия 86 (UX-01-002): переименование сессии. Раньше IPC-команды не
+/// существовало: безымянные сессии навсегда оставались «путём из cwd»,
+/// а отличить два диалога в одной папке было невозможно. Пустой title
+/// не пишем — это возвращение к автогенерации.
+#[tauri::command]
+async fn rename_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    rename_session_core(&st, session_id, title).await
+}
+
+pub(crate) async fn rename_session_core(
+    state: &AppState,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("пустое название".into());
+    }
+    if title.chars().count() > 200 {
+        return Err("название слишком длинное (лимит 200 символов)".into());
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        let s = sessions
+            .iter_mut()
+            .find(|s| s.id.to_string() == session_id)
+            .ok_or_else(|| format!("сессия {session_id} не найдена"))?;
+        if s.status.is_busy() {
+            return Err("нельзя переименовать: идёт ход".into());
+        }
+        s.title = title.clone();
+    }
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .set_session_title(&session_id, &title)
+            .map_err(|e| e.to_string())?;
+    }
+    state.bus.publish(EventKind::SessionRenamed {
+        session: id2sid(&session_id),
+        title,
+    });
+    Ok(())
+}
+
+/// session_id -> SessionId: события шины типизированы, команда получает строку.
+fn id2sid(session_id: &str) -> swagcod_core::session::SessionId {
+    swagcod_core::session::SessionId::new(session_id.to_string())
 }
 
 /// B-1: настройки ключ-значение в store. Фронтенд пишет с debounce 500 мс,
@@ -2041,6 +2113,8 @@ pub(crate) async fn run_subagent(
         session: swagcod_core::SessionId::new(sid),
         ok,
         reason: failure.clone(),
+        /* UX-02-006: цена ветки суб-агента — считаем той же таблицей цен. */
+        cost_usd: swagcod_core::pricing::cost_usd(&model, est_in, est_out),
     });
 
     // Отчёт родительскому ходу: текст ветки + честная статистика.
@@ -3286,6 +3360,27 @@ async fn open_in_explorer(
     Ok(())
 }
 
+/// Открыть домашнюю папку конфигурации SwagCod в проводнике.
+///
+/// UX-05-008 (ревизия 86): кнопка настроек «конфиг» раньше открывала cwd
+/// рабочей сессии — не то, что обещает подпись. Настоящее место конфигурации:
+/// `~/.swagcod` (folder_rules.json, skills/, shadow/). Папка создаётся при
+/// отсутствии: пустая, но видимая — человек сразу видит структуру, а не
+/// ошибку проводника.
+#[tauri::command]
+async fn open_config_dir() -> Result<String, String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "домашняя папка не найдена".to_string())?;
+    let dir = std::path::Path::new(&home).join(".swagcod");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    silent_cmd("explorer")
+        .arg(dir.as_os_str().to_string_lossy().to_string())
+        .spawn()
+        .map_err(|e| format!("explorer: {e}"))?;
+    Ok(dir.display().to_string())
+}
+
 /// Короткий идентификатор без зависимостей: наносекунды + монотонный счётчик.
 ///
 /// Счётчик обязателен: два вызова в одну наносекунду иначе дали бы
@@ -4091,6 +4186,21 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
+        /* UX-02-001 (ревизия 86): фокус окна обязан доживать до
+        suppress_when_focused. Раньше window_focused создавался true и
+        никто его не писал: «окно в фокусе» было всегда, и
+        suppress_when_focused глушил ВСЕ тосты и звуки — обратная связь
+        из rev85 не работала ни разу. EventKind::Status это же чинит не
+        трогая: центральный флаг, одна точка записи. */
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if let Some(state) = window.try_state::<std::sync::Arc<crate::AppState>>() {
+                    state
+                        .window_focused
+                        .store(*focused, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        })
         .setup(|app| {
             let mut state = AppState::default();
             /* B-1: файловая база в локальном профиле и сидирование сессий
@@ -4337,6 +4447,7 @@ pub fn run() {
             list_sessions,
             create_session,
             delete_session,
+            rename_session,
             get_pref,
             set_pref,
             pty_spawn,
@@ -4384,10 +4495,12 @@ pub fn run() {
             providers::fetch_provider_models,
             providers::save_provider,
             providers::delete_provider,
+            providers::forget_provider_key,
             providers::set_active_provider,
             get_skills_list,
             reload_skill,
             open_in_explorer,
+            open_config_dir,
             update_check,
             update_install,
             restart_app,
@@ -4989,9 +5102,31 @@ mod tests {
 
     #[test]
     fn attachments_images_are_marked_unsupported() {
-        let out = render_attachments(&["C:/pics/cat.PNG".to_string()]);
-        assert!(out.contains("cat.PNG"), "{out}");
-        assert!(out.contains("картинки пока не поддерживаются"), "{out}");
+        /* Ревизия 86 (UX-04-005): png/jpg/jpeg/gif/webp до 5 МБ уходят в
+        запрос блоком image — подпись обязана говорить это; bmp/ico —
+        честный отказ; несуществующий файл — честное «не найден». */
+        let dir = std::env::temp_dir().join(format!("swagcod-att-img-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cat.png"), [0x89_u8, b'P', b'N', b'G']).unwrap();
+        let real = dir.join("cat.png").to_string_lossy().to_string();
+        let out = render_attachments(&[
+            real,
+            "C:/pics/cat.PNG".to_string(),
+            "C:/pics/cat.bmp".to_string(),
+        ]);
+        assert!(
+            out.contains("cat.png: картинка, ушла в запрос отдельным блоком (png)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("cat.PNG: не прикреплено — файл не найден"),
+            "{out}"
+        );
+        assert!(
+            out.contains("cat.bmp: не прикреплено — формат bmp не поддерживается"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E-2: сквозной тест локального вкуса — index_workspace собирает кэш
@@ -7775,5 +7910,189 @@ rl.on('line', (l) => {
         let res = resolve_folder_rules(&state, &sub);
         assert_eq!(res.prompt_lines, vec!["без unsafe"]);
         assert!(res.prompt_text().contains("- без unsafe"));
+    }
+
+    // ---------- ревизия 86: UX-блокеры сессий ----------
+
+    /// UX-01-005: удаление сессии обязано публиковать SessionDeleted —
+    /// иначе активный чат остаётся призраком с мёртвой историей.
+    #[tokio::test]
+    async fn delete_session_publishes_event() {
+        let state = AppState::default();
+        *state.store.lock().unwrap() = swagcod_core::store::open_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rx = state.bus.subscribe();
+        let brief = create_session_core(&state, dir.path().to_string_lossy().into(), None)
+            .await
+            .expect("сессия создана");
+        // Создание публикует Status; вычитываем, чтобы не мешал поиску.
+        let _ = rx.try_recv();
+
+        delete_session_core(&state, brief.id.clone())
+            .await
+            .expect("сессия удалена");
+
+        let found = loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    if matches!(
+                        ev.kind,
+                        swagcod_core::bus::EventKind::SessionDeleted { ref session }
+                            if session.to_string() == brief.id
+                    ) {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        assert!(found, "SessionDeleted не опубликован");
+        // Сессии больше нет в списке.
+        let list = list_sessions_core(&state).await;
+        assert!(list.iter().all(|s| s.id != brief.id));
+    }
+
+    /// UX-01-002: rename_session меняет title в памяти, в store и публикует
+    /// SessionRenamed. Пустое название отклоняется.
+    #[tokio::test]
+    async fn rename_session_updates_title_and_publishes() {
+        let state = AppState::default();
+        *state.store.lock().unwrap() = swagcod_core::store::open_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rx = state.bus.subscribe();
+        let brief = create_session_core(&state, dir.path().to_string_lossy().into(), None)
+            .await
+            .expect("сессия создана");
+        let _ = rx.try_recv();
+
+        rename_session_core(&state, brief.id.clone(), "  мой диалог  ".into())
+            .await
+            .expect("переименование прошло");
+
+        let found = loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    if let swagcod_core::bus::EventKind::SessionRenamed {
+                        ref session,
+                        ref title,
+                    } = ev.kind
+                    {
+                        if session.to_string() == brief.id {
+                            assert_eq!(title, "мой диалог");
+                            break true;
+                        }
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        assert!(found, "SessionRenamed не опубликован");
+
+        // Заголовок живёт в памяти и пережил бы рестарт (store).
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .iter()
+                .find(|s| s.id.to_string() == brief.id)
+                .unwrap();
+            assert_eq!(s.title, "мой диалог");
+        }
+        let reloaded = state
+            .store
+            .lock()
+            .unwrap()
+            .load_session(brief.id.as_str())
+            .expect("store читается")
+            .expect("сессия в базе");
+        assert_eq!(reloaded.title, "мой диалог");
+
+        // Пустое название — честный отказ, title не тронут.
+        let err = rename_session_core(&state, brief.id.clone(), "   ".into())
+            .await
+            .expect_err("пустое название отклонено");
+        assert!(err.contains("пустое название"));
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .iter()
+                .find(|s| s.id.to_string() == brief.id)
+                .unwrap();
+            assert_eq!(s.title, "мой диалог");
+        }
+    }
+
+    /// UX-05-002: сохранение ключа для пресета с пустым base_url от фронта —
+    /// раньше падало «пустой endpoint» ДО ветки пресета, ключ не попадал
+    /// в DPAPI-карту. Теперь base/label для пресета не требуются, ключ
+    /// и модели пишутся. DPAPI-ветка — только на Windows (вне его ключ
+    /// не хранится вовсе), поэтому проверка карты под cfg(windows).
+    #[tokio::test]
+    async fn save_provider_preset_key_with_empty_base() {
+        let state = AppState::default();
+        *state.store.lock().unwrap() = swagcod_core::store::open_memory();
+
+        let presets = crate::providers::list_provider_presets();
+        let preset = presets
+            .iter()
+            .find(|p| p.needs_key)
+            .expect("есть пресет с ключом");
+
+        // Зеркало фронт-вызова: base_url='', label='' (фетч шёл по каталогу).
+        let res = crate::providers::save_provider_core(
+            &state,
+            Some(preset.id.to_string()),
+            String::new(),
+            String::new(),
+            "openai".into(),
+            Some("sk-test-123".into()),
+            vec!["m-1".into()],
+        );
+        assert!(res.is_ok(), "пресет с пустым base_url сохраняется: {res:?}");
+        assert_eq!(res.unwrap(), preset.id, "id цели не изменился");
+
+        #[cfg(windows)]
+        {
+            let keys = crate::providers::read_keys_map(&**state.store.lock().unwrap());
+            assert_eq!(
+                keys.get(preset.id).map(String::as_str),
+                Some("sk-test-123"),
+                "ключ записан в DPAPI-карту под id пресета"
+            );
+        }
+
+        // Модели записаны (карта моделей общая, без DPAPI — любая платформа).
+        let store = state.store.lock().unwrap();
+        let blob = store.get_pref("provider_models").ok().flatten().unwrap();
+        assert!(blob.contains(preset.id), "карта моделей знает пресет");
+    }
+
+    /// UX-05-002, продолжение: custom по-прежнему требует endpoint и
+    /// название — ослабление валидации не должно было открыть мусор в каталог.
+    #[tokio::test]
+    async fn save_provider_custom_still_validated() {
+        let state = AppState::default();
+        *state.store.lock().unwrap() = swagcod_core::store::open_memory();
+
+        let no_base = crate::providers::save_provider_core(
+            &state,
+            None,
+            "мой шлюз".into(),
+            "  ".into(),
+            "openai".into(),
+            None,
+            vec![],
+        );
+        assert!(no_base.is_err_and(|e| e.contains("пустой endpoint")));
+
+        let no_label = crate::providers::save_provider_core(
+            &state,
+            None,
+            "  ".into(),
+            "https://api.example.com".into(),
+            "openai".into(),
+            None,
+            vec![],
+        );
+        assert!(no_label.is_err_and(|e| e.contains("пустое название")));
     }
 }

@@ -56,17 +56,28 @@ export function renderMarkdown(text: string): string {
   const raw = marked.parse(text, { async: false }) as string
 
   // Подсветка код-блоков
+  /* UX-04-001 (ревизия 86): класс языка опционален — блоки без ```lang
+     («голый» код, логи, дампы) получают ту же кнопку «копировать» и
+     подсветку автодетектом, а не остаются без кнопки вовсе. */
   const highlighted = raw.replace(
-    /<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g,
+    /<pre><code(?:\s+class="language-(\w+)")?>([\s\S]*?)<\/code><\/pre>/g,
     (_match, lang, code) => {
       const decoded = decodeHtml(code)
       let hl: string
+      let langAttr = typeof lang === 'string' ? lang : ''
       try {
-        hl = hljs.highlight(decoded, { language: lang }).value
+        if (langAttr && hljs.getLanguage(langAttr)) {
+          hl = hljs.highlight(decoded, { language: langAttr }).value
+        } else {
+          /* Голый блок: autodetect ограничен 10 кандидатами — дёшево. */
+          const auto = hljs.highlightAuto(decoded)
+          hl = auto.value
+          langAttr = auto.language || ''
+        }
       } catch {
         hl = escapeHtml(decoded)
       }
-      return `<div class="code-block-wrap"><button class="copy-btn" data-copy>копировать</button><pre class="code-block"><code class="hljs language-${lang}">${hl}</code></pre></div>`
+      return `<div class="code-block-wrap"><button class="copy-btn" data-copy>копировать</button><pre class="code-block"><code class="hljs${langAttr ? ` language-${langAttr}` : ''}">${hl}</code></pre></div>`
     }
   )
 
@@ -79,14 +90,11 @@ export function renderMarkdown(text: string): string {
 }
 
 /**
- * C-4 фикс: стримящийся текст рендерится как plain text с курсором.
- * Никакого marked.parse, никакого hljs — O(1) на токен.
- * Полный парсинг произойдёт когда элемент станет done.
+ * C-4 фикс: стримящийся текст рендерился как plain text с курсором.
+ * Ревизия 86 (зондаж UX, «мёртвый код»): путь не использовался —
+ * с ревизии 84 markdown рендерится живьём на каждом батче, функция
+ * удалена вместе со своим тестом.
  */
-export function renderStreaming(text: string): string {
-  if (!text) return '<span class="cursor">▊</span>'
-  return `<span class="streaming-text">${escapeHtml(text)}</span><span class="cursor">▊</span>`
-}
 
 function escapeHtml(s: string): string {
   return s

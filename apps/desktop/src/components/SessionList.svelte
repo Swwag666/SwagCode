@@ -7,6 +7,7 @@
    */
   import { invoke } from '@tauri-apps/api/core'
   import Icon from './Icon.svelte'
+  import { translate, type StrKey } from '../lib/strings'
 
   interface SessionInfo {
     id: string
@@ -26,16 +27,26 @@
     /** Сигнал обновления из App: растёт только на ходовых событиях шины.
         Таймера больше нет — список не дёргается и не жрёт инвоки впустую. */
     refreshTick?: number
-    /** Живой статус из событий шины: мозг/галочка/треугольник без опроса. */
-    liveStates?: Record<string, 'running' | 'ok' | 'fail'>
+    /** Живой статус из событий шины: мозг/галочка/треугольник без опроса.
+        'neutral' (ревизия 86) — ход остановлен пользователем: штатный
+        стоп не рисуется ошибкой. */
+    liveStates?: Record<string, 'running' | 'ok' | 'fail' | 'neutral'>
     /** Группировка как в DeepSeek: по рабочим папкам или единым списком. */
     groupMode?: 'workspace' | 'list'
-    /** Порядок: ручной (порядок создания) или по последней активности. */
+    /** Порядок: «по созданию» (стабильный порядок ядра — сессии идут в
+        порядке создания, ручного dnd нет: решение владельца, ревизия 86)
+        или по последней активности. */
     orderMode?: 'manual' | 'updated'
     /** Строка поиска из шапки Workspaces. */
     filter?: string
     /** Малый плюс на папке: новая сессия именно в этой директории. */
     onCreateIn?: (cwd: string) => void
+    /** UX-01-014 (ревизия 86): кнопка-подсказка из пустого фильтра
+        открывает полнотекстовый поиск по чатам. */
+    onOpenSearch?: () => void
+    /** UX-04-013 (ревизия 86): язык интерфейса — список больше не
+        русский остров в английском интерфейсе. */
+    lang?: 'ru' | 'en'
   }
 
   let {
@@ -47,14 +58,27 @@
     orderMode = 'updated',
     filter = '',
     onCreateIn,
+    onOpenSearch,
+    lang = 'ru',
   }: Props = $props()
 
+  function t(key: StrKey): string {
+    return translate(lang, key)
+  }
+
   let sessions = $state<SessionInfo[]>([])
-  let contextMenu = $state<{ x: number; y: number; session: SessionInfo } | null>(null)
+  let contextMenu = $state<{ x: number; y: number; session: SessionInfo; step: 'main' | 'confirm' } | null>(null)
+
+  /* UX-01-007 (ревизия 86): инлайн-переименование из контекст-меню.
+  IPC-команды раньше не существовало вовсе — безымянные сессии навсегда
+  оставались «путём из cwd», а отличить два диалога в одной папке было
+  нельзя. */
+  let renaming = $state<{ id: string; title: string } | null>(null)
 
   function onContextMenu(e: MouseEvent, s: SessionInfo): void {
     e.preventDefault()
-    contextMenu = { x: e.clientX, y: e.clientY, session: s }
+    if (renaming && renaming.id === s.id) return
+    contextMenu = { x: e.clientX, y: e.clientY, session: s, step: 'main' }
   }
 
   function closeContextMenu(): void {
@@ -84,6 +108,53 @@
     }
   })
 
+  function startRename(): void {
+    const s = contextMenu?.session
+    closeContextMenu()
+    if (!s) return
+    renaming = { id: s.id, title: s.title }
+  }
+
+  function cancelRename(): void {
+    renaming = null
+  }
+
+  async function commitRename(): Promise<void> {
+    if (!renaming) return
+    const { id, title } = renaming
+    renaming = null
+    const clean = title.trim()
+    if (!clean) return
+    try {
+      await invoke('rename_session', { sessionId: id, title: clean })
+    } catch (e) {
+      console.error('rename_session', e)
+    }
+    await refresh()
+  }
+
+  async function forkSession(): Promise<void> {
+    const s = contextMenu?.session
+    closeContextMenu()
+    if (!s) return
+    try {
+      const brief = await invoke<{ id: string; cwd: string }>('session_fork', { sessionId: s.id })
+      await refresh()
+      onSelect(brief.id)
+    } catch (e) {
+      console.error('session_fork', e)
+    }
+  }
+
+  /* UX-01-001 (ревизия 86): удаление — необратимое действие над всей
+  историей диалога. Раньше один промах ПКМ по «удалить сессию» стирал
+  сессию без единого вопроса. Теперь меню переспрашивает: второй клик
+  подтверждает, любой клик мимо или Escape — отмена. */
+  function askDelete(): void {
+    if (!contextMenu) return
+    contextMenu = { ...contextMenu, step: 'confirm' }
+  }
+
   async function deleteSession(): Promise<void> {
     const target = contextMenu?.session.id
     closeContextMenu()
@@ -111,7 +182,32 @@
 
   /** Последний ход упал или остановлен пользователем. */
   function isFailed(s: SessionInfo): boolean {
+    /* 'neutral' — ход остановлен человеком: это не ошибка (UX-04-002). */
+    if (liveStates[s.id] === 'neutral') return false
     return liveStates[s.id] === 'fail' || s.status === 'failed' || (s.last_ok === false && liveStates[s.id] !== 'ok')
+  }
+
+  /* Группа, достойная отдельного значка: остановленный ход — серая
+     вертикальная черта, не «пустая сессия» и не ошибка. */
+  function isStopped(s: SessionInfo): boolean {
+    return liveStates[s.id] === 'neutral' || s.status === 'cancelled'
+  }
+
+  /* UX-01-011 (ревизия 86): «5 ходов» было константой — «1 ходов», «2 ходов».
+     Русская плюрализация одним правилом; EN — просто turns. */
+  function pluralTurns(n: number): string {
+    if (lang === 'en') return `${n} ${n === 1 ? t('turnsOne') : t('turnsFew')}`
+    if (n % 10 === 1 && n % 100 !== 11) return `${n} ${t('turnsOne')}`
+    if (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)) return `${n} ${t('turnsFew')}`
+    return `${n} ${t('turnsMany')}`
+  }
+
+  /* UX-01-008 (ревизия 86): модель показывалась хвостом по дефису —
+     «20250929» у датированных сборок. Читается последний сегмент пути
+     (после «/»), дефисы внутри имени не режутся. */
+  function shortModel(model: string): string {
+    if (!model) return '—'
+    return model.split('/').pop() || model
   }
 
   /** Ходы были и последний завершился успешно. */
@@ -212,25 +308,44 @@
     aria-selected={s.id === activeId}
   >
     {#if isBusy(s)}
-      <span class="session-state state-run" title="нейронка работает">
+      <span class="session-state state-run" title={t('stateRunning')}>
         <Icon name="brain" size={13} />
       </span>
+    {:else if isStopped(s)}
+      <span class="session-state state-stop" title={t('stateStopped')}>
+        <span class="stop-mark">▮</span>
+      </span>
     {:else if isFailed(s)}
-      <span class="session-state state-err" title="последний ход завершился ошибкой">
+      <span class="session-state state-err" title={t('stateFailed')}>
         <Icon name="alert" size={13} />
       </span>
     {:else if isDone(s)}
-      <span class="session-state state-ok" title="ход завершён успешно">
+      <span class="session-state state-ok" title={t('stateOk')}>
         <Icon name="check" size={13} />
       </span>
     {:else}
-      <span class="session-dot" title="ходов ещё не было"></span>
+      <span class="session-dot" title={t('noTurnsYet')}></span>
     {/if}
     <div class="session-info">
-      <span class="session-name">
-        {s.title || s.id.slice(0, 8)}
-      </span>
-      <span class="session-meta">{s.turns} ходов · {s.model.split('-').pop()}</span>
+      {#if renaming && renaming.id === s.id}
+        <input
+          class="rename-input"
+          bind:value={renaming.title}
+          onkeydown={(e) => {
+            if (e.key === 'Enter') { e.preventDefault(); void commitRename() }
+            if (e.key === 'Escape') { e.preventDefault(); cancelRename() }
+          }}
+          onblur={() => { if (renaming?.id === s.id) void commitRename() }}
+          maxlength="200"
+          aria-label={t('renameItem')}
+          spellcheck="false"
+        />
+      {:else}
+        <span class="session-name">
+          {s.title || s.id.slice(0, 8)}
+        </span>
+        <span class="session-meta">{pluralTurns(s.turns)} · {shortModel(s.model)}</span>
+      {/if}
     </div>
     <span class="session-age" title={new Date(s.last_activity_ms).toLocaleString()}>
       {formatAge(s.last_activity_ms)}
@@ -239,7 +354,7 @@
 {/snippet}
 
 <div class="sessions">
-  <div class="sessions-list" role="listbox" aria-label="сессии">
+  <div class="sessions-list" role="listbox" aria-label={t('listAria')}>
     {#if groupMode === 'workspace'}
       {#each groups as g (g.key)}
         <div class="ws-group">
@@ -255,8 +370,8 @@
             <span class="ws-group-name">{g.label}</span>
             <button
               class="ws-group-add"
-              title="новая сессия в {g.label}"
-              aria-label="новая сессия в {g.label}"
+              title={t('newSessionIn').replace('{name}', g.label)}
+              aria-label={t('newSessionIn').replace('{name}', g.label)}
               onclick={(e) => {
                 e.stopPropagation()
                 onCreateIn?.(g.cwd)
@@ -270,7 +385,7 @@
             {/each}
             {#if g.sessions.length > GROUP_LIMIT && !shownAllGroups.has(g.key)}
               <button class="ws-more" onclick={() => showAllInGroup(g.key)}>
-                показать ещё {g.sessions.length - GROUP_LIMIT} сессий
+                {t('showMoreSessions').replace('{n}', String(g.sessions.length - GROUP_LIMIT))}
               </button>
             {/if}
           {/if}
@@ -282,7 +397,18 @@
       {/each}
     {/if}
     {#if filtered.length === 0}
-      <div class="sessions-empty">нет сессий</div>
+      <div class="sessions-empty">
+        {#if sessions.length > 0}
+          <!-- UX-01-013/014 (ревизия 86): фильтр ничего не нашёл — это не
+               «нет сессий»: список жив, промахнулся запрос. Рядом подсказка
+               про полнотекстовый /search: фильтр режет только по названию и
+               папке, а ищут чаще по словам из чата. -->
+          {t('filterEmpty')}
+          <button class="empty-hint" onclick={() => onOpenSearch?.()}>{t('filterSearchHint')}</button>
+        {:else}
+          {t('sessionsEmpty')}
+        {/if}
+      </div>
     {/if}
   </div>
 </div>
@@ -296,7 +422,18 @@
     role="menu"
     tabindex="-1"
   >
-    <button onclick={deleteSession} role="menuitem">удалить сессию</button>
+    {#if contextMenu.step === 'confirm'}
+      <div class="menu-confirm-text">
+        {t('deleteConfirmQuestion').replace('{title}', contextMenu.session.title || contextMenu.session.id.slice(0, 8))}
+        {t('deleteConfirmNote')}
+      </div>
+      <button onclick={deleteSession} role="menuitem" class="danger">{t('deleteForever')}</button>
+      <button onclick={closeContextMenu} role="menuitem">{t('cancel')}</button>
+    {:else}
+      <button onclick={startRename} role="menuitem">{t('renameItem')}</button>
+      <button onclick={forkSession} role="menuitem">{t('forkItem')}</button>
+      <button onclick={askDelete} role="menuitem" class="danger">{t('deleteItem')}</button>
+    {/if}
   </div>
 {/if}
 
@@ -586,6 +723,16 @@
     animation: state-blink 0.9s steps(2, jump-none) infinite;
   }
 
+  /* Ревизия 86: остановленный ход — серый маркер без анимации. */
+  .state-stop {
+    color: var(--text-dim);
+  }
+
+  .stop-mark {
+    font-size: 11px;
+    line-height: 1;
+  }
+
   .state-ok {
     color: var(--ok);
     animation: state-blink-soft 1.8s ease-in-out infinite;
@@ -724,6 +871,24 @@
     color: var(--text-dim);
   }
 
+  /* UX-01-014: кнопка-подсказка из пустого фильтра. */
+  .sessions-empty .empty-hint {
+    margin-top: 6px;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-decoration: underline dotted;
+  }
+
+  .sessions-empty .empty-hint:hover {
+    text-shadow: 0 0 12px rgba(var(--accent-rgb), 0.6);
+  }
+
   .session-context-menu {
     position: fixed;
     z-index: 1000;
@@ -797,5 +962,37 @@
     background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     color: var(--accent);
     transform: translateX(2px);
+  }
+
+  /* Ревизия 86: подтверждение удаления и inline-переименование. */
+  .session-context-menu button.danger {
+    color: var(--err);
+  }
+
+  .session-context-menu button.danger:hover {
+    background: rgba(var(--err-rgb), calc(0.12 * var(--glow-k)));
+    color: var(--err);
+    box-shadow: 0 0 16px rgba(var(--err-rgb), calc(0.2 * var(--glow-k)));
+  }
+
+  .menu-confirm-text {
+    padding: 6px 10px 4px;
+    font-size: 10px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    max-width: 220px;
+    line-height: 1.4;
+  }
+
+  .rename-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 6px;
+    outline: none;
   }
 </style>

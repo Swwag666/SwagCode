@@ -229,6 +229,8 @@ fn get_audio_handle() -> Option<&'static rodio::OutputStreamHandle> {
 /// к нему только через &'static handle.
 pub struct NotificationManager {
     config: NotificationConfig,
+    /// Ночной прогон: ходовые «готово» глушатся (UX-02-008).
+    night_mode: bool,
     /// Кэш декодированных звуков: имя → PCM-данные + sample rate + channels.
     sound_cache: HashMap<String, Arc<DecodedSound>>,
 }
@@ -249,6 +251,7 @@ impl NotificationManager {
         config.normalize();
         Self {
             config,
+            night_mode: false,
             sound_cache: HashMap::new(),
         }
     }
@@ -278,24 +281,59 @@ impl NotificationManager {
             EventKind::ApprovalRequired { .. } => NotifyTrigger::ApprovalRequired,
             _ => return,
         };
+        /* UX-02-008 (ревизия 86): ночной прогон гоняет десятки раундов —
+        тост на каждый TurnComplete превратил бы Action Center в спам.
+        Ночью глушится только «готово» (ходовой шум); ошибки и вопросы
+        approval остаются: они редкие и их важно видеть. Итоговый отчёт
+        шлётся вручную одним тостом в конце прогона. */
+        if self.night_mode && matches!(trigger, NotifyTrigger::TurnComplete) {
+            return;
+        }
         let Some(action) = self.config.triggers.get(&trigger).cloned() else {
             return;
         };
-        self.execute_action(&action).await;
+        /* UX-02-003 (ревизия 86): тело тоста несёт живой контекст события
+        (причину падения, суть вопроса approval), а не только статичную
+        подпись из конфига. Раньше «ход завершился с ошибкой» без причины
+        заставляло идти смотреть в окно, хотя причина уже была в событии. */
+        let detail = match event {
+            EventKind::TurnEnded {
+                reason: Some(r), ..
+            } => Some(short_detail(r)),
+            EventKind::ApprovalRequired { summary, .. } => Some(short_detail(summary)),
+            _ => None,
+        };
+        self.execute_action(&action, detail.as_deref()).await;
+    }
+
+    /// Ночной режим (глушит TurnComplete): включается/выключается прогоном.
+    pub fn set_night_mode(&mut self, on: bool) {
+        self.night_mode = on;
+    }
+
+    /// Тост вручную (итоговый отчёт ночного прогона): без триггеров.
+    pub async fn notify_manual(&mut self, title: &str, body: &str) -> bool {
+        show_toast(title, body)
     }
 
     /// Выполнить действие уведомления.
     ///
     /// Возвращает итог проигрывания (None - звука в действии не было) и факт
-    /// показа toast: это нужно тесту триггера, обычный путь результат не читает.
-    async fn execute_action(&mut self, action: &NotifyAction) -> (Option<PlayOutcome>, bool) {
+    /// отправки toast в Action Center: это нужно тесту триггера, обычный путь
+    /// результат не читает. `detail` (UX-02-003) дописывается в тело тоста
+    /// второй строкой — живой контекст события рядом со статичной подписью.
+    async fn execute_action(
+        &mut self,
+        action: &NotifyAction,
+        detail: Option<&str>,
+    ) -> (Option<PlayOutcome>, bool) {
         match action {
             NotifyAction::Sound { source, volume } => {
                 (Some(self.play_sound(source, *volume).await), false)
             }
             NotifyAction::Toast { title, body } => {
-                show_toast(title, body);
-                (None, true)
+                let shown = show_toast(title, &with_detail(body, detail));
+                (None, shown)
             }
             NotifyAction::Both {
                 source,
@@ -304,8 +342,8 @@ impl NotificationManager {
                 body,
             } => {
                 let outcome = self.play_sound(source, *volume).await;
-                show_toast(title, body);
-                (Some(outcome), true)
+                let shown = show_toast(title, &with_detail(body, detail));
+                (Some(outcome), shown)
             }
         }
     }
@@ -370,12 +408,22 @@ impl NotificationManager {
         let master = self.config.master_volume.clamp(0.0, 1.0);
         let percent = (volume.clamp(0.0, 1.0) * master * 100.0).round();
 
-        let (play, toast) = self.execute_action(&action).await;
+        let (play, toast) = self.execute_action(&action, None).await;
         let outcome = match play {
             Some(PlayOutcome::Played) => "played",
             Some(PlayOutcome::NoDevice) => "no_device",
             Some(PlayOutcome::NoSound) => "no_sound",
-            None => "toast_only",
+            None => {
+                /* UX-02-010 (ревизия 86): «toast_only» раньше ставился и
+                когда тост провалился (headless, нет Action Center): кнопка
+                «Проверить» докладывала успех молча провалившемуся тосту.
+                Теперь исход честный в обе стороны. */
+                if toast {
+                    "toast_only"
+                } else {
+                    "toast_failed"
+                }
+            }
         };
 
         NotifyTestReport {
@@ -556,10 +604,12 @@ fn register_aumid() {
 /// Ревизия 85: прежний путь — MessageBoxW с MB_SYSTEMMODAL — вылезал
 /// модальным окном поверх всего и блокировал внимание; теперь нативный
 /// WinRT-тост: тихий, сворачивается в центр, не крадёт фокус.
-/// Ошибки (headless-сессия, отсутствие shell) — в stderr, процесс жив.
+/// Ревизия 86: возвращает факт отправки в Action Center — тест триггера
+/// обязан отличать «показан» от «провалился headless-сессией».
 #[cfg(windows)]
-fn show_toast(title: &str, body: &str) {
+fn show_toast(title: &str, body: &str) -> bool {
     let xml = build_toast_xml(title, body);
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
     std::thread::spawn(move || unsafe {
         // WinRT из этого потока: тост можно отправлять из MTA.
         let _ = windows::Win32::System::WinRT::RoInitialize(
@@ -576,6 +626,7 @@ fn show_toast(title: &str, body: &str) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("swagcod: toast XML не собрался: {e}");
+                let _ = tx.send(false);
                 return;
             }
         };
@@ -583,6 +634,7 @@ fn show_toast(title: &str, body: &str) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("swagcod: тост не создан: {e}");
+                let _ = tx.send(false);
                 return;
             }
         };
@@ -591,18 +643,53 @@ fn show_toast(title: &str, body: &str) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("swagcod: notifer недоступен (headless?): {e}");
+                    let _ = tx.send(false);
                     return;
                 }
             };
-        if let Err(e) = notifier.Show(&toast) {
-            eprintln!("swagcod: тост не показан: {e}");
-        }
+        let shown = match notifier.Show(&toast) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("swagcod: тост не показан: {e}");
+                false
+            }
+        };
+        let _ = tx.send(shown);
     });
+    // 400 мс: тост-вызов быстрый, но Show живёт в отдельном потоке WinRT.
+    matches!(
+        rx.recv_timeout(std::time::Duration::from_millis(400)),
+        Ok(true)
+    )
 }
 
 #[cfg(not(windows))]
-fn show_toast(_title: &str, _body: &str) {
+fn show_toast(_title: &str, _body: &str) -> bool {
     // На не-Windows платформах тост недоступен.
+    false
+}
+
+/* UX-02-003 (ревизия 86): контекст события в теле тоста — одна строка,
+переводы строк схлопнуты, обрезка подписана. */
+fn short_detail(s: &str) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    let mut out: String = flat.chars().take(140).collect();
+    let total = flat.chars().count();
+    if total > 140 {
+        out.push_str(&format!(" … [+{} симв.]", total - 140));
+    }
+    out
+}
+
+fn with_detail(body: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(d) if !d.trim().is_empty() => format!("{body}\n{d}"),
+        _ => body.to_string(),
+    }
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -726,6 +813,7 @@ mod tests {
             session: SessionId::new("s1"),
             ok: true,
             reason: None,
+            cost_usd: None,
         };
         mgr.handle_event(&event, false).await;
     }
@@ -742,6 +830,7 @@ mod tests {
             session: SessionId::new("s1"),
             ok: true,
             reason: None,
+            cost_usd: None,
         };
         mgr.handle_event(&event, true).await;
     }

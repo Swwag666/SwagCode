@@ -64,7 +64,10 @@ describe('ApprovalDialog: smoke', () => {
       diffHiddenLabel: STR.ru.diffHidden,
       onRespond: vi.fn(),
     })
-    expect(screen.getByTestId('dp-hidden').textContent).toBe(
+    /* Ревизия 86 (UX-03-007): в .dp-hidden рядом с подписью появилась
+       кнопка «показать все» — textContent уже не равен строке подписи
+       в точности, проверяем вхождением. */
+    expect(screen.getByTestId('dp-hidden').textContent).toContain(
       STR.ru.diffHidden.replace('{n}', '1'),
     )
     // Обрезка режет DOM, но не статистику: иначе «+601» превратилось бы в «+600».

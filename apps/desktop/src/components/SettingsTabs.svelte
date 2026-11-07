@@ -731,6 +731,10 @@
     modelSpecs: ModelSpec[]
     currentSpec: ModelSpec
     reloadModels: () => Promise<void>
+    /* UX-05-001 (ревизия 86): модель активного чата — то, на чём реально
+       ходят ходы сейчас; null — активного чата нет. */
+    activeChatModel: string | null
+    activeChatOverride: boolean
 
     /* ── провайдеры ── */
     provState: { active: string; providers: ProviderInfo[] } | null
@@ -748,6 +752,8 @@
     deleteProvider: (id: string) => Promise<void>
     fetchModels: (p: { id: string | null; label: string; base_url: string; flavor: string }, typedKey: string) => Promise<void>
     savePreview: () => Promise<void>
+    /* UX-05-002 (ревизия 86): ключ можно не только положить, но и забыть. */
+    forgetProviderKey: (id: string) => Promise<void>
 
     /* ── MCP-серверы ── */
     mcpServers: { name: string; command: string; args: string[]; enabled: boolean; state: string; tools: number }[]
@@ -802,6 +808,9 @@
     pickMemoryDir: () => Promise<void>
     exportMemoryFile: (text: string) => Promise<string | null>
     memoryExporting: boolean
+    /* UX-03-006 (ревизия 86): блокнот проекта .swagcod/MEMORY.md — только
+       текст для чтения; загружает его App по cwd активной сессии. */
+    memoryProject: string | null
 
     /* ── js-плагины ── */
     jsPlugTools: { name: string; description: string; file: string }[]
@@ -888,6 +897,8 @@
     modelSpecs,
     currentSpec,
     reloadModels,
+    activeChatModel = null,
+    activeChatOverride = false,
 
     /* провайдеры */
     provState,
@@ -905,6 +916,7 @@
     deleteProvider,
     fetchModels,
     savePreview,
+    forgetProviderKey,
 
     /* MCP-серверы */
     mcpServers,
@@ -952,6 +964,7 @@
     pickMemoryDir,
     exportMemoryFile,
     memoryExporting,
+    memoryProject,
 
     /* js-плагины */
     jsPlugTools,
@@ -965,13 +978,13 @@
 
 {#if showSettings}
   <div class="settings-overlay" onclick={() => (showSettings = false)} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }} role="presentation">
-    <div class="settings-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }} role="dialog" aria-label="настройки" tabindex="-1">
+    <div class="settings-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }} role="dialog" aria-label={t('settings')} tabindex="-1">
       <div class="settings-header">
         <h2>{t('settings')}</h2>
         <div class="settings-actions">
           <button class="settings-action-btn" onclick={openConfigFile}>{t('openConfigFile')}</button>
           <button class="settings-action-btn" onclick={exportDiagnostics}>{t('exportDiagnosticsBtn')}</button>
-          <button class="settings-close" onclick={() => (showSettings = false)} aria-label="закрыть"><Icon name="close" size={14} /></button>
+          <button class="settings-close" onclick={() => (showSettings = false)} aria-label={t('closeLabel')}><Icon name="close" size={14} /></button>
         </div>
       </div>
       <div class="settings-body">
@@ -1710,6 +1723,19 @@
             </div>
           {:else if settingsTab === 'models'}
             <div class="settings-section">
+              <!-- UX-05-001 (ревизия 86): вкладка моделей честно называет
+                   модель активного чата: глобальный селектор и карточки
+                   говорили только про дефолт, а чат мог ходить на
+                   per-session переопределении — человек менял модель и
+                   не видел эффекта. -->
+              {#if activeChatModel}
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{t('modelActiveChat')}</span>
+                    <span class="label-desc">{activeChatModel} · {activeChatOverride ? t('modelSessionOverride') : t('modelFromGlobal')}</span>
+                  </div>
+                </div>
+              {/if}
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('modelTitle')}</span>
@@ -1722,6 +1748,19 @@
                 </select>
                 <button class="appearance-btn" onclick={() => void reloadModels()} title={t('modelRefresh')}>{t('modelRefresh')}</button>
               </div>
+              {#if models.length === 0}
+                <!-- UX-05-007 (ревизия 86): пустой список — не тупик:
+                     кнопка перечитать прямо в пустом состоянии, а не
+                     только в строке селектора (селектор пустым выглядит
+                     как сломанный). -->
+                <div class="settings-row">
+                  <div class="settings-label">
+                    <span class="label-title">{t('noModels')}</span>
+                    <span class="label-desc">{t('noModelsHint')}</span>
+                  </div>
+                  <button class="appearance-btn" onclick={() => void reloadModels()}>{t('modelRefresh')}</button>
+                </div>
+              {/if}
               <div class="settings-row">
                 <div class="settings-label">
                   <span class="label-title">{t('tempAuto')}</span>
@@ -1785,16 +1824,23 @@
                   </div>
                   <div class="settings-row">
                     <div class="settings-label">
-                      {#if p.needs_key && !p.has_key}
+                      {#if p.needs_key}
                         <input
                           class="settings-number"
                           style="width:200px"
                           type="password"
                           value={provKeys[p.id] ?? ''}
                           oninput={(e) => (provKeys[p.id] = (e.target as HTMLInputElement).value)}
-                          placeholder={t('provKeyPh')}
-                          aria-label={t('provKeyPh')}
+                          placeholder={p.has_key ? t('provKeyReplacePh') : t('provKeyPh')}
+                          aria-label={p.has_key ? t('provKeyReplacePh') : t('provKeyPh')}
                         />
+                      {/if}
+                      {#if p.needs_key && p.has_key}
+                        <button
+                          class="appearance-btn"
+                          disabled={provBusy}
+                          onclick={() => void forgetProviderKey(p.id)}
+                        >{t('provKeyForget')}</button>
                       {/if}
                     </div>
                     {#if p.id !== provState.active}
@@ -1974,6 +2020,10 @@
                 onScope={setMemoryScope}
                 onAdd={(text) => void addMemory(text)}
                 onForget={(id) => void forgetMemory(id)}
+                projectLabel={t('memoryProject')}
+                projectHint={t('memoryProjectHint')}
+                projectNoneLabel={t('memoryProjectNone')}
+                projectMemory={memoryProject}
               />
             </div>
           {:else}

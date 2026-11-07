@@ -74,6 +74,12 @@ export class Transcript {
     this.push({ key: this.key('u'), kind: 'user', text, done: true, ts: Date.now() })
   }
 
+  /** Служебная строка, созданная локально (не через шину): судьба
+   *  вложений, локальные статусы. Ревизия 86, UX-04-005. */
+  addStatus(text: string): void {
+    this.push({ key: this.key('st'), kind: 'status', text, done: true, ts: Date.now() })
+  }
+
   /** Ход закончился: все его стримящиеся строки переводим в готовый вид.
       Без этого «ДУМАЕТ» продолжает мигать волной после ответа модели. */
   closeTurn(turn: string): void {
@@ -253,7 +259,22 @@ export class Transcript {
       case 'turn_ended': {
         this.closeStreaming(k.data.turn)
         if (!k.data.ok && k.data.reason) {
-          this.pushError(k.data.reason, k.data.turn, ev.ts_ms)
+          /* UX-04-002 (ревизия 86): штатная остановка — не ошибка.
+             Пользователь нажал «стоп» сам, а видел красный error-ряд с
+             мигающим треугольником в сайдбаре — ложная тревога на своё
+             же действие. Нейтральная статус-строка вместо error. */
+          if (k.data.reason === 'остановлено пользователем') {
+            this.push({
+              key: this.key('st'),
+              kind: 'status',
+              text: 'ход остановлен',
+              turn: k.data.turn,
+              done: true,
+              ts: ev.ts_ms,
+            })
+          } else {
+            this.pushError(k.data.reason, k.data.turn, ev.ts_ms)
+          }
         }
         return true
       }
@@ -326,15 +347,8 @@ export class Transcript {
     for (const it of this.items) it.done = true
   }
 
-  /** Ключи стримящихся (незавершённых) reasoning-элементов: пока модель
-      рассуждает, мысли видны целиком; на финише хода сворачиваются сами. */
-  liveReasoningKeys(): string[] {
-    const out: string[] = []
-    for (const it of this.items) {
-      if (it.kind === 'reasoning' && !it.done) out.push(it.key)
-    }
-    return out
-  }
+  /* Ревизия 86 (UX-зондаж): liveReasoningKeys удалён — вызовов не было,
+     свёртывание мыслей на финише хода делает closeTurn. */
 
   get length(): number {
     return this.items.length

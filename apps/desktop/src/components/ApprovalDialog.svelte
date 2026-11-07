@@ -22,6 +22,8 @@
     preview?: string
     /** Подпись обрезки diff ({n} — сколько строк не влезло в DOM). */
     diffHiddenLabel?: string
+    /** UX-03-007 (ревизия 86): кнопка раскрытия полной обрезки. */
+    diffExpandLabel?: string
     onRespond: (decision: 'approved' | 'denied') => void
   }
 
@@ -33,6 +35,7 @@
     denyLabel,
     preview = '',
     diffHiddenLabel = '',
+    diffExpandLabel = '',
     onRespond,
   }: Props = $props()
 </script>
@@ -47,7 +50,7 @@
     <pre class="approval-summary">{summary}</pre>
     {#if preview}
       <!-- Что именно произойдёт с файлом — до того как человек решит. -->
-      <DiffPreview text={preview} hiddenLabel={diffHiddenLabel} />
+      <DiffPreview text={preview} hiddenLabel={diffHiddenLabel} expandLabel={diffExpandLabel} />
     {/if}
     <div class="approval-actions">
       <button class="approval-btn deny" onclick={() => onRespond('denied')}>{denyLabel}</button>

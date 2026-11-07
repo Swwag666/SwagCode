@@ -15,9 +15,18 @@
     maxLines?: number
     /** Подпись под обрезанным списком ({n} — сколько строк не показано). */
     hiddenLabel?: string
+    /** UX-03-007 (ревизия 86): кнопка раскрытия полной обрезки. */
+    expandLabel?: string
   }
 
-  let { text, maxLines = 600, hiddenLabel = '' }: Props = $props()
+  let { text, maxLines = 600, hiddenLabel = '', expandLabel = '' }: Props = $props()
+
+  /* UX-03-007 (ревизия 86): обрезка диффа раскрывается, а не только
+     подписывается: «показаны не все строки» без кнопки заставлял
+     подтверждать изменения, которых не видно. Потолок 5000 строк —
+     защита DOM, но это на порядок больше стартовых 600. */
+  let expanded = $state(false)
+  const HARD_CAP = 5000
 
   type RowKind = 'add' | 'del' | 'ctx' | 'hunk'
   interface Row {
@@ -41,7 +50,7 @@
     })
   })
 
-  const shown = $derived(rows.slice(0, maxLines))
+  const shown = $derived(rows.slice(0, expanded ? Math.min(rows.length, HARD_CAP) : maxLines))
   const hidden = $derived(rows.length - shown.length)
   const adds = $derived(rows.filter((r) => r.kind === 'add').length)
   const dels = $derived(rows.filter((r) => r.kind === 'del').length)
@@ -63,7 +72,12 @@
       </div>
     {/each}
     {#if hidden > 0 && hiddenLabel}
-      <div class="dp-hidden" data-testid="dp-hidden">{hiddenLabel.replace('{n}', String(hidden))}</div>
+      <div class="dp-hidden" data-testid="dp-hidden">
+        {hiddenLabel.replace('{n}', String(hidden))}
+        {#if expandLabel}
+          <button type="button" class="dp-expand" onclick={() => (expanded = true)}>{expandLabel}</button>
+        {/if}
+      </div>
     {/if}
   </div>
 </div>
@@ -135,5 +149,23 @@
     color: var(--text-faint);
     font-size: 11px;
     border-top: 1px dashed var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .dp-expand {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--accent);
+    font-size: 11px;
+    font-family: inherit;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+
+  .dp-expand:hover {
+    border-color: var(--accent);
   }
 </style>

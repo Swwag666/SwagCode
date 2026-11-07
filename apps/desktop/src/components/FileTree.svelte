@@ -21,9 +21,19 @@
     /** Id сессии: песочница ядра привязана к cwd сессии, файловые команды ходят с ним. */
     sessionId: string
     onFileSelect?: (path: string, name: string) => void
+    /** UX-03-004 (ревизия 86): мягкое обновление вместо перемонтирования.
+     *  Раньше App держал {#key treeRefresh} — каждый file_changed убивал
+     *  дерево: раскрытые папки схлопывались, скролл уезжал вверх. Теперь
+     *  тик говорит «данные протухли»: раскрытые пути собираются, корень и
+     *  ровно они перечитываются, всё остальное состояние живёт. */
+    refreshTick?: number
+    /** UX-04-014 (ревизия 86): заголовок панели локализуется родителем
+     *  («файлы» / «files») — раньше здесь был остров русского текста в
+     *  английском интерфейсе. */
+    title?: string
   }
 
-  let { root, sessionId, onFileSelect }: Props = $props()
+  let { root, sessionId, onFileSelect, refreshTick = 0, title = 'файлы' }: Props = $props()
 
   let entries = $state<FileEntry[]>([])
   let loading = $state(false)
@@ -123,7 +133,8 @@
       if (entry.expanded && !entry.children) {
         entry.children = await loadDir(entry.path)
       }
-      // Триггерим реактивность
+      // Глубокая реактивность $state разносит мутацию по дереву; клон
+      // корня остаётся для миграции со старых версий рендера.
       entries = [...entries]
     } else {
       onFileSelect?.(entry.path, entry.name)
@@ -142,15 +153,90 @@
     }
   }
 
+  /** Раскрытые директории на текущий момент: обход вглубь. */
+  function collectExpanded(list: FileEntry[], acc: string[] = []): string[] {
+    for (const e of list) {
+      if (e.is_dir && e.expanded) {
+        acc.push(e.path)
+        if (e.children) collectExpanded(e.children, acc)
+      }
+    }
+    return acc
+  }
+
+  /** Мягкое обновление: корень и раскрытые папки перечитываются,
+   *  свёрнутое остаётся свёрнутым, скролл не трогается. */
+  async function softRefresh(): Promise<void> {
+    const expandedPaths = new Set(collectExpanded(entries))
+    const fresh = await loadDir(root)
+    for (const e of fresh) {
+      if (e.is_dir && expandedPaths.has(e.path)) {
+        e.expanded = true
+        e.children = await loadDir(e.path)
+        expandInto(e.children, expandedPaths)
+      }
+    }
+    entries = fresh
+  }
+
+  async function expandInto(list: FileEntry[], expandedPaths: Set<string>): Promise<void> {
+    for (const e of list) {
+      if (e.is_dir && expandedPaths.has(e.path)) {
+        e.expanded = true
+        e.children = await loadDir(e.path)
+        await expandInto(e.children, expandedPaths)
+      }
+    }
+  }
+
   // Загружаем при монтировании
   $effect(() => {
     if (root) loadRoot()
   })
+
+  // UX-03-004: тик обновления (file_changed) — без перемонтирования.
+  $effect(() => {
+    void refreshTick
+    if (refreshTick > 0 && root) void softRefresh()
+  })
 </script>
+
+<!-- UX-03-001 (ревизия 86): рекурсивный рендер. Раньше шаблон рисовал
+     только два уровня: внук кликался, стрелка вертелась, детей не было —
+     папки третьего уровня (apps/desktop/src в типичном проекте) выглядели
+     пустыми и были недостижимы. Сниппет рендерит узел любой глубины,
+     дети грузятся лениво, как раньше. -->
+{#snippet node(entry: FileEntry, depth: number)}
+  <div
+    class="tree-entry"
+    class:dir={entry.is_dir}
+    class:child={depth > 0}
+    style="padding-left: {12 + depth * 12}px"
+    onclick={() => toggle(entry)}
+    oncontextmenu={(e) => onContextMenu(e, entry)}
+    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(entry) } }}
+    role="treeitem"
+    tabindex="0"
+    aria-expanded={entry.is_dir ? entry.expanded : undefined}
+    aria-selected="false"
+  >
+    <span class="tree-icon" style="color: {entry.is_dir ? 'var(--accent)' : extColor(entry.name)}">
+      {icon(entry)}
+    </span>
+    <span class="tree-name">{entry.name}</span>
+  </div>
+  {#if entry.is_dir && entry.expanded && entry.children}
+    <div class="tree-children" role="group">
+      {#each entry.children as child (child.path)}
+        {@render node(child, depth + 1)}
+      {/each}
+    </div>
+  {/if}
+{/snippet}
 
 <div class="file-tree">
   <div class="tree-header">
-    <span class="tree-title">файлы</span>
+    <span class="tree-title">{title}</span>
     <span class="tree-root">{root.split(/[/\\]/).pop()}</span>
   </div>
   {#if loading}
@@ -160,42 +246,7 @@
   {:else}
     <div class="tree-entries">
       {#each entries as entry (entry.path)}
-        <div
-          class="tree-entry"
-          class:dir={entry.is_dir}
-          onclick={() => toggle(entry)}
-          oncontextmenu={(e) => onContextMenu(e, entry)}
-          onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(entry) } }}
-          role="treeitem"
-          tabindex="0"
-          aria-expanded={entry.is_dir ? entry.expanded : undefined}
-          aria-selected="false"
-        >
-          <span class="tree-icon" style="color: {entry.is_dir ? 'var(--accent)' : extColor(entry.name)}">
-            {icon(entry)}
-          </span>
-          <span class="tree-name">{entry.name}</span>
-        </div>
-        {#if entry.is_dir && entry.expanded && entry.children}
-          <div class="tree-children" role="group">
-            {#each entry.children as child (child.path)}
-              <div
-                class="tree-entry child"
-                class:dir={child.is_dir}
-                onclick={() => toggle(child)}
-                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(child) } }}
-                role="treeitem"
-                tabindex="0"
-                aria-selected="false"
-              >
-                <span class="tree-icon" style="color: {child.is_dir ? 'var(--accent)' : extColor(child.name)}">
-                  {icon(child)}
-                </span>
-                <span class="tree-name">{child.name}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
+        {@render node(entry, 0)}
       {/each}
     </div>
   {/if}

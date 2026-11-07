@@ -36,7 +36,9 @@
     setOrderMode: (m: 'manual' | 'updated') => void
     currentSession: string | null
     sessionRefreshTick: number
-    liveStates: Record<string, 'running' | 'ok' | 'fail'>
+    /* UX-04-002 (ревизия 86): 'neutral' — ход остановлен самим пользователем,
+       не поломка (нет ни зелёного ok, ни красного fail). */
+    liveStates: Record<string, 'running' | 'ok' | 'fail' | 'neutral'>
     switchSession: (id: string) => void
 
     /* ── рабочие области ── */
@@ -58,6 +60,10 @@
     tauriAvailable: boolean
     logNote: string
     showSettings: boolean
+    /* UX-01-014/UX-04-013 (ревизия 86): список сессий — язык и кнопка
+       «искать по тексту чатов» из пустого фильтра. */
+    lang: 'ru' | 'en'
+    onOpenSearch: () => void
   }
 
   /* Флаги, которые панель меняет сама, — $bindable: App видит новое значение
@@ -102,7 +108,16 @@
     tauriAvailable,
     logNote,
     showSettings = $bindable(),
+    lang,
+    onOpenSearch,
   }: Props = $props()
+
+  /* UX-01-011 (ревизия 86): фильтр при открытии сразу ловит фокус —
+     без лишнего клика в поле. */
+  let filterEl = $state<HTMLInputElement | null>(null)
+  $effect(() => {
+    if (sessionFilterOpen && filterEl) filterEl.focus()
+  })
 </script>
 
 <aside class="sidebar" aria-hidden={sidebarCollapsed}>
@@ -197,9 +212,13 @@
     {/if}
     {#if sessionFilterOpen}
       <div class="session-filter">
+        <!-- UX-01-011 (ревизия 86): фильтр сразу получает фокус — раньше
+             поле открытия фильтра требовало лишний клик в него. Через
+             $effect, а не атрибут autofocus (a11y). -->
         <input
           type="text"
           class="search-input"
+          bind:this={filterEl}
           placeholder={t('filterPlaceholder')}
           bind:value={sessionFilter}
           onkeydown={(e) => {
@@ -255,6 +274,8 @@
       orderMode={orderMode}
       filter={sessionFilter}
       onCreateIn={(cwd) => void createNewSession(cwd)}
+      onOpenSearch={onOpenSearch}
+      lang={lang}
     />
   </div>
 

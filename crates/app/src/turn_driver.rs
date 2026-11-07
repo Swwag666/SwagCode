@@ -95,6 +95,12 @@ pub(crate) async fn night_run_core(
     /* Прогон включает авто-коммит на своё время и снимает его на выходе -
     включая ранний по ошибке: guard живёт до конца функции. */
     let _commit_on = NightAutoCommitGuard::new();
+    /* UX-02-008 (ревизия 86): ночной режим уведомлений: ходовые «готово»
+    глушатся (десятки раундов = десятки тостов в Action Center), ошибки и
+    вопросы остаются. Итоговый отчёт пойдёт одним тостом в конце. */
+    if let Ok(mut n) = state.notifications.try_lock() {
+        n.set_night_mode(true);
+    }
     let mut stopped_by = String::new();
     while let swagcod_core::night::NightVerdict::Continue = swagcod_core::night::verdict(&plan, &ns)
     {
@@ -110,12 +116,56 @@ pub(crate) async fn night_run_core(
             stopped_by = reason;
             break;
         }
+        /* UX-02-004 (ревизия 86): ход «закончился» — это ещё не «сделался».
+        Раньше упавший раунд засчитывался как done и утренний отчёт был
+        слеп к падениям: владельцу утром «N раундов, $X», хотя половина
+        упала. Теперь исход хода читается по статусу сессии: Failed —
+        стоп с честной причиной, Cancelled — стоп (стоп-кнопка работает
+        и на прогон, а не только на текущий ход). */
+        {
+            let sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.iter().find(|s| s.id.to_string() == session_id) {
+                match s.status {
+                    swagcod_core::session::SessionStatus::Failed => {
+                        stopped_by = format!(
+                            "раунд {} завершился ошибкой — подробности в журнале сессии",
+                            ns.rounds_done + 1
+                        );
+                        break;
+                    }
+                    swagcod_core::session::SessionStatus::Cancelled => {
+                        stopped_by = "остановлено пользователем".to_string();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
         let cost = last_turn_cost(&state, before_ms);
         ns = ns.after_round(cost);
+    }
+    {
+        let mut n = state.notifications.lock().await;
+        n.set_night_mode(false);
     }
     let mut report = swagcod_core::night::morning_report(&plan, &ns);
     if !stopped_by.is_empty() {
         report.push_str(&format!("\nОстановлен досрочно: {stopped_by}."));
+    }
+    /* UX-02-002 (ревизия 86): отчёт доезжает до человека, даже если окно
+    приложения ему не принадлежало в момент финиша: один итоговый тост
+    (ходовые уже погашены ночным режимом) + строка в чат сессии. */
+    state.bus.publish(swagcod_core::bus::EventKind::Status {
+        message: report.clone(),
+    });
+    {
+        let mut n = state.notifications.lock().await;
+        let title = if stopped_by.is_empty() {
+            "SwagCod — ночной прогон завершён"
+        } else {
+            "SwagCod — ночной прогон остановлен"
+        };
+        let _ = n.notify_manual(title, &report).await;
     }
     Ok(report)
 }
@@ -207,6 +257,10 @@ struct TurnWriteJob {
     record: swagcod_core::session::TurnRecord,
     history: Vec<swagcod_provider::types::ChatMessage>,
     cost: Option<f64>,
+    /* UX-01-003 (ревизия 86): автозаголовок сессии пишется в store этим же
+    писателем — отдельный store.lock в финализаторе создавал deadlock с
+    занятым мьютексом (F-081-контракт: финал не ждёт store). */
+    title: Option<String>,
 }
 
 static TURN_WRITE_TX: std::sync::OnceLock<std::sync::mpsc::Sender<TurnWriteJob>> =
@@ -230,6 +284,9 @@ fn enqueue_turn_write(job: TurnWriteJob) {
 fn turn_write_loop(rx: std::sync::mpsc::Receiver<TurnWriteJob>) {
     while let Ok(job) = rx.recv() {
         if let Ok(store) = job.app.store.lock() {
+            if let Some(t) = &job.title {
+                let _ = store.set_session_title(&job.sid, t);
+            }
             if let Err(e) = store.save_turn(&job.sid, &job.record, &job.history) {
                 eprintln!("store: ход не записан: {e}");
             }
@@ -367,9 +424,26 @@ pub(crate) fn render_attachments(paths: &[String]) -> String {
             ext.as_str(),
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
         ) {
-            out.push_str(&format!(
-                "\n\n---\nВложение {name}: не прикреплено — картинки пока не поддерживаются (текстовый провайдер)."
-            ));
+            /* UX-04-005 (ревизия 86): png/jpg/jpeg/gif/webp до 5 МБ реально
+            уходят в запрос блоком image (image_attachments) — текст про
+            «картинки не поддерживаются» был враньём для модели и для
+            пользователя (реплика с ним сохранялась в журнал и всплывала
+            после перезагрузки). Теперь подпись говорит правду о судьбе
+            вложения. bmp/ico блоком не уходят — честный отказ. */
+            let meta = std::fs::metadata(p);
+            let note = if matches!(ext.as_str(), "bmp" | "ico") {
+                format!("не прикреплено — формат {ext} не поддерживается")
+            } else {
+                match meta {
+                    Err(_) => "не прикреплено — файл не найден".to_string(),
+                    Ok(m) if m.len() > IMAGE_MAX_BYTES => format!(
+                        "не прикреплено — больше {} МБ",
+                        IMAGE_MAX_BYTES / (1024 * 1024)
+                    ),
+                    Ok(_) => format!("картинка, ушла в запрос отдельным блоком ({ext})"),
+                }
+            };
+            out.push_str(&format!("\n\n---\nВложение {name}: {note}."));
             continue;
         }
         match std::fs::metadata(p) {
@@ -1427,9 +1501,39 @@ pub(crate) async fn start_turn_core(
         if let Some(reason) = fail_reason.clone() {
             record.failure = Some(reason);
         }
+        /* UX-01-003 (ревизия 86): автозаголовок для безымянной сессии из
+        первой реплики. Раньше сессии навсегда оставались «путём из cwd»: в
+        группе одной папки все строки назывались одинаково, различить
+        диалоги было невозможно. Пользовательское переименование
+        (rename_session) приоритетнее — этот путь трогает только пустой
+        title. Значение переживает sessions-блок: запись в store уходит
+        FIFO-писателем ниже. */
+        let mut auto_title: Option<String> = None;
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.id.to_string() == sid) {
+                if session.title.trim().is_empty() && session.turns.is_empty() {
+                    if let Some(first_user) = session
+                        .history
+                        .iter()
+                        .find(|m| m.role == swagcod_provider::types::Role::User)
+                    {
+                        let flat: String = first_user
+                            .content
+                            .chars()
+                            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                            .collect();
+                        let flat = flat.trim();
+                        let mut t: String = flat.chars().take(60).collect();
+                        if !t.is_empty() {
+                            if flat.chars().count() > 60 {
+                                t.push('…');
+                            }
+                            auto_title = Some(t.clone());
+                            session.title = t;
+                        }
+                    }
+                }
                 // История сессии — это история машины: assistant с tool_calls
                 // всегда закрыт ответами tool, следующий запрос валиден.
                 session.history = machine.history().to_vec();
@@ -1443,6 +1547,19 @@ pub(crate) async fn start_turn_core(
                 // D-121: сайдбар видит свежие счётчики без полной сессии.
                 if let Ok(mut m) = app_state.session_meta.lock() {
                     m.insert(sid.clone(), meta_of(session));
+                }
+                /* Автозаголовок: память сессии уже обновлена (title выше),
+                SessionRenamed уходит в шину сразу, а запись в store —
+                FIFO-писателем ниже (UX-01-003, ревизия 86): отдельный
+                store.lock() здесь ронял финализатор в deadlock с занятым
+                мьютексом (F-081: финал не ждёт store). */
+                if let Some(t) = auto_title.clone() {
+                    app_state
+                        .bus
+                        .publish(swagcod_core::bus::EventKind::SessionRenamed {
+                            session: swagcod_core::session::SessionId::new(sid.clone()),
+                            title: t,
+                        });
                 }
                 /* B-1: ход и снимок истории уходят в store одной транзакцией —
                 теперь ниже, после публикации финала (F-081): персистенция не
@@ -1477,6 +1594,9 @@ pub(crate) async fn start_turn_core(
             session: swagcod_core::SessionId::new(&sid),
             ok: outcome == TurnOutcome::Completed,
             reason,
+            /* UX-02-006 (ревизия 86): цена хода в финальном событии —
+            UI показывает её в шапке сразу, не дожидаясь телеметрии. */
+            cost_usd: turn_cost,
         });
 
         /* Персистенция хода (B-1: ход + снимок истории одной транзакцией)
@@ -1498,6 +1618,7 @@ pub(crate) async fn start_turn_core(
                 record: record.clone(),
                 history: snapshot,
                 cost: turn_cost,
+                title: auto_title,
             });
         }
         /* F-8: post_turn — после записи хода, поэтому хук видит полный
@@ -1581,6 +1702,8 @@ pub(crate) async fn stop_turn_core(state: &AppState, session_id: String) -> Resu
         session: swagcod_core::SessionId::new(&session_id),
         ok: false,
         reason: Some("остановлено пользователем".to_string()),
+        /* Прерванный ход цены не считал: токены обрезаны, счёт — враньё. */
+        cost_usd: None,
     });
     {
         let mut sessions = state.sessions.lock().await;

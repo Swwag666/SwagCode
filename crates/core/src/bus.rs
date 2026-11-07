@@ -64,6 +64,11 @@ pub enum EventKind {
         ok: bool,
         /// Причина незавершённости, если ход оборвался.
         reason: Option<String>,
+        /// UX-02-006 (ревизия 86): цена хода в долларах — ноль соврал бы
+        /// про бесплатный прогон, поэтому None значит «модель не в таблице
+        /// цен». Сериализация back-compatible: старые журналы читаются.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
     },
     /// Требуется подтверждение пользователя. Permission-решение живёт в ядре,
     /// а не в UI (DECISIONS.md §2) — UI только отображает запрос.
@@ -104,6 +109,14 @@ pub enum EventKind {
         session: SessionId,
         paths: Vec<String>,
     },
+    /// Ревизия 86 (UX-01-005): сессия удалена. Раньше фронт узнавал об
+    /// этом только по ошибке следующей отправки в призрачный чат: UI
+    /// держал удалённую сессию открытой с мёртвой историей. Событие
+    /// несёт id — активный чат обязан сброситься, сайдбар обновиться.
+    SessionDeleted { session: SessionId },
+    /// Ревизия 86 (UX-01-002): сессия переименована. Заголовок сайдбара
+    /// и шапка чата обновляются без полного reload списка.
+    SessionRenamed { session: SessionId, title: String },
 }
 
 /// Событие с монотонной меткой порядка.
@@ -362,6 +375,7 @@ mod tests {
                 session: sid(),
                 ok: true,
                 reason: None,
+                cost_usd: None,
             },
             EventKind::ApprovalRequired {
                 turn: tid(),

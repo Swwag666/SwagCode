@@ -32,6 +32,11 @@
     /** Запрос из поля ввода (уже с задержкой) — App ходит им в ядро. */
     onquery: (query: string) => void
     onpick: (hit: MessageHitDto) => void
+    /** UX-01-012 (ревизия 86): голый id сессии в поиске не даёт FTS-хитов —
+     *  поиск по словам не матчит идентификатор. Если запрос похож на id
+     *  известной сессии, App подсказывает её; клик открывает чат. */
+    suggestSession?: { id: string; title: string } | null
+    onOpenSession?: (id: string) => void
   }
 
   let {
@@ -43,6 +48,8 @@
     t,
     onquery,
     onpick,
+    suggestSession = null,
+    onOpenSession,
   }: Props = $props()
 
   let query = $state('')
@@ -179,6 +186,23 @@
             </button>
           </li>
         {/each}
+        {#if suggestSession && onOpenSession}
+          <!-- UX-01-012: запрос похож на id сессии — предложить сам чат,
+               поиск по словам его не найдёт. -->
+          <li>
+            <button
+              type="button"
+              class="hsearch-item hsearch-suggest"
+              onclick={() => onOpenSession(suggestSession.id)}
+            >
+              <span class="hsearch-where">
+                <span class="hsearch-role">session</span>
+                <span class="hsearch-ses">{hitTitle(suggestSession.title, suggestSession.id)}</span>
+              </span>
+              <span class="hsearch-snip">{t('searchIdHint')}</span>
+            </button>
+          </li>
+        {/if}
       </ul>
     </div>
   </div>
@@ -271,6 +295,12 @@
   .hsearch-item.sel {
     background: rgba(var(--accent-rgb), calc(0.1 * var(--glow-k)));
     border-left-color: var(--accent);
+  }
+  /* UX-01-012: подсказка «это id сессии» — визуально мягче хитов. */
+  .hsearch-suggest {
+    margin-top: 4px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
   }
   .hsearch-where {
     display: flex;

@@ -96,7 +96,8 @@ fn write_models_map(store: &dyn Store, map: &HashMap<String, Vec<String>>) -> Re
 
 /// Карта ключей `{id: ключ}` из DPAPI. Любая порча — пустая карта
 /// (громко в лог): лучше честный «нет ключа», чем падение настроек.
-fn read_keys_map(store: &dyn Store) -> HashMap<String, String> {
+/// Ревизия 86: pub(crate) — юнит-тест ревизии читает карту напрямую.
+pub(crate) fn read_keys_map(store: &dyn Store) -> HashMap<String, String> {
     let blob: String = match store.get_pref("provider_keys_dpapi").ok().flatten() {
         Some(b) if !b.trim().is_empty() => b,
         _ => return HashMap::new(),
@@ -260,8 +261,11 @@ pub fn build_chat_provider(state: &AppState) -> Result<AnyProvider, String> {
     }
     let (cfg, _) = resolve_active(state)?;
     if cfg.id == DEFAULT_PROVIDER_ID {
-        let router = Router::from_env_with_key(super::dpapi_key(state))
-            .map_err(|e| format!("провайдер: {e}"))?;
+        /* UX-05-001: префикс «провайдер:» больше не дублируется — его
+        ставит вызывающий (start_turn). Тройное «ошибка: провайдер:
+        провайдер: …» на первом запуске пугало без пользы. */
+        let router =
+            Router::from_env_with_key(super::dpapi_key(state)).map_err(|e| e.to_string())?;
         return Ok(AnyProvider::OpenAi(router));
     }
     if cfg.base_url.trim().is_empty() {
@@ -281,7 +285,7 @@ pub fn build_chat_provider(state: &AppState) -> Result<AnyProvider, String> {
             } else {
                 OpenAiProvider::new(&cfg.base_url, &cfg.key)
             }
-            .map_err(|e| format!("провайдер: {e}"))?;
+            .map_err(|e| e.to_string())?;
             let router = Router::new(vec![RouterEndpoint {
                 provider: p,
                 model: None,
@@ -302,7 +306,7 @@ pub fn build_chat_provider(state: &AppState) -> Result<AnyProvider, String> {
             } else {
                 AnthropicProvider::new(&cfg.base_url, &cfg.key)
             }
-            .map_err(|e| format!("провайдер: {e}"))?;
+            .map_err(|e| e.to_string())?;
             Ok(AnyProvider::Anthropic(p))
         }
     }
@@ -495,15 +499,40 @@ pub fn save_provider(
     key: Option<String>,
     models: Vec<String>,
 ) -> Result<String, String> {
+    save_provider_core(&state, id, label, base_url, flavor, key, models)
+}
+
+/// Ревизия 86: логика вынесена из Tauri-обёртки для юнит-тестов (UX-05-002).
+pub fn save_provider_core(
+    state: &AppState,
+    id: Option<String>,
+    label: String,
+    base_url: String,
+    flavor: String,
+    key: Option<String>,
+    models: Vec<String>,
+) -> Result<String, String> {
     let flavor =
         ProviderFlavor::parse(&flavor).ok_or_else(|| format!("неизвестный протокол «{flavor}»"))?;
     let base = base_url.trim().trim_end_matches('/').to_string();
-    if base.is_empty() {
-        return Err("пустой endpoint".into());
-    }
     let label = label.trim().to_string();
-    if label.is_empty() {
-        return Err("пустое название".into());
+    /* UX-05-002 (ревизия 86): фронт для пресетов шлёт base_url="" и
+    label="" — фетч шёл по конфигу каталога, ключ валиден, а сохранение
+    падало «пустой endpoint» ДО ветки пресета: ключ не попадал в DPAPI,
+    флоу из README был мёртв. Для пресета и default base/label не
+    пишутся вовсе (конфиг каталога не трогаем) — требовать их пустыми
+    нельзя. Валидация осталась для custom: и endpoint, и название. */
+    let is_preset = matches!(
+        id.as_deref().map(str::trim).unwrap_or(""),
+        s if s == DEFAULT_PROVIDER_ID || find_preset(s).is_some()
+    );
+    if !is_preset {
+        if base.is_empty() {
+            return Err("пустой endpoint".into());
+        }
+        if label.is_empty() {
+            return Err("пустое название".into());
+        }
     }
     let models: Vec<String> = models
         .into_iter()
@@ -585,6 +614,23 @@ pub fn delete_provider(state: State<'_, Arc<AppState>>, id: String) -> Result<()
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Забыть ключ провайдера (UX-05-002, ревизия 86). Пресет остаётся в
+/// списке, но `has_key` становится false и ход требует новый ключ (или
+/// `.env`). Замена ключа идёт обычным `save_provider` с непустым ключом.
+/// Возвращает true, если ключ был и удалён.
+#[tauri::command]
+pub fn forget_provider_key(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+    let id = id.trim().to_string();
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store: &dyn Store = &**store;
+    let mut keys = read_keys_map(store);
+    let existed = keys.remove(&id).is_some();
+    if existed {
+        write_keys_map(store, &keys)?;
+    }
+    Ok(existed)
 }
 
 /// Выбрать активного провайдера для ходов и списка моделей.

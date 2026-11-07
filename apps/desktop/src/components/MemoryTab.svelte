@@ -73,6 +73,13 @@
     onScope: (scope: MemoryScope) => void
     onAdd: (text: string) => void
     onForget: (id: number) => void
+    /** UX-03-006 (ревизия 86): четвёртая область — блокнот проекта
+     *  `.swagcod/MEMORY.md` рабочей папки. Текст read-only: агент пишет
+     *  его инструментом memory_add; здесь это видно и читается. */
+    projectLabel?: string
+    projectHint?: string
+    projectNoneLabel?: string
+    projectMemory?: string | null
   }
 
   let {
@@ -113,6 +120,10 @@
     onScope,
     onAdd,
     onForget,
+    projectLabel = '',
+    projectHint = '',
+    projectNoneLabel = '',
+    projectMemory = null,
   }: Props = $props()
 
   let draft = $state('')
@@ -284,6 +295,22 @@
 
   {#if status}<p class="mem-status" data-testid="memory-status">{status}</p>{/if}
 
+  {#if projectLabel}
+    <!-- UX-03-006 (ревизия 86): блокнот проекта — то, что агент реально
+         подкладывает в промпт каждого хода (.swagcod/MEMORY.md). Раньше
+         вкладка молчала о нём: агент «помнил» факты, которых человек в
+         интерфейсе не видел. -->
+    <div class="mem-project" data-testid="memory-project">
+      <span class="mem-project-label">{projectLabel}</span>
+      {#if projectMemory && projectMemory.trim().length > 0}
+        <pre class="mem-project-text">{projectMemory}</pre>
+      {:else}
+        <p class="mem-empty">{projectNoneLabel}</p>
+      {/if}
+      {#if projectHint}<p class="mem-hint">{projectHint}</p>{/if}
+    </div>
+  {/if}
+
   {#if items.length === 0}
     <p class="mem-empty" data-testid="memory-empty">{emptyLabel}</p>
   {:else}
@@ -331,6 +358,35 @@
   .memory-tab h3 {
     margin: 0;
     font-size: 15px;
+  }
+
+  /* UX-03-006: блокнот проекта — read-only текст в моно-шрифте. */
+  .mem-project {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mem-project-label {
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .mem-project-text {
+    margin: 0;
+    white-space: pre-wrap;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text);
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    max-height: 30vh;
+    overflow-y: auto;
   }
   .mem-desc {
     margin: 0;

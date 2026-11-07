@@ -31,6 +31,15 @@
         истории). По нему список принудительно уезжает к низу: scrollTop
         иначе переживает смену сессии и новый чат открывается с дырой. */
     scrollNonce?: number
+    /** UX-01-006 (ревизия 86): якорь перемотки из полнотекстового поиска.
+        Текст из сниппета находки: список находит строку включением,
+        доехать к ней скроллом и мигнуть подсветкой. После сработки якорь
+        гасится (bindable), чтобы повторный поиск того же текста снова
+        триггернул эффект. */
+    scrollToText?: string | null
+    /** UX-04-014 (ревизия 86): метки строк (user/agent/…), локализованные
+        родителем; ключи совпадают с kind транскрипта. */
+    labels?: Record<string, string>
   }
 
   let {
@@ -41,6 +50,8 @@
     onToggleBookmark,
     showThoughts = 'live',
     scrollNonce = 0,
+    scrollToText = $bindable(null),
+    labels = {},
   }: Props = $props()
 
   let scroller: HTMLDivElement | undefined = $state()
@@ -52,6 +63,36 @@
      список принудительно встаёт на самый низ и возвращает прилипание.
      Старый scrollTop прошлой сессии иначе открывает новый чат «с дырой». */
   let pendingBottom = $state(true)
+
+  /* UX-01-006: строка, найденная поиском — мигает после прыжка. */
+  let highlightKey = $state<string | null>(null)
+
+  /* UX-01-006 (ревизия 86): прыжок к найденному сообщению. Высоты
+     нерендеренных строк — из кэша или оценки: для позиционирования
+     хватает, вторая попытка через 350 мс ловит уточнённые высоты. */
+  $effect(() => {
+    const anchor = scrollToText
+    if (!anchor) return
+    void revision
+    const frag = anchor.length > 60 ? anchor.slice(0, 60) : anchor
+    const idx = items.findIndex((it) => it.text && it.text.includes(frag))
+    if (idx < 0) return
+    void tick().then(() => {
+      let top = 0
+      for (let i = 0; i < idx; i++) {
+        top += heights.get(items[i].key) ?? ESTIMATED_ITEM_HEIGHT
+      }
+      if (scroller) {
+        stickToBottom = false
+        scroller.scrollTop = Math.max(0, top - viewportHeight / 3)
+      }
+      highlightKey = items[idx].key
+      scrollToText = null
+      setTimeout(() => {
+        if (highlightKey === items[idx]?.key) highlightKey = null
+      }, 2500)
+    })
+  })
 
   $effect(() => {
     void scrollNonce
@@ -229,24 +270,10 @@
   }
 
   function labelOf(kind: string): string {
-    switch (kind) {
-      case 'user':
-        return 'вы'
-      case 'assistant':
-        return 'агент'
-      case 'reasoning':
-        return 'думает'
-      case 'tool_call':
-        return 'вызов'
-      case 'tool_result':
-        return 'результат'
-      case 'approval':
-        return 'подтвердите'
-      case 'error':
-        return 'ошибка'
-      default:
-        return 'статус'
-    }
+    /* UX-04-014 (ревизия 86): метки строк локализуются родителем
+       (проп labels): раньше здесь был остров русского текста, который
+       английский интерфейс показывал вперемешку. */
+    return labels[kind] ?? kind
   }
 
   /* Разворот одного сообщения на весь экран: его можно растянуть и читать
@@ -283,6 +310,21 @@
   }
   function readerZoomReset(): void {
     readerScale = 1
+  }
+
+  /** UX-04-001 (ревизия 86): копия текста строки/ридера с отзывом на самой
+      кнопке — тот же паттерн, что у data-copy код-блоков. */
+  function copyItemText(item: TranscriptItem, btn: HTMLElement | null): void {
+    const text = item.text || ''
+    if (!text) return
+    navigator.clipboard.writeText(text).then(() => {
+      if (!btn) return
+      const prev = btn.getAttribute('title')
+      btn.setAttribute('title', 'скопировано')
+      setTimeout(() => { if (prev) btn.setAttribute('title', prev) }, 1500)
+      btn.classList.add('copied')
+      setTimeout(() => btn.classList.remove('copied'), 1500)
+    })
   }
 
   $effect(() => {
@@ -376,6 +418,7 @@
       <div
         class="row row-{item.kind}"
         class:row-failed={item.ok === false}
+        class:row-hit={item.key === highlightKey}
         use:trackRow={item.key}
         data-key={item.key}
       >
@@ -423,6 +466,18 @@
             title="развернуть на весь экран"
             aria-label="развернуть на весь экран">
             <Icon name="expand" size={13} />
+          </button>
+          <!-- UX-04-001 (ревизия 86): копия всей строки — текст реплики,
+               ответа или результата тулза. Раньше скопировать можно было
+               только код-блок внутри markdown: обычный текст ответа
+               выделялся мышью по виртуализированному списку, где выделение
+               сбрасывается при перерисовке. -->
+          <button
+            class="expand-btn copy-row-btn"
+            onclick={(e) => copyItemText(item, e.currentTarget)}
+            title="копировать текст"
+            aria-label="копировать текст">
+            <Icon name="clipboard" size={13} />
           </button>
         </div>
         <!-- Мысли видны ЖИВЬЁМ, пока модель рассуждает (стрим не завершён):
@@ -481,6 +536,7 @@
         {#if expanded.tool}<span class="tool">{expanded.tool}</span>{/if}
         {#if expanded.elapsedMs !== undefined}<span class="elapsed">{expanded.elapsedMs} мс</span>{/if}
         <div class="reader-tools">
+          <button class="reader-btn reader-copy" onclick={() => copyItemText(expanded!, null)} title="копировать текст" aria-label="копировать текст"><Icon name="clipboard" size={12} /></button>
           <button class="reader-btn" onclick={readerZoomOut} aria-label="уменьшить">−</button>
           <button class="reader-btn reader-value" onclick={readerZoomReset} title="сбросить">{Math.round(readerScale * 100)}%</button>
           <button class="reader-btn" onclick={readerZoomIn} aria-label="увеличить">+</button>
@@ -796,6 +852,22 @@
     color: var(--accent);
     transform: scale(1.2);
     text-shadow: 0 0 8px var(--accent-glow);
+  }
+
+  /* Ревизия 86: подтверждение копии строки цветом. */
+  .copy-row-btn.copied {
+    color: var(--ok);
+    opacity: 1;
+  }
+
+  /* UX-01-006: строка, найденная поиском, мигает после прыжка. */
+  .row-hit {
+    animation: row-hit-flash 2.5s ease-out 1;
+  }
+
+  @keyframes row-hit-flash {
+    0% { background: var(--accent-glow, rgba(122, 162, 247, 0.25)); }
+    100% { background: transparent; }
   }
 
   .tool {

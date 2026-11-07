@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
-import { renderMarkdown, renderStreaming } from './markdown'
+import { renderMarkdown } from './markdown'
 
 describe('renderMarkdown: санитизация вывода модели', () => {
   it('вырезает script и inline-обработчики', () => {
@@ -27,12 +27,12 @@ describe('renderMarkdown: санитизация вывода модели', () 
     expect(html).toContain('https://example.com')
     expect(html).toContain('пункт')
   })
-})
 
-describe('renderStreaming: стрим без парсинга', () => {
-  it('экранирует разметку в сыром тексте', () => {
-    const html = renderStreaming('<b>не html</b>')
-    expect(html).not.toContain('<b>')
-    expect(html).toContain('&lt;b&gt;')
+  /* UX-04-001 (ревизия 86): голый ``` без языка — тоже код-блок с кнопкой. */
+  it('голый код-блок получает кнопку копирования и подсветку', () => {
+    const html = renderMarkdown('```\ngit status\n```')
+    expect(html).toContain('code-block-wrap')
+    expect(html).toContain('data-copy')
+    expect(html).toContain('git status')
   })
 })

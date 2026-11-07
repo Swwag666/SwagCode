@@ -164,9 +164,9 @@ impl AnthropicProvider {
                 let text = resp.text().await.unwrap_or_default();
                 let msg =
                     anthropic_error_text(&text).unwrap_or_else(|| text.chars().take(300).collect());
-                let _ = tx
-                    .send(StreamEvent::Error(format!("anthropic {status}: {msg}")))
-                    .await;
+                /* UX-05-004 (ревизия 86): причина словами + детали провайдера. */
+                let hint = crate::http::status_hint_public(status.as_u16(), "anthropic");
+                let _ = tx.send(StreamEvent::Error(format!("{hint}: {msg}"))).await;
                 return;
             }
 
