@@ -1805,7 +1805,10 @@ mod tests {
             &cwd,
         )
         .await;
-        eprintln!("[probe] bash echo юникод (powershell utf8) → {:?}", out.output);
+        eprintln!(
+            "[probe] bash echo юникод (powershell utf8) → {:?}",
+            out.output
+        );
         assert!(
             out.output.contains("Кривые-Руки-Тест"),
             "кириллица в stdout обязана декодироваться: {out:?}"
