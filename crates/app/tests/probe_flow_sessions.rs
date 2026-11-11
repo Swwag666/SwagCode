@@ -1010,13 +1010,27 @@ async fn finding_immediate_turn_after_final_is_rejected() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Ход проходит и завершается — сессия здорова.
-    start_turn(port, &sid, "второй после гонки").await;
-    await_turn_ends(&mut sse, &[(&sid, 1)], "ход после гонки").await;
+    // Ход «сразу после финала» завершён — дождаться его финала и
+    // зафиксировать ответ ДО запуска следующего хода. Ревизия 86:
+    // прежний порядок (запустить второй ход, дождаться, потом смотреть
+    // транскрипт) делал «последний контент» зависимым от гонки «успел
+    // ли второй ход дописать свой»: в release на быстрой машине успевал,
+    // и assert ждал чужой текст.
+    await_turn_ends(&mut sse, &[(&sid, 1)], "сразу после финала").await;
     let snap = transcript(port, &sid).await;
     assert_turn_blocks(&snap, "после гонки");
     assert_eq!(
         content_texts(&snap).last().copied().unwrap_or_default(),
         "эхо: сразу после финала"
+    );
+
+    // Ход проходит и завершается — сессия здорова.
+    start_turn(port, &sid, "второй после гонки").await;
+    await_turn_ends(&mut sse, &[(&sid, 1)], "ход после гонки").await;
+    let snap = transcript(port, &sid).await;
+    assert_turn_blocks(&snap, "финал после гонки");
+    assert_eq!(
+        content_texts(&snap).last().copied().unwrap_or_default(),
+        "эхо: второй после гонки"
     );
 }
