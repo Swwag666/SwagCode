@@ -49,28 +49,12 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
-      - name: clumsy fetch (диагностика AV rev86)
-        run: cargo test -p swagcod-app --lib clumsy_fetch_url_host -- --nocapture --test-threads=1
-
       - name: clippy
         # -D warnings: предупреждения не должны накапливаться молча.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: notify toast only (диагностика AV rev86)
-        run: cargo test -p swagcod-app --lib test_trigger_toast_only -- --nocapture --test-threads=1
-
-      - name: notify sound+toast (диагностика AV rev86)
-        run: cargo test -p swagcod-app --lib test_trigger_reports_sound -- --nocapture --test-threads=1
-
-      - name: notify все 4 параллельно (диагностика AV rev86)
-        run: cargo test -p swagcod-app --lib test_trigger -- --nocapture
-
       - name: test (headless, без Tauri-окна)
-        # --no-capture (ревизия 86, диагностика CI-only падения clumsy_bash):
-        # [probe]-строки попадают в лог сразу, AV-краш не съедает captured
-        # stdout падающего теста. --test-threads=1: последовательный порядок
-        # называет тест, умирающий AV-крашем, по последней напечатанной строке.
-        run: cargo test --workspace -- --no-capture --test-threads=1
+        run: cargo test --workspace
 
       - name: test release profile
         # Бенчи и проверки производительности имеют смысл только в release.

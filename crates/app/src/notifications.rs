@@ -372,12 +372,9 @@ impl NotificationManager {
         };
 
         // Играем через rodio.
-        eprintln!("[diag] sound: до get_audio_handle");
         let Some(handle) = get_audio_handle() else {
-            eprintln!("[diag] sound: аудиовыход недоступен");
             return PlayOutcome::NoDevice;
         };
-        eprintln!("[diag] sound: handle получен");
         let buffer = rodio::buffer::SamplesBuffer::new(
             decoded.channels,
             decoded.sample_rate,
@@ -610,67 +607,115 @@ fn register_aumid() {
 /// Ревизия 86: возвращает факт отправки в Action Center — тест триггера
 /// обязан отличать «показан» от «провалился headless-сессией».
 #[cfg(windows)]
+#[cfg(windows)]
+struct ToastWorker {
+    tx: std::sync::mpsc::Sender<ToastRequest>,
+}
+
+#[cfg(windows)]
+struct ToastRequest {
+    xml: String,
+    reply: std::sync::mpsc::Sender<bool>,
+}
+
+/// Показать системное уведомление в Action Center (тост сбоку экрана).
+///
+/// Ревизия 85: прежний путь — MessageBoxW с MB_SYSTEMMODAL — вылезал
+/// модальным окном поверх всего и блокировал внимание; теперь нативный
+/// WinRT-тост: тихий, сворачивается в центр, не крадёт фокус.
+/// Ревизия 86: тосты обслуживает ОДИН стационарный MTA-поток на процесс.
+/// Прежний «поток на каждый тост» на CI-раннере падал AV при повторной
+/// активации XmlDocument после инициализации аудио-стека в основном
+/// потоке (cpal CoInitializeEx меняет апартаменты COM процесса): второй
+/// RoGetActivationFactory в свежем потоке уходил в 0xC0000005.
+/// Стационарный поток инициализирует WinRT ровно один раз и живёт до
+/// конца процесса — штатный паттерн для WinRT-фоновых уведомлений.
+#[cfg(windows)]
 fn show_toast(title: &str, body: &str) -> bool {
+    use std::sync::mpsc;
     let xml = build_toast_xml(title, body);
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::spawn(move || unsafe {
-        // WinRT из этого потока: тост можно отправлять из MTA.
-        eprintln!("[diag] toast: поток стартовал");
-        let _ = windows::Win32::System::WinRT::RoInitialize(
-            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
-        );
-        eprintln!("[diag] toast: RoInitialize прошёл");
-        register_aumid();
-        eprintln!("[diag] toast: aumid зарегистрирован");
-        use windows::core::HSTRING;
-        use windows::Data::Xml::Dom::XmlDocument;
-        use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
-        let doc = match XmlDocument::new().and_then(|d| {
-            d.LoadXml(&HSTRING::from(&xml))?;
-            Ok(d)
-        }) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("swagcod: toast XML не собрался: {e}");
-                let _ = tx.send(false);
-                return;
-            }
-        };
-        eprintln!("[diag] toast: XML загружен");
-        let toast = match ToastNotification::CreateToastNotification(&doc) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("swagcod: тост не создан: {e}");
-                let _ = tx.send(false);
-                return;
-            }
-        };
-        eprintln!("[diag] toast: уведомление создано");
-        let notifier =
-            match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("swagcod: notifer недоступен (headless?): {e}");
-                    let _ = tx.send(false);
-                    return;
-                }
-            };
-        eprintln!("[diag] toast: notifier получен");
-        let shown = match notifier.Show(&toast) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("swagcod: тост не показан: {e}");
-                false
-            }
-        };
-        eprintln!("[diag] toast: Show завершён, shown={shown}");
-        let _ = tx.send(shown);
-    });
-    // 400 мс: тост-вызов быстрый, но Show живёт в отдельном потоке WinRT.
+    let worker = toast_worker();
+    let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+    if worker
+        .tx
+        .send(ToastRequest {
+            xml,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // 400 мс: тост-вызов быстрый, но живёт в стационарном потоке WinRT.
     matches!(
-        rx.recv_timeout(std::time::Duration::from_millis(400)),
+        reply_rx.recv_timeout(std::time::Duration::from_millis(400)),
         Ok(true)
     )
+}
+
+/// Стационарный тост-поток: единожды RoInitialize(MTA), дальше цикл
+/// запросов. Паника внутри потока не уносит процесс: канал закрывается,
+/// следующие show_toast честно возвращают false.
+#[cfg(windows)]
+fn toast_worker() -> &'static ToastWorker {
+    static WORKER: std::sync::OnceLock<ToastWorker> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<ToastRequest>();
+        std::thread::Builder::new()
+            .name("swagcod-toast".into())
+            .spawn(move || unsafe {
+                // WinRT из этого потока: тост можно отправлять из MTA.
+                // Один раз на процесс — см. доку show_toast.
+                let _ = windows::Win32::System::WinRT::RoInitialize(
+                    windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+                );
+                register_aumid();
+                use windows::core::HSTRING;
+                use windows::Data::Xml::Dom::XmlDocument;
+                use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+                for req in rx {
+                    let shown = (|| -> bool {
+                        let doc = match XmlDocument::new().and_then(|d| {
+                            d.LoadXml(&HSTRING::from(&req.xml))?;
+                            Ok(d)
+                        }) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("swagcod: toast XML не собрался: {e}");
+                                return false;
+                            }
+                        };
+                        let toast = match ToastNotification::CreateToastNotification(&doc) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("swagcod: тост не создан: {e}");
+                                return false;
+                            }
+                        };
+                        let notifier = match ToastNotificationManager::CreateToastNotifierWithId(
+                            &HSTRING::from(AUMID),
+                        ) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                eprintln!("swagcod: notifer недоступен (headless?): {e}");
+                                return false;
+                            }
+                        };
+                        match notifier.Show(&toast) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("swagcod: тост не показан: {e}");
+                                false
+                            }
+                        }
+                    })();
+                    let _ = req.reply.send(shown);
+                }
+            })
+            .expect("тост-поток не создан");
+        ToastWorker { tx }
+    })
 }
 
 #[cfg(not(windows))]
