@@ -12,8 +12,9 @@
  *
  * Каждый плагин — файл plugins/*.js — исполняется в собственном
  * vm-контексте: на загрузку 5 с, на вызов handler — timeout_ms
- * (синхронный код vm убивает по дедлайну; асинхронные handler в v1 не
- * поддерживаются — «плагин обязан отвечать в дедлайн» гарантируется).
+ * (синхронный код vm убивает по дедлайну; async-хендлеры ревизии 85
+ * дожидаются того же дедлайна). Завершение (shutdown/close stdin)
+ * дожидается исходящих call-ответов — ревизия 86.
  * Мост к хранилищу: только read-only API prefs (не сессий — приватность).
  * В stdout — ТОЛЬКО строки протокола: console плагина перехватывается в
  * буфер и возвращается в output.
@@ -180,7 +181,7 @@ function doLoad(params) {
 /* Ревизия 85, из зондажа «пацаны»: handler в JS по умолчанию пишут async —
 прежде Promise от runInContext проходил как «объект» и сериализовался
 в "{}": плагин «работал», результат молча проглывался. Теперь thenable
-дожидается с тем же дедлайном; таймаут async-части — честная ошибка.
+дождётся с тем же дедлайном; таймаут async-части — честная ошибка.
 Вызов стал асинхронным: ответ уходит по завершении, родитель ждёт по id. */
 async function doCall(params) {
   const name = String((params && params.name) || '');
@@ -232,6 +233,43 @@ async function doCall(params) {
   }
 }
 
+/* Ревизия 86 (фикс регресса 85): call асинхронный, и завершение обязано
+дожидаться его ответа. Раньше shutdown (и close stdin) делали exit(0)
+сразу — при pipelined-очереди load/call/shutdown микротаска call.then
+не успевала отправить ответ: клиент терял id 2 молча. Счётчик исходящих
+вызовов + отложенный bye закрывают это; сиротский потолок —
+MAX_CALL_TIMEOUT_MS + 5 c, чтобы зависший плагин не оставлял процесс
+навсегда. */
+let inflightCalls = 0;
+let pendingShutdownId = null;
+let stdinClosed = false;
+let orphanGuard = null;
+
+function exitNow() {
+  try {
+    if (prefsDb) prefsDb.close();
+  } catch (_) {}
+  process.exit(0);
+}
+
+function armOrphanGuard() {
+  if (orphanGuard) return;
+  orphanGuard = setTimeout(exitNow, MAX_CALL_TIMEOUT_MS + 5000);
+  if (typeof orphanGuard.unref === 'function') orphanGuard.unref();
+}
+
+function tryFinish() {
+  if (inflightCalls > 0) return;
+  if (pendingShutdownId !== null) {
+    const id = pendingShutdownId;
+    pendingShutdownId = null;
+    send({ jsonrpc: '2.0', id, result: { bye: true } });
+    exitNow();
+    return;
+  }
+  if (stdinClosed) exitNow();
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   let m;
@@ -260,20 +298,22 @@ rl.on('line', (line) => {
       case 'call':
         /* Ревизия 85: call — единственный асинхронный метод (async-хендлеры
         плагинов дожидаются микротасками). Ответ уходит по завершении;
-        общий send в хвосте switch для call пропускается. */
+        ревизия 86: исходящие вызовы считаются, завершение их не убивает. */
+        inflightCalls++;
+        armOrphanGuard();
         doCall(m.params || {})
           .then((r) => send({ jsonrpc: '2.0', id: m.id, result: r }))
           .catch((e) =>
             send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: String((e && e.message) || e) } })
-          );
+          )
+          .then(() => {
+            inflightCalls--;
+            tryFinish();
+          });
         return;
       case 'shutdown':
-        result = { bye: true };
-        send({ jsonrpc: '2.0', id: m.id, result });
-        try {
-          if (prefsDb) prefsDb.close();
-        } catch (_) {}
-        process.exit(0);
+        pendingShutdownId = m.id;
+        tryFinish();
         return;
       default:
         error = { code: -32601, message: 'неизвестный метод: ' + String(m.method) };
@@ -283,5 +323,14 @@ rl.on('line', (line) => {
   }
   send(error ? { jsonrpc: '2.0', id: m.id, error } : { jsonrpc: '2.0', id: m.id, result });
 });
-/* stdin закрыт — приложение ушло: sidecar не должен жить сиротой. */
-rl.on('close', () => process.exit(0));
+/* stdin закрыт — приложение ушло: sidecar не должен жить сиротой.
+Ревизия 86: если в момент close исходят call-ответы, сначала они,
+потом выход (с сиротским потолком на зависший плагин). */
+rl.on('close', () => {
+  stdinClosed = true;
+  if (inflightCalls > 0) {
+    armOrphanGuard();
+    return;
+  }
+  exitNow();
+});

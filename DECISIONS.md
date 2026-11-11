@@ -7321,8 +7321,24 @@ renderStreaming (markdown) мёртв — удалён.
 запаса сохранена). Порог поднимается явно с обоснованием — правило
 README соблюдено; бенч старта не перемерялся (не в объёме ревизии).
 
+**D-403. Регресс ревизии 85 в plugin-server, пойман релизным
+self-check'ом.** Call стал асинхронным (thenable-хендлеры, ответ «по
+завершении»), но shutdown и close stdin продолжали звать exit(0)
+немедленно: при pipelined-очереди load/call/shutdown (нормальный паттерн
+newline-JSON-RPC) микротаска отправки ответа не успевала — клиент терял
+id 2 молча. Релизный workflow v0.4.0 упал на шаге bundle-sidecar
+(«vendor plugin-server.js did not read prefs», output пуст), тот же
+self-check воспроизвёл падение локально. Фикс: счётчик исходящих вызовов
+— shutdown при живых вызовах откладывает bye до их отправки, close stdin
+ждёт их же; сиротский потолок MAX_CALL_TIMEOUT_MS + 5 с гарантирует
+выход при зависшем плагине. Self-check зелёный (pref=7), рабочие
+клиенты (Rust run_js_call) получили строго лучшее поведение — ответы
+pipelined-вызовов не теряются.
+
 **Гейты rev86:** clippy 0 (`-D warnings`), fmt чисто, cargo test
 --workspace 794 passed / 0 failed / 1 ignored (включая F-081-репро на
 deadlock D-400), vitest 199 passed, svelte-check 0 errors/warnings,
-`node tools/probe-store-sidecar.js` — 56 кейсов, «находок нет».
-probe-ux/ — артефакты агентов, в git не идут.
+`node tools/probe-store-sidecar.js` — 56 кейсов, «находок нет»,
+`tools/bundle-sidecar.ps1` self-check — prefs-мост через
+plugin-server принят (D-403). probe-ux/ — артефакты агентов, в git не
+идут.
