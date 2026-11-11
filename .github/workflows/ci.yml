@@ -54,7 +54,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test (headless, без Tauri-окна)
-        run: cargo test --workspace
+        # --no-capture (ревизия 86, диагностика CI-only падения clumsy_bash):
+        # [probe]-строки попадают в лог сразу, AV-краш не съедает captured
+        # stdout падающего теста.
+        run: cargo test --workspace -- --no-capture
 
       - name: test release profile
         # Бенчи и проверки производительности имеют смысл только в release.
