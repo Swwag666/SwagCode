@@ -590,8 +590,18 @@ async fn flow_running_session_rejects_second_turn_without_parallelism() {
     std::fs::write(cwd.join("note.txt"), b"base").unwrap();
     let sid = create_session(port, &cwd, None).await;
 
-    // Длинный ход уходит — и юзер сразу тыкает всё подряд, не дожидаясь.
-    let t1 = start_turn(port, &sid, &slow_message()).await;
+    // Ревизия 86: в release-профиле на быстрой машине эхо пролетало
+    // быстрее двух HTTP-запросов ниже — ход успевал ЗАВЕРШИТЬСЯ, и
+    // «занятая сессия» законно принимала второй ход (200 вместо 400).
+    // Занятость обязана быть свойством теста, а не скорости CPU:
+    // маркер [echo-slow:2] задаёт echo-провайдеру 2 мс на дельту ТОЛЬКО
+    // для этого хода (глобальный env задевал бы параллельные тесты).
+    // Объём подобран под Windows-гранулярность таймера (~15.6 мс на
+    // sleep): ~420 дельт живут ~6.5 с на Windows, ~0.8 с на Linux —
+    // и то и другое в тысячи раз больше кругового пути HTTP-запросов,
+    // и с запасом меньше 30-секундного дедлайна ожидания финала.
+    let busy_message = format!("[echo-slow:2]{}end", "data ".repeat(2_000));
+    let t1 = start_turn(port, &sid, &busy_message).await;
 
     // Чат открыт во время хода: транскрипт не виснет, ходов в нём ноль.
     let mid = transcript(port, &sid).await;

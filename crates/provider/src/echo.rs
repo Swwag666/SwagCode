@@ -26,6 +26,34 @@ use crate::types::{ChatRequest, Role};
 /// Env-флаг, включающий echo-провайдер.
 pub const ECHO_ENV: &str = "SWAGCOD_ECHO_PROVIDER";
 
+/// Префикс сообщения вида `[echo-slow:2]…`: задержка 2 мс между дельтами
+/// контента ТОЛЬКО для этого хода (потолок 1000 мс).
+///
+/// Ревизия 86: в release-профиле на быстрой машине эхо пролетает быстрее
+/// HTTP-обмена, и тест «занятая сессия отказывает второму ходу» превращался
+/// в гонку «успеть до конца хода». Задержка должна быть свойством конкретного
+/// хода, а не процесса: env-переменная глобальна и задевала параллельные
+/// тесты, поэтому маркер живёт в самом сообщении и вырезается из эха.
+/// Прод-поведение не меняется: без маркера задержки нет.
+const SLOW_PREFIX: &str = "[echo-slow:";
+
+/// Разобрать маркер задержки: `(мс, текст без префикса)`.
+/// Некорректный маркер (не число, без закрывающей скобки, больше 1000)
+/// трактуется как обычный текст — провайдер тестовый, строгая валидация
+/// здесь только размывает картину.
+fn split_slow_marker(text: &str) -> (Option<u64>, &str) {
+    let Some(rest) = text.strip_prefix(SLOW_PREFIX) else {
+        return (None, text);
+    };
+    let Some((ms, tail)) = rest.split_once(']') else {
+        return (None, text);
+    };
+    match ms.trim().parse::<u64>() {
+        Ok(v) if v > 0 && v <= 1000 => (Some(v), tail),
+        _ => (None, text),
+    }
+}
+
 /// Имя провайдера для логов и UI: в журнале хода должно быть видно, что
 /// ответило эхо, а не боевая модель.
 pub const ECHO_NAME: &str = "echo";
@@ -103,6 +131,12 @@ impl EchoProvider {
             .find(|m| m.role == Role::User)
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        // Маркер задержки вырезается из эха: текст ответа — только то,
+        // что шло после маркера, журналы не видят служебный префикс.
+        // Owned: ссылка жила бы на last_user, а та уезжает в задачу.
+        let (slow_ms, clean_user) = split_slow_marker(&last_user);
+        let clean_user = clean_user.to_string();
+        let delay = slow_ms.map(std::time::Duration::from_millis);
         // Считаем и контент, и рассуждения: в истории они оба хранятся и оба
         // стоят токенов.
         // Пол в один токен — у итога запроса: ноль в журнале неотличим от
@@ -122,7 +156,7 @@ impl EchoProvider {
                 )))
                 .await;
 
-            let body = echo_body(&last_user);
+            let body = echo_body(&clean_user);
             let mut rest = body.as_str();
             while !rest.is_empty() {
                 // Режем по границе символа, а не байта: текст русский, и
@@ -141,6 +175,9 @@ impl EchoProvider {
                     .is_err()
                 {
                     return;
+                }
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
                 }
                 rest = tail;
             }
@@ -174,6 +211,46 @@ impl EchoProvider {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn slow_marker_parses_only_prefixed_number() {
+        assert_eq!(split_slow_marker("обычный текст"), (None, "обычный текст"));
+        assert_eq!(
+            split_slow_marker("[echo-slow:2]дальше"),
+            (Some(2), "дальше")
+        );
+        // Некорректные формы — не маркер, текст не режется.
+        assert_eq!(
+            split_slow_marker("[echo-slow:x]дальше"),
+            (None, "[echo-slow:x]дальше")
+        );
+        assert_eq!(
+            split_slow_marker("[echo-slow:0]дальше"),
+            (None, "[echo-slow:0]дальше")
+        );
+        assert_eq!(
+            split_slow_marker("[echo-slow:2000]дальше"),
+            (None, "[echo-slow:2000]дальше")
+        );
+        assert_eq!(
+            split_slow_marker("[echo-slow:2 дальше"),
+            (None, "[echo-slow:2 дальше")
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_marker_is_cut_from_echo_body() {
+        let req = ChatRequest::new("m", vec![ChatMessage::user("[echo-slow:1]тело сообщения")]);
+        let events = collect(req).await;
+        let content: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Content(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "эхо: тело сообщения");
+    }
 
     fn request() -> ChatRequest {
         ChatRequest::new(
