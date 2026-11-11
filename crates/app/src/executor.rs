@@ -1793,20 +1793,26 @@ mod tests {
             t0.elapsed()
         );
 
-        // юникод-раундтрип: powershell пишет юникод в stdout-пайп стабильно
-        // на любой локали ([Console]::OutputEncoding = UTF-8), в отличие от
-        // cmd: на US-раннере (OEM cp437) cmd echo кириллицы молча даёт
-        // «??????», chcp 65001 внутри cmd не лечит — аргумент уже испорчен
-        // при разборе. Ревизия 86: проверка декодера UTF-8-пути стала
-        // детерминированной; OEM-путь (cp866) проверяется локально.
+        // юникод-раундтрип: кириллица через cmd-аргумент не проходит на
+        // US-локали в принципе (cmd /C парсит команду в ANSI: cp1252-раннер
+        // превращает её в «??????», chcp и powershell-обёртки не лечат —
+        // аргумент испорчен ДО запуска). Поэтому тестируем юникод-декодер
+        // единственным локале-независимым путём: powershell
+        // -EncodedCommand (base64 UTF-16LE, ASCII-безопасен для cmd) с
+        // явным [Console]::OutputEncoding=UTF8 — в пайп идут честные байты
+        // UTF-8, decode_text_bytes обязан их прочитать. Ревизия 86: тест
+        // детерминирован на любой машине; OEM-путь (cp866) остаётся
+        // локальной проверкой владельца.
+        // b64: [Console]::OutputEncoding=[System.Text.Encoding]::UTF8;
+        //      Write-Output 'Кривые-Руки-Тест'
         let out = run_tool(
             "bash",
-            serde_json::json!({"command": "powershell -NoProfile -Command \"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; 'Кривые-Руки-Тест'\""}),
+            serde_json::json!({"command": "powershell -NoProfile -EncodedCommand WwBDAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AHAAdQB0AEUAbgBjAG8AZABpAG4AZwA9AFsAUwB5AHMAdABlAG0ALgBUAGUAeAB0AC4ARQBuAGMAbwBkAGkAbgBnAF0AOgA6AFUAVABGADgAOwAgAFcAcgBpAHQAZQAtAE8AdQB0AHAAdQB0ACAAJwAaBEAEOAQyBEsENQQtACAEQwQ6BDgELQAiBDUEQQRCBCcA"}),
             &cwd,
         )
         .await;
         eprintln!(
-            "[probe] bash echo юникод (powershell utf8) → {:?}",
+            "[probe] bash echo юникод (PS EncodedCommand utf8) → {:?}",
             out.output
         );
         assert!(
