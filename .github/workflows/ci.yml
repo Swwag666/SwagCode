@@ -59,6 +59,9 @@ jobs:
       - name: notify sound+toast (диагностика AV rev86)
         run: cargo test -p swagcod-app --lib test_trigger_reports_sound -- --nocapture --test-threads=1
 
+      - name: notify все 4 параллельно (диагностика AV rev86)
+        run: cargo test -p swagcod-app --lib test_trigger -- --nocapture
+
       - name: test (headless, без Tauri-окна)
         # --no-capture (ревизия 86, диагностика CI-only падения clumsy_bash):
         # [probe]-строки попадают в лог сразу, AV-краш не съедает captured
@@ -231,11 +234,14 @@ jobs:
       # разбор отчёта теста). Запас после правки был бы отрицательным, поэтому
       # порог поднят до 445000: запас 4158 держит ту же планку ~4-5 КБ на
       # ревизию, а не подгоняется под текущий факт.
+      # Ревизия 86: порог поднят 445000 → 475000. 74 UX-правки выросли в
+      # сумму .js 466190 Б на CI (468413 локально; сумма ВСЕХ чанков
+      # dist/assets, а не только index.js). Запас ~9 КБ возвращает планку.
       - name: bundle size budget
         shell: bash
         run: |
           set -e
-          LIMIT=445000
+          LIMIT=475000
           TOTAL=0
           for f in apps/desktop/dist/assets/*.js; do
             SIZE=$(stat -c%s "$f")
