@@ -59,6 +59,20 @@ ignore = [
     # 2.5.2 требует zbus ^5. Пересмотреть при выходе tauri-plugin-single-instance
     # на zbus 6+.
     "RUSTSEC-2026-0372",
+    # libsqlite3-sys 0.30.1 (bundled SQLite < 3.54, RUSTSEC-2026-0459 /
+    # CVE-2026-119375). Ревизия 86: основной стор приложения — sidecar
+    # better-sqlite3 12.11.1 со свежим prebuilt SQLite; rusqlite 0.32.1 —
+    # ЛОКАЛЬНЫЙ Store ядра (crates/core), читает и пишет только базу
+    # самого приложения в известном каталоге: враждебского SQL и
+    # подсунутого файла базы на пути нет. Лечение — rusqlite 0.41
+    # (требует Rust 1.89, мажорные правки API Store): отложено до
+    # перехода toolchain. Пересмотреть при bump rust-version ≥ 1.89.
+    "RUSTSEC-2026-0459",
+    # pin-utils помечен unmaintained (RUSTSEC-2026-0441): транзитив
+    # futures-util старых веток, эксплойтов advisory не содержит —
+    # «unmaintained», не уязвимость. Обновится вместе с futures.
+    # Пересмотреть при обновлении дерева futures.
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]

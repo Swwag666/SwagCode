@@ -1793,14 +1793,18 @@ mod tests {
             t0.elapsed()
         );
 
-        // юникод через кодовую страницу cmd
+        // юникод-раундтрип: chcp 65001 ставит stdout cmd в UTF-8 ДО echo —
+        // проверка декодера перестала зависеть от OEM-страницы среды.
+        // (Ревизия 86: на windows-latest-раннере OEM = cp437, кириллицу cmd
+        // молча печатает знаками вопроса — ассерт падал на окружении, а не
+        // на приложении. В cp866-локали владельца работало и будет работать.)
         let out = run_tool(
             "bash",
-            serde_json::json!({"command": "echo Кривые-Руки-Тест"}),
+            serde_json::json!({"command": "chcp 65001 > nul & echo Кривые-Руки-Тест"}),
             &cwd,
         )
         .await;
-        eprintln!("[probe] bash echo юникод → {:?}", out.output);
+        eprintln!("[probe] bash echo юникод (cp65001) → {:?}", out.output);
         assert!(
             out.output.contains("Кривые-Руки-Тест"),
             "кириллица в stdout обязана декодироваться: {out:?}"
