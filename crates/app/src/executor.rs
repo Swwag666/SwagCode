@@ -1793,18 +1793,19 @@ mod tests {
             t0.elapsed()
         );
 
-        // юникод-раундтрип: chcp 65001 ставит stdout cmd в UTF-8 ДО echo —
-        // проверка декодера перестала зависеть от OEM-страницы среды.
-        // (Ревизия 86: на windows-latest-раннере OEM = cp437, кириллицу cmd
-        // молча печатает знаками вопроса — ассерт падал на окружении, а не
-        // на приложении. В cp866-локали владельца работало и будет работать.)
+        // юникод-раундтрип: powershell пишет юникод в stdout-пайп стабильно
+        // на любой локали ([Console]::OutputEncoding = UTF-8), в отличие от
+        // cmd: на US-раннере (OEM cp437) cmd echo кириллицы молча даёт
+        // «??????», chcp 65001 внутри cmd не лечит — аргумент уже испорчен
+        // при разборе. Ревизия 86: проверка декодера UTF-8-пути стала
+        // детерминированной; OEM-путь (cp866) проверяется локально.
         let out = run_tool(
             "bash",
-            serde_json::json!({"command": "chcp 65001 > nul & echo Кривые-Руки-Тест"}),
+            serde_json::json!({"command": "powershell -NoProfile -Command \"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; 'Кривые-Руки-Тест'\""}),
             &cwd,
         )
         .await;
-        eprintln!("[probe] bash echo юникод (cp65001) → {:?}", out.output);
+        eprintln!("[probe] bash echo юникод (powershell utf8) → {:?}", out.output);
         assert!(
             out.output.contains("Кривые-Руки-Тест"),
             "кириллица в stdout обязана декодироваться: {out:?}"

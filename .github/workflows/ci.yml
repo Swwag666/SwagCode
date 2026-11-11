@@ -53,17 +53,17 @@ jobs:
         # -D warnings: предупреждения не должны накапливаться молча.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: test (headless, без Tauri-окна)
-        # --no-capture (ревизия 86, диагностика CI-only падения clumsy_bash):
-        # [probe]-строки попадают в лог сразу, AV-краш не съедает captured
-        # stdout падающего теста.
-        run: cargo test --workspace -- --no-capture
-
       - name: notify toast only (диагностика AV rev86)
         run: cargo test -p swagcod-app --lib test_trigger_toast_only -- --nocapture --test-threads=1
 
       - name: notify sound+toast (диагностика AV rev86)
         run: cargo test -p swagcod-app --lib test_trigger_reports_sound -- --nocapture --test-threads=1
+
+      - name: test (headless, без Tauri-окна)
+        # --no-capture (ревизия 86, диагностика CI-only падения clumsy_bash):
+        # [probe]-строки попадают в лог сразу, AV-краш не съедает captured
+        # stdout падающего теста.
+        run: cargo test --workspace -- --no-capture
 
       - name: test release profile
         # Бенчи и проверки производительности имеют смысл только в release.
