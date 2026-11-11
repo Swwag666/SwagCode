@@ -372,9 +372,12 @@ impl NotificationManager {
         };
 
         // Играем через rodio.
+        eprintln!("[diag] sound: до get_audio_handle");
         let Some(handle) = get_audio_handle() else {
+            eprintln!("[diag] sound: аудиовыход недоступен");
             return PlayOutcome::NoDevice;
         };
+        eprintln!("[diag] sound: handle получен");
         let buffer = rodio::buffer::SamplesBuffer::new(
             decoded.channels,
             decoded.sample_rate,
@@ -612,10 +615,13 @@ fn show_toast(title: &str, body: &str) -> bool {
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     std::thread::spawn(move || unsafe {
         // WinRT из этого потока: тост можно отправлять из MTA.
+        eprintln!("[diag] toast: поток стартовал");
         let _ = windows::Win32::System::WinRT::RoInitialize(
             windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
         );
+        eprintln!("[diag] toast: RoInitialize прошёл");
         register_aumid();
+        eprintln!("[diag] toast: aumid зарегистрирован");
         use windows::core::HSTRING;
         use windows::Data::Xml::Dom::XmlDocument;
         use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
@@ -630,6 +636,7 @@ fn show_toast(title: &str, body: &str) -> bool {
                 return;
             }
         };
+        eprintln!("[diag] toast: XML загружен");
         let toast = match ToastNotification::CreateToastNotification(&doc) {
             Ok(t) => t,
             Err(e) => {
@@ -638,6 +645,7 @@ fn show_toast(title: &str, body: &str) -> bool {
                 return;
             }
         };
+        eprintln!("[diag] toast: уведомление создано");
         let notifier =
             match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)) {
                 Ok(n) => n,
@@ -647,6 +655,7 @@ fn show_toast(title: &str, body: &str) -> bool {
                     return;
                 }
             };
+        eprintln!("[diag] toast: notifier получен");
         let shown = match notifier.Show(&toast) {
             Ok(()) => true,
             Err(e) => {
@@ -654,6 +663,7 @@ fn show_toast(title: &str, body: &str) -> bool {
                 false
             }
         };
+        eprintln!("[diag] toast: Show завершён, shown={shown}");
         let _ = tx.send(shown);
     });
     // 400 мс: тост-вызов быстрый, но Show живёт в отдельном потоке WinRT.
