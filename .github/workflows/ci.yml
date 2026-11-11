@@ -49,6 +49,9 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      - name: clumsy fetch (диагностика AV rev86)
+        run: cargo test -p swagcod-app --lib clumsy_fetch_url_host -- --nocapture --test-threads=1
+
       - name: clippy
         # -D warnings: предупреждения не должны накапливаться молча.
         run: cargo clippy --workspace --all-targets -- -D warnings

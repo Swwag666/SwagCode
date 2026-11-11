@@ -1720,47 +1720,59 @@ mod tests {
     #[tokio::test]
     async fn clumsy_fetch_url_host_and_size_edges() {
         let dot = std::path::Path::new(".");
+        // Печать зонда режет вывод до 96 символов + длина: сам вывод
+        // содержит ЦЕЛИКОМ URL (у 100k-зонда — 100 000 байт), и печать
+        // такой строки в CI-лог глушит шаг визуально и грузит лог-канал.
+        // Длина сохранена числом — «что вернулось» видно и в сокращении.
+        let probe = |tag: &str, out: &ToolOutcome, t0: std::time::Instant| {
+            let head: String = out.output.chars().take(96).collect();
+            eprintln!(
+                "[probe] fetch {tag} → ok={} за {:?} — {}… (всего {} байт)",
+                out.ok,
+                t0.elapsed(),
+                head,
+                out.output.len()
+            );
+        };
 
         // whitespace-padded: схема проверяется по trim, запрос идёт по trim
+        let t0 = std::time::Instant::now();
         let out = run_tool(
             "fetch_url",
             serde_json::json!({"url": "  http://127.0.0.1:1/x  "}),
             dot,
         )
         .await;
-        eprintln!("[probe] fetch padded → ok={} {:?}", out.ok, out.output);
+        probe("padded", &out, t0);
         assert!(!out.ok, "{out:?}");
 
         // юникод в пути URL
+        let t0 = std::time::Instant::now();
         let out = run_tool(
             "fetch_url",
             serde_json::json!({"url": "http://127.0.0.1:1/путь-測試"}),
             dot,
         )
         .await;
-        eprintln!("[probe] fetch юникод-путь → ok={} {:?}", out.ok, out.output);
+        probe("юникод-путь", &out, t0);
         assert!(!out.ok, "{out:?}");
 
         // управляющий символ в URL
+        let t0 = std::time::Instant::now();
         let out = run_tool(
             "fetch_url",
             serde_json::json!({"url": "http://127.0.0.1:1/a\nb"}),
             dot,
         )
         .await;
-        eprintln!("[probe] fetch URL с \\n → ok={} {:?}", out.ok, out.output);
+        probe("URL с \\n", &out, t0);
         assert!(!out.ok, "{out:?}");
 
         // URL длиной 100000
         let url = format!("http://127.0.0.1:1/{}", "a".repeat(100_000));
         let t0 = std::time::Instant::now();
         let out = run_tool("fetch_url", serde_json::json!({"url": url}), dot).await;
-        eprintln!(
-            "[probe] fetch 100k URL → ok={} за {:?} — {:?}",
-            out.ok,
-            t0.elapsed(),
-            out.output
-        );
+        probe("100k URL", &out, t0);
         assert!(!out.ok, "{out:?}");
     }
 
